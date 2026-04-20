@@ -1,0 +1,38 @@
+# Build artifacts
+/bin/
+/dist/
+/build/
+*.exe
+*.test
+*.out
+rud1-agent
+rud1-agent-*
+
+# Go
+vendor/
+*.test
+coverage.out
+coverage.html
+
+# Local config & state
+.env
+.env.local
+config.yaml
+config.local.yaml
+data/
+state/
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

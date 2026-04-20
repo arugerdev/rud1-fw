@@ -1,0 +1,33 @@
+# rud1-agent configuration example
+# Copy to /etc/rud1-agent/config.yaml (Linux) or %APPDATA%\Rud1\agent\config.yaml (Windows)
+
+log_level: info
+
+server:
+  host: 0.0.0.0
+  port: 7070
+  read_timeout: 15s
+  write_timeout: 30s
+  allowed_origins:
+    - http://localhost:5173
+    - http://localhost:80
+    - http://rud1.local
+  # auth_token: ""  # Optional: set to require Bearer auth on local API
+
+cloud:
+  enabled: true
+  base_url: https://rud1.es
+  api_secret: ""        # Set to your DEVICE_API_SECRET from rud1-es
+  registration_code: "" # Override auto-generated code (optional)
+  heartbeat_interval: 60s
+  http_timeout: 20s
+
+vpn:
+  interface: wg0
+  config_path: /etc/wireguard/wg0.conf
+
+usb:
+  bind_port: 3240
+  usbip_enabled: false          # Set to true to enable USB/IP server (Linux only)
+  authorized_nets:              # CIDRs allowed to attach USB devices (empty = no restriction)
+    - 10.200.0.0/16             # Allow VPN subnet (adjust to your WireGuard range)

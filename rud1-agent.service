@@ -1,0 +1,18 @@
+[Unit]
+Description=Rud1 Device Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/rud1-agent -config /etc/rud1-agent/config.yaml
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rud1-agent
+Environment=RUD1_LOG_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target

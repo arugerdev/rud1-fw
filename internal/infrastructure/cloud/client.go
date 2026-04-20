@@ -1,0 +1,300 @@
+// Package cloud implements an HTTP client for the rud1-es API.
+package cloud
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// Client is an HTTP client for the rud1-es cloud API.
+type Client struct {
+	baseURL    string
+	apiSecret  string
+	httpClient *http.Client
+}
+
+// New creates a Client targeting baseURL, authenticating with apiSecret.
+func New(baseURL, apiSecret string, timeout time.Duration) *Client {
+	return &Client{
+		baseURL:  baseURL,
+		apiSecret: apiSecret,
+		httpClient: &http.Client{
+			Timeout: timeout,
+		},
+	}
+}
+
+// ── Registration ─────────────────────────────────────────────────────────────
+
+// RegisterRequest is the body sent to POST /api/v1/devices/register.
+type RegisterRequest struct {
+	RegistrationCode string `json:"registrationCode"`
+	SerialNumber     string `json:"serialNumber,omitempty"`
+	FirmwareVersion  string `json:"firmwareVersion,omitempty"`
+	Platform         string `json:"platform,omitempty"`
+	Arch             string `json:"arch,omitempty"`
+}
+
+// RegisterResponse is the body returned by a successful registration.
+type RegisterResponse struct {
+	OK             bool   `json:"ok"`
+	DeviceID       string `json:"deviceId"`
+	SerialNumber   string `json:"serialNumber"`
+	OrganizationID string `json:"organizationId"`
+}
+
+// Register posts device registration data and returns the assigned identity.
+// No auth header required — the registration code is the credential.
+func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterResponse, error) {
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/devices/register", "", req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusConflict {
+		return nil, fmt.Errorf("register: device already provisioned")
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("register: unexpected status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var out RegisterResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("register: decode response: %w", err)
+	}
+	return &out, nil
+}
+
+// ── Heartbeat ────────────────────────────────────────────────────────────────
+
+// HeartbeatPayload matches the nested schema expected by POST /api/v1/devices/heartbeat.
+type HeartbeatPayload struct {
+	RegistrationCode string      `json:"registrationCode"`
+	SerialNumber     string      `json:"serialNumber,omitempty"`
+	FirmwareVersion  string      `json:"firmwareVersion,omitempty"`
+	Info             *HBInfo     `json:"info,omitempty"`
+	Metrics          *HBMetrics  `json:"metrics,omitempty"`
+	Network          *HBNetwork  `json:"network,omitempty"`
+	VPN              *HBVPN      `json:"vpn,omitempty"`
+	USB              *HBUSB      `json:"usb,omitempty"`
+}
+
+// HBInfo carries static device identification fields.
+type HBInfo struct {
+	Hostname      string `json:"hostname"`
+	AgentVersion  string `json:"agentVersion"`
+	Platform      string `json:"platform"`
+	Arch          string `json:"arch"`
+	Simulated     bool   `json:"simulated"`
+	KernelVersion string `json:"kernelVersion,omitempty"`
+	OS            string `json:"os,omitempty"`
+	UptimeSeconds int64  `json:"uptimeSeconds"`
+}
+
+// HBMetrics carries live resource usage.
+type HBMetrics struct {
+	CPUUsage    float64  `json:"cpuUsage"`
+	MemoryUsage float64  `json:"memoryUsage"`
+	Temperature *float64 `json:"temperature,omitempty"`
+	DiskUsage   *float64 `json:"diskUsage,omitempty"`
+	Uptime      int64    `json:"uptime"`
+	RxBytes     *int64   `json:"rxBytes,omitempty"`
+	TxBytes     *int64   `json:"txBytes,omitempty"`
+}
+
+// HBNetworkInterface is one network interface in a heartbeat.
+type HBNetworkInterface struct {
+	Name       string   `json:"name"`
+	MAC        string   `json:"mac"`
+	MTU        int      `json:"mtu"`
+	Up         bool     `json:"up"`
+	IPv4       []string `json:"ipv4"`
+	IPv6       []string `json:"ipv6"`
+	IsLoopback bool     `json:"isLoopback"`
+	IsWireless bool     `json:"isWireless"`
+}
+
+// HBNetwork carries a full network status snapshot.
+type HBNetwork struct {
+	Hostname   string               `json:"hostname"`
+	Interfaces []HBNetworkInterface `json:"interfaces"`
+	Gateway    string               `json:"gateway,omitempty"`
+	DNS        []string             `json:"dns"`
+	Internet   bool                 `json:"internet"`
+}
+
+// HBVPN carries WireGuard connection state.
+// Only included when the VPN config exists and has a public key.
+type HBVPN struct {
+	InterfaceName string  `json:"interfaceName"`
+	PublicKey     string  `json:"publicKey"`
+	Connected     bool    `json:"connected"`
+	Endpoint      string  `json:"endpoint,omitempty"`
+	AllowedIps    string  `json:"allowedIps,omitempty"`
+	DNS           string  `json:"dns,omitempty"`
+	PeerCount     int     `json:"peerCount"`
+	LastHandshake *string `json:"lastHandshake,omitempty"`
+}
+
+// HBUSBDevice is one USB device in a heartbeat.
+type HBUSBDevice struct {
+	BusID       string  `json:"busId"`
+	VendorID    string  `json:"vendorId"`
+	ProductID   string  `json:"productId"`
+	VendorName  *string `json:"vendorName,omitempty"`
+	ProductName *string `json:"productName,omitempty"`
+	Serial      *string `json:"serial,omitempty"`
+	Shared      bool    `json:"shared"`
+}
+
+// HBUSB wraps the USB device list and USB/IP server state.
+type HBUSB struct {
+	Devices         []HBUSBDevice `json:"devices"`
+	UsbipEnabled    bool          `json:"usbipEnabled"`
+	ExportedBusIDs  []string      `json:"exportedBusIds,omitempty"`
+}
+
+// HeartbeatResponse is the body returned by POST /api/v1/devices/heartbeat.
+type HeartbeatResponse struct {
+	OK                 bool   `json:"ok"`
+	DeviceID           string `json:"deviceId"`
+	NextCheckInSeconds int    `json:"nextCheckInSeconds"`
+}
+
+// Heartbeat sends a device heartbeat authenticated with the shared API secret.
+func (c *Client) Heartbeat(ctx context.Context, payload HeartbeatPayload) (*HeartbeatResponse, error) {
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/devices/heartbeat", c.apiSecret, payload)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("heartbeat: unexpected status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var out HeartbeatResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("heartbeat: decode response: %w", err)
+	}
+	return &out, nil
+}
+
+// ── Firmware ─────────────────────────────────────────────────────────────────
+
+// FirmwarePending describes an available firmware update returned by the cloud.
+type FirmwarePending struct {
+	RolloutID   string
+	Version     string
+	URL         string
+	SHA256      string
+}
+
+type firmwarePendingResponse struct {
+	Pending     bool   `json:"pending"`
+	RolloutID   string `json:"rolloutId"`
+	Version     string `json:"version"`
+	SHA256      string `json:"sha256"`
+	DownloadURL string `json:"downloadUrl"`
+}
+
+// CheckFirmware queries for a pending firmware update by registration code.
+// Returns nil if no update is available.
+func (c *Client) CheckFirmware(ctx context.Context, registrationCode string) (*FirmwarePending, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/api/v1/devices/firmware/pending", nil)
+	if err != nil {
+		return nil, err
+	}
+	q := req.URL.Query()
+	q.Set("registrationCode", registrationCode)
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set("Authorization", "Bearer "+c.apiSecret)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("check firmware: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("check firmware: unexpected status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var out firmwarePendingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("check firmware: decode response: %w", err)
+	}
+	if !out.Pending {
+		return nil, nil
+	}
+	return &FirmwarePending{
+		RolloutID: out.RolloutID,
+		Version:   out.Version,
+		URL:       out.DownloadURL,
+		SHA256:    out.SHA256,
+	}, nil
+}
+
+// AckFirmware reports the result of a firmware installation to the cloud.
+// status should be "COMPLETED" or "FAILED".
+func (c *Client) AckFirmware(ctx context.Context, rolloutID, registrationCode, status, errMsg string) error {
+	body := map[string]any{
+		"rolloutId":        rolloutID,
+		"registrationCode": registrationCode,
+		"status":           status,
+	}
+	if errMsg != "" {
+		body["errorMsg"] = errMsg
+	}
+
+	resp, err := c.doJSON(ctx, http.MethodPost, "/api/v1/devices/firmware/ack", c.apiSecret, body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ack firmware: unexpected status %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// doJSON marshals body and issues an HTTP request with JSON content-type.
+// If token is non-empty it is sent as Bearer auth.
+func (c *Client) doJSON(ctx context.Context, method, path, token string, body any) (*http.Response, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", method, path, err)
+	}
+	return resp, nil
+}
