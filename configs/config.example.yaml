@@ -17,8 +17,10 @@ server:
 cloud:
   enabled: true
   base_url: https://rud1.es
-  api_secret: ""        # Set to your DEVICE_API_SECRET from rud1-es
-  registration_code: "" # Override auto-generated code (optional)
+  api_secret: ""        # Required: matches DEVICE_API_SECRET env var on rud1-es
+  # registration_code: # Leave empty in production — the agent generates and persists
+  #                    # a unique code on first boot under platform.ConfigDir().
+  #                    # Set explicitly only for testing / forced re-pairing scenarios.
   heartbeat_interval: 60s
   http_timeout: 20s
 
