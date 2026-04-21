@@ -1,0 +1,44 @@
+[Unit]
+Description=Rud1 Device Agent
+Documentation=https://github.com/arugerdev/rud1-fw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root is required today because the agent touches WireGuard and USB/IP
+# kernel interfaces. When we split those into a privileged helper this can
+# drop to a DynamicUser.
+User=root
+ExecStart=/usr/local/bin/rud1-agent -config /etc/rud1-agent/config.yaml
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Observability
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rud1-agent
+Environment=RUD1_LOG_LEVEL=info
+
+# Light hardening — kept conservative because the agent needs broad net/fs
+# access to manage WireGuard, usbip, system metrics and network snapshots.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# Keep CAP_NET_ADMIN (WireGuard, iptables), CAP_SYS_ADMIN (usbip bind),
+# CAP_NET_RAW (ICMP). Everything else is already implicit for root.
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+
+# Resource limits — generous but bounded, tuned for a Raspberry Pi 3 / 1GB.
+LimitNOFILE=65536
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

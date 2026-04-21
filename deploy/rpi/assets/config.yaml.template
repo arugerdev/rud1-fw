@@ -1,0 +1,39 @@
+# rud1-agent production config — installed to /etc/rud1-agent/config.yaml
+# by deploy/rpi/install.sh. Override any of these at runtime by editing the
+# file and running:  sudo systemctl restart rud1-agent
+
+log_level: info
+
+server:
+  host: 0.0.0.0
+  port: 7070
+  read_timeout: 15s
+  write_timeout: 30s
+  allowed_origins:
+    - http://localhost
+    - http://localhost:5173
+    - http://rud1.local
+    # Add additional hostnames here if you renamed the Pi, e.g.:
+    # - http://factory-gw-01.local
+  # auth_token: ""   # Optional: require Bearer auth on the LOCAL API (recommended if
+                     # the device is on an untrusted LAN). The panel in rud1-app then
+                     # needs to be served with the same token baked in.
+
+cloud:
+  enabled: true
+  base_url: https://rud1.es
+  api_secret: ""     # Filled in by install.sh (from $RUD1_API_SECRET or prompt).
+  # registration_code:  ←  LEAVE EMPTY. The agent generates a unique code on
+  #                        first boot and persists it under /var/lib/rud1-agent.
+  heartbeat_interval: 60s
+  http_timeout: 20s
+
+vpn:
+  interface: wg0
+  config_path: /etc/wireguard/wg0.conf
+
+usb:
+  bind_port: 3240
+  usbip_enabled: true           # Raspberry Pi OS ships the needed modules.
+  authorized_nets:              # Only these CIDRs may attach USB devices.
+    - 10.200.0.0/16             # Default WireGuard subnet — adjust if yours differs.
