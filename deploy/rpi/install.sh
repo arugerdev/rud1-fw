@@ -75,7 +75,8 @@ if [[ "$RUD1_SKIP_APT" != "1" ]]; then
     wireguard wireguard-tools
     network-manager              # WiFi client + setup-AP via nmcli
     modemmanager                 # LTE modem (Sierra Wireless MC7700 HAT)
-    libqmi-utils uqmi            # QMI tooling for Sierra modems
+    libqmi-utils                 # QMI tooling (qmicli) — ModemManager backend
+    libmbim-utils                # MBIM tooling (mbimcli) — some Sierra FWs
     avahi-daemon                 # mDNS → rud1.local
     chrony                       # Time sync (cloud API requires clean TLS)
   )
