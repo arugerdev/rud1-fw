@@ -37,3 +37,27 @@ usb:
   usbip_enabled: true           # Raspberry Pi OS ships the needed modules.
   authorized_nets:              # Only these CIDRs may attach USB devices.
     - 10.200.0.0/16             # Default WireGuard subnet — adjust if yours differs.
+
+network:
+  # WiFi / cellular / setup-AP settings. Defaults are tuned for the onboard
+  # RPi 3 radio + the optional Sierra Wireless MC7700 cellular HAT.
+  wifi_interface: wlan0
+  ap_interface: wlan0
+  # ap_ssid + ap_password can be left blank to auto-derive per device from
+  # its machine-id. The generated values are written to
+  # /var/lib/rud1-agent/setup-ap.txt (mode 0600) on every boot.
+  ap_ssid: ""
+  ap_password: ""
+  ap_cidr: 192.168.50.1/24
+  # auto_ap: raise the setup hotspot automatically when the device has been
+  # offline for longer than offline_grace_seconds. Turn off for fleet
+  # devices that should never become a hotspot even when unreachable.
+  auto_ap: true
+  offline_grace_seconds: 90
+  # preferred_uplink: auto | wifi | cellular
+  preferred_uplink: auto
+  # cellular_apn: default APN used when connecting via the LTE modem for the
+  # first time (user can override later via the panel). Empty = ask carrier.
+  cellular_apn: ""
+  # cellular_data_cap_mb: soft alert threshold. 0 disables the warning.
+  cellular_data_cap_mb: 0

@@ -33,6 +33,7 @@ func New(
 	networkH *handlers.NetworkHandler,
 	vpnH *handlers.VPNHandler,
 	usbH *handlers.USBHandler,
+	connH *handlers.ConnectivityHandler,
 ) *Server {
 	usbipH := handlers.NewUSBIPHandler(&cfg.USB)
 
@@ -64,6 +65,29 @@ func New(
 		r.Post("/api/system/reboot", systemH.Reboot)
 
 		r.Get("/api/network/status", networkH.Status)
+
+		// Connectivity (WiFi client + cellular modem + setup AP).
+		// These routes MUST remain reachable even when the device is in AP
+		// mode — that's the whole point. BearerAuth is still enforced if
+		// the user configured an auth_token; otherwise it's open on-LAN.
+		r.Get("/api/network/connectivity", connH.Snapshot)
+		r.Post("/api/network/connectivity/preferred", connH.SetPreferred)
+
+		r.Get("/api/network/wifi/scan", connH.WiFiScan)
+		r.Get("/api/network/wifi/saved", connH.WiFiSaved)
+		r.Get("/api/network/wifi/status", connH.WiFiStatus)
+		r.Post("/api/network/wifi/connect", connH.WiFiConnect)
+		r.Post("/api/network/wifi/disconnect", connH.WiFiDisconnect)
+		r.Delete("/api/network/wifi/saved/{ssid}", connH.WiFiForget)
+
+		r.Get("/api/network/cellular", connH.CellularStatus)
+		r.Post("/api/network/cellular/config", connH.CellularSetConfig)
+		r.Post("/api/network/cellular/pin", connH.CellularUnlockPIN)
+		r.Post("/api/network/cellular/connect", connH.CellularConnect)
+		r.Post("/api/network/cellular/disconnect", connH.CellularDisconnect)
+
+		r.Get("/api/network/ap", connH.APStatus)
+		r.Post("/api/network/ap", connH.APSet)
 
 		r.Get("/api/vpn/status", vpnH.Status)
 		r.Post("/api/vpn/reconnect", vpnH.Reconnect)

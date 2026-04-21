@@ -73,6 +73,9 @@ if [[ "$RUD1_SKIP_APT" != "1" ]]; then
   PKGS=(
     ca-certificates curl gnupg
     wireguard wireguard-tools
+    network-manager              # WiFi client + setup-AP via nmcli
+    modemmanager                 # LTE modem (Sierra Wireless MC7700 HAT)
+    libqmi-utils uqmi            # QMI tooling for Sierra modems
     avahi-daemon                 # mDNS → rud1.local
     chrony                       # Time sync (cloud API requires clean TLS)
   )
@@ -85,6 +88,31 @@ if [[ "$RUD1_SKIP_APT" != "1" ]]; then
 
   log "Installing: ${PKGS[*]}"
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PKGS[@]}"
+fi
+
+# ── NetworkManager takeover ──────────────────────────────────────────────────
+# Bookworm ships NM by default. Older images (Bullseye) shipped dhcpcd. If
+# dhcpcd is still running, disable it so NM can manage wlan0 without
+# stepping on its toes.
+if systemctl is-enabled dhcpcd >/dev/null 2>&1; then
+  log "Disabling legacy dhcpcd (NetworkManager will manage interfaces)"
+  systemctl disable --now dhcpcd 2>/dev/null || true
+fi
+# Ensure NM manages wlan0. Some RPi OS images blacklist it in
+# /etc/NetworkManager/NetworkManager.conf — inject an 'unmanaged-devices='
+# override only if NM is installed.
+if [[ -d /etc/NetworkManager ]]; then
+  install -d /etc/NetworkManager/conf.d
+  cat > /etc/NetworkManager/conf.d/10-rud1.conf <<'EOF'
+# Let NetworkManager own both the onboard radio (wlan0) and any USB-attached
+# radios. Installed by rud1-agent.
+[main]
+plugins=keyfile
+[keyfile]
+unmanaged-devices=none
+EOF
+  systemctl enable --now NetworkManager 2>/dev/null || true
+  systemctl enable --now ModemManager 2>/dev/null || true
 fi
 
 # ── Hostname (optional) ──────────────────────────────────────────────────────

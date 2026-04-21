@@ -18,11 +18,48 @@ import (
 
 // Config is the top-level agent configuration.
 type Config struct {
-	LogLevel string       `yaml:"log_level"`
-	Server   ServerConfig `yaml:"server"`
-	Cloud    CloudConfig  `yaml:"cloud"`
-	VPN      VPNConfig    `yaml:"vpn"`
-	USB      USBConfig    `yaml:"usb"`
+	LogLevel string        `yaml:"log_level"`
+	Server   ServerConfig  `yaml:"server"`
+	Cloud    CloudConfig   `yaml:"cloud"`
+	VPN      VPNConfig     `yaml:"vpn"`
+	USB      USBConfig     `yaml:"usb"`
+	Network  NetworkConfig `yaml:"network"`
+}
+
+// NetworkConfig controls the WiFi / cellular / setup-AP subsystem.
+//
+// Defaults are tuned for a Raspberry Pi 3 with the stock onboard WiFi and an
+// optional Sierra Wireless MC7700 cellular HAT. Users can override any field
+// via /etc/rud1-agent/config.yaml.
+type NetworkConfig struct {
+	// WiFiInterface is the NIC the WiFi client uses (usually "wlan0").
+	WiFiInterface string `yaml:"wifi_interface"`
+	// APInterface is the NIC used for the setup hotspot. Typically the same
+	// as WiFiInterface — NM will tear down the client to bring up the AP.
+	APInterface string `yaml:"ap_interface"`
+	// APSSID is the hotspot name. If left blank, defaults to
+	// "Rud1-Setup-XXXX" with the last 4 hex chars of the machine-id so
+	// multiple devices on the same installer's laptop are disambiguated.
+	APSSID string `yaml:"ap_ssid"`
+	// APPassword seeds the hotspot. If blank, the agent derives a stable
+	// 10-char password from the machine-id and writes it to
+	// /var/lib/rud1-agent/setup-ap.txt so the admin can retrieve it.
+	APPassword string `yaml:"ap_password"`
+	// APCIDR is the IPv4 range served on the hotspot, e.g. "192.168.50.1/24".
+	APCIDR string `yaml:"ap_cidr"`
+	// AutoAP: let the supervisor raise the hotspot automatically when the
+	// device has been offline for longer than OfflineGrace.
+	AutoAP bool `yaml:"auto_ap"`
+	// OfflineGrace: how long (in seconds) to tolerate no internet before
+	// raising the AP. Must be positive if AutoAP is true.
+	OfflineGraceSeconds int `yaml:"offline_grace_seconds"`
+	// CellularAPN: default APN attempted on first cellular connect.
+	CellularAPN string `yaml:"cellular_apn"`
+	// CellularDataCapMB: soft cap used by the UI to warn the user before
+	// the plan runs out. 0 disables the warning.
+	CellularDataCapMB uint64 `yaml:"cellular_data_cap_mb"`
+	// PreferredUplink: auto | wifi | cellular
+	PreferredUplink string `yaml:"preferred_uplink"`
 }
 
 // ServerConfig configures the local HTTP API consumed by rud1-app.
@@ -81,6 +118,14 @@ func Default() *Config {
 		},
 		USB: USBConfig{
 			BindPort: 3240,
+		},
+		Network: NetworkConfig{
+			WiFiInterface:       "wlan0",
+			APInterface:         "wlan0",
+			APCIDR:              "192.168.50.1/24",
+			AutoAP:              true,
+			OfflineGraceSeconds: 90,
+			PreferredUplink:     "auto",
 		},
 	}
 }

@@ -33,3 +33,18 @@ usb:
   usbip_enabled: false          # Set to true to enable USB/IP server (Linux only)
   authorized_nets:              # CIDRs allowed to attach USB devices (empty = no restriction)
     - 10.200.0.0/16             # Allow VPN subnet (adjust to your WireGuard range)
+
+network:
+  # WiFi client + setup-AP (NetworkManager) + optional LTE modem (ModemManager).
+  # Leave ap_ssid / ap_password blank to auto-derive them from the device's
+  # machine-id — stable per device, unique across the fleet.
+  wifi_interface: wlan0
+  ap_interface: wlan0
+  ap_ssid: ""
+  ap_password: ""
+  ap_cidr: 192.168.50.1/24
+  auto_ap: true                 # raise the setup hotspot when offline for too long
+  offline_grace_seconds: 90
+  preferred_uplink: auto        # auto | wifi | cellular
+  cellular_apn: ""
+  cellular_data_cap_mb: 0

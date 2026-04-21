@@ -24,6 +24,7 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/domain/device"
 	domainnet "github.com/rud1-es/rud1-fw/internal/domain/network"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/cloud"
+	connimpl "github.com/rud1-es/rud1-fw/internal/infrastructure/connectivity"
 	netscanner "github.com/rud1-es/rud1-fw/internal/infrastructure/network"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/storage"
 	sysinfo "github.com/rud1-es/rud1-fw/internal/infrastructure/system"
@@ -39,11 +40,12 @@ var Version = "dev"
 
 // Agent wires all infrastructure services together and owns the run loop.
 type Agent struct {
-	cfg      *config.Config
-	store    *storage.DeviceStore
-	identity *device.Identity
-	cloud    *cloud.Client // nil when cloud.Enabled == false
-	srv      *server.Server
+	cfg       *config.Config
+	store     *storage.DeviceStore
+	identity  *device.Identity
+	cloud     *cloud.Client // nil when cloud.Enabled == false
+	srv       *server.Server
+	connSup   *connimpl.Supervisor // nil when auto-AP disabled or in simulated mode
 }
 
 // New creates an Agent from the given Config.
@@ -92,7 +94,14 @@ func New(cfg *config.Config) (*Agent, error) {
 	vpnH := handlers.NewVPNHandler(cfg.VPN.ConfigPath, cfg.VPN.Interface)
 	usbH := handlers.NewUSBHandler()
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, usbH)
+	// Connectivity (WiFi / cellular / setup-AP) — picks the right backend
+	// for the platform, plus an optional supervisor that auto-raises the
+	// setup AP when the device has been offline too long.
+	connSvc, connSup := buildConnectivityService(cfg, a.identity.SerialNumber)
+	a.connSup = connSup
+	connH := handlers.NewConnectivityHandler(connSvc)
+
+	a.srv = server.New(cfg, systemH, networkH, vpnH, usbH, connH)
 
 	return a, nil
 }
@@ -105,6 +114,10 @@ func (a *Agent) Run(ctx context.Context) error {
 			srvErr <- err
 		}
 	}()
+
+	if a.connSup != nil {
+		go a.connSup.Run(ctx)
+	}
 
 	if a.cfg.Cloud.Enabled && a.cloud != nil {
 		if a.identity.DeviceID == "" {
