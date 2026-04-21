@@ -57,16 +57,19 @@ Apple o usa la IP directa (mira tu router).
 
 Todo está automatizado con dos scripts:
 
-- **`build-release.sh`** — lo ejecutas **en tu máquina de desarrollo**.
-  Cross-compila el agente Go para `linux/arm64`, construye el panel Astro y
-  empaqueta todo en un `tar.gz`.
+- **`build-release.sh` / `build-release.ps1`** — lo ejecutas **en tu máquina
+  de desarrollo**. Cross-compila el agente Go para `linux/arm64`, construye
+  el panel Astro y empaqueta todo en un `tar.gz`. Hay versión bash (Linux /
+  macOS / WSL) y versión PowerShell (Windows nativo, sin WSL).
 - **`install.sh`** — lo ejecutas **dentro de la Pi**. Instala dependencias
   APT, módulos de kernel, systemd unit, nginx + estáticos, config y arranca
   los servicios.
 
 ### 1) Generar el release (máquina de desarrollo)
 
-Requisitos: `go 1.23+`, `node 20+` y `npm`.
+Requisitos comunes: `go 1.23+`, `node 20+` y `npm`. En Windows además
+`tar.exe` (viene con Windows 10 1803+ como bsdtar — `tar --version` en
+PowerShell para verificar).
 
 Layout asumido:
 
@@ -75,6 +78,8 @@ Layout asumido:
   rud1-fw/      ← este repo
   rud1-app/     ← panel Astro (hermano)
 ```
+
+#### Linux / macOS / WSL
 
 Desde `rud1-fw/`:
 
@@ -93,7 +98,44 @@ GOARCH=arm ./deploy/rpi/build-release.sh
 RUD1_APP_DIR= ./deploy/rpi/build-release.sh
 ```
 
+#### Windows (PowerShell nativo)
+
+Desde `rud1-fw\` en una PowerShell normal (no hace falta WSL ni Git Bash):
+
+```powershell
+.\deploy\rpi\build-release.ps1
+# → produce deploy\rpi\dist\rud1-release-<version>-linux-arm64.tar.gz
+```
+
+Si la primera vez te bloquea la política de ejecución:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+Opciones:
+
+```powershell
+# 32-bit Pi OS:
+.\deploy\rpi\build-release.ps1 -GoArch arm
+
+# Sin UI web (solo agente):
+.\deploy\rpi\build-release.ps1 -SkipUI
+
+# Apuntar a otro checkout de rud1-app:
+.\deploy\rpi\build-release.ps1 -AppDir D:\code\rud1-app
+```
+
+> El `.ps1` produce **el mismo tarball** que el `.sh` (mismo árbol y mismos
+> ficheros). Detalle de implementación: bsdtar en Windows no propaga el bit
+> `+x` desde NTFS, así que el `install.sh` dentro del tarball sale como
+> `0644`. Por eso el comando del paso 2 lo invoca con `sudo bash install.sh`
+> (en lugar de `sudo ./install.sh`) — funciona idéntico partiendo de
+> tarballs generados desde Linux o desde Windows.
+
 ### 2) Copiar + instalar en la Pi
+
+#### Linux / macOS / WSL
 
 ```bash
 TARBALL=$(ls -t deploy/rpi/dist/rud1-release-*.tar.gz | head -1)
@@ -102,14 +144,30 @@ PI=pi@rud1-taller-01.local
 # Copia
 scp "$TARBALL" "$PI:/tmp/"
 
-# Desempaqueta e instala
+# Desempaqueta e instala (bash explícito → no necesita +x en el .sh)
 ssh "$PI" bash -s <<EOF
   set -e
   sudo rm -rf /tmp/rud1-release
   mkdir -p /tmp/rud1-release
   tar -C /tmp/rud1-release -xzf /tmp/$(basename "$TARBALL")
-  sudo RUD1_API_SECRET='<el-secreto-del-backend>' /tmp/rud1-release/install.sh
+  sudo RUD1_API_SECRET='<el-secreto-del-backend>' bash /tmp/rud1-release/install.sh
 EOF
+```
+
+#### Windows (PowerShell nativo — `scp` y `ssh` vienen con OpenSSH desde Windows 10 1809)
+
+```powershell
+$Tarball = (Get-ChildItem deploy\rpi\dist\rud1-release-*.tar.gz |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+$Base    = Split-Path -Leaf $Tarball
+$Pi      = "pi@rud1-taller-01.local"
+$Secret  = "<el-secreto-del-backend>"
+
+# Copia
+scp $Tarball "${Pi}:/tmp/"
+
+# Desempaqueta e instala
+ssh $Pi "sudo rm -rf /tmp/rud1-release && mkdir -p /tmp/rud1-release && tar -C /tmp/rud1-release -xzf /tmp/$Base && sudo RUD1_API_SECRET='$Secret' bash /tmp/rud1-release/install.sh"
 ```
 
 `RUD1_API_SECRET` es el valor de la variable de entorno `DEVICE_API_SECRET`
