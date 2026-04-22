@@ -35,6 +35,7 @@ func New(
 	systemH *handlers.SystemHandler,
 	networkH *handlers.NetworkHandler,
 	vpnH *handlers.VPNHandler,
+	vpnPeerH *handlers.VPNPeerHandler,
 	usbH *handlers.USBHandler,
 	usbipH *handlers.USBIPHandler,
 	connH *handlers.ConnectivityHandler,
@@ -103,6 +104,13 @@ func New(
 		r.Get("/api/vpn/status", vpnH.Status)
 		r.Post("/api/vpn/reconnect", vpnH.Reconnect)
 		r.Post("/api/vpn/config", vpnH.ApplyConfig)
+
+		// WG server peer management (list / add / remove). Add/Remove is
+		// out-of-band relative to the cloud-driven heartbeat sync —
+		// useful for rud1-app admin tasks and disconnected installs.
+		r.Get("/api/vpn/peers", vpnPeerH.List)
+		r.Post("/api/vpn/peers", vpnPeerH.Add)
+		r.Delete("/api/vpn/peers", vpnPeerH.Remove)
 
 		r.Get("/api/usb/devices", usbH.List)
 

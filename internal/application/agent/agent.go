@@ -160,6 +160,7 @@ func New(cfg *config.Config) (*Agent, error) {
 		cfg.VPN.PubkeyPath,
 		a.snapshotNAT,
 	)
+	vpnPeerH := handlers.NewVPNPeerHandler(cfg.VPN.Interface)
 	usbH := handlers.NewUSBHandler()
 	usbipH := handlers.NewUSBIPHandler(cfg)
 	a.usbipH = usbipH
@@ -172,7 +173,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.connSup = connSup
 	connH := handlers.NewConnectivityHandler(connSvc)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, usbH, usbipH, connH, identityH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH)
 
 	return a, nil
 }
@@ -550,6 +551,90 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// deployment used a different derivation) we re-apply.
 	if resp.VpnPeer != nil {
 		a.maybeReapplyServer(resp.VpnPeer)
+	}
+
+	// ClientPeers is the authoritative set of user peers for this device.
+	// A nil slice means "no opinion" (legacy/unclaimed response); an empty
+	// slice means "drop all peers". The apply call is best-effort — a
+	// failure to wg-set one peer doesn't abort the others.
+	if resp.ClientPeers != nil {
+		a.applyClientPeers(resp.ClientPeers)
+	}
+}
+
+// applyClientPeers converges the live WireGuard server state toward the
+// authoritative `desired` set the cloud just echoed back. For every desired
+// peer that is missing from `wg show dump`, we AddPeer; for every live peer
+// not present in `desired`, we RemovePeer.
+//
+// Errors are logged, not returned — the caller is a heartbeat goroutine, and
+// a single bad peer must not prevent the rest of the set from converging.
+// On simulated hardware this is effectively a trace-only no-op (the
+// underlying wireguard package skips the wg binary).
+func (a *Agent) applyClientPeers(desired []cloud.ClientPeer) {
+	iface := a.cfg.VPN.Interface
+	live, err := wireguard.ListPeers(iface)
+	if err != nil {
+		log.Warn().Err(err).Msg("vpn: list peers failed — skipping peer sync")
+		return
+	}
+
+	// Build a pubkey-indexed view of both sides so the diff is O(n+m).
+	desiredByKey := make(map[string]cloud.ClientPeer, len(desired))
+	for _, p := range desired {
+		if p.PublicKey == "" {
+			continue
+		}
+		desiredByKey[p.PublicKey] = p
+	}
+	liveByKey := make(map[string]wireguard.RuntimePeer, len(live))
+	for _, p := range live {
+		liveByKey[p.PublicKey] = p
+	}
+
+	// Add/refresh peers that should exist. AddPeer is idempotent, so
+	// re-issuing a wg set with the same allowed-ips is cheap — we only
+	// skip it when nothing changed to keep the logs quiet.
+	var added, removed, refreshed int
+	for key, p := range desiredByKey {
+		if cur, ok := liveByKey[key]; ok {
+			if cur.AllowedIPs == p.AllowedIPs {
+				continue
+			}
+			if err := wireguard.AddPeer(iface, key, p.AllowedIPs, p.PersistentKeepalive); err != nil {
+				log.Warn().Err(err).Str("pubkey", key).Msg("vpn: refresh peer failed")
+				continue
+			}
+			refreshed++
+			continue
+		}
+		if err := wireguard.AddPeer(iface, key, p.AllowedIPs, p.PersistentKeepalive); err != nil {
+			log.Warn().Err(err).Str("pubkey", key).Msg("vpn: add peer failed")
+			continue
+		}
+		added++
+	}
+
+	// Revoke peers the cloud no longer lists.
+	for key := range liveByKey {
+		if _, ok := desiredByKey[key]; ok {
+			continue
+		}
+		if err := wireguard.RemovePeer(iface, key); err != nil {
+			log.Warn().Err(err).Str("pubkey", key).Msg("vpn: remove peer failed")
+			continue
+		}
+		removed++
+	}
+
+	if added+removed+refreshed > 0 {
+		log.Info().
+			Int("added", added).
+			Int("removed", removed).
+			Int("refreshed", refreshed).
+			Int("desired", len(desiredByKey)).
+			Int("live", len(liveByKey)).
+			Msg("vpn: client peer set converged")
 	}
 }
 

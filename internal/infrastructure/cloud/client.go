@@ -196,6 +196,20 @@ type VpnPeer struct {
 	PersistentKeepalive int     `json:"persistentKeepalive"`
 }
 
+// ClientPeer is one [Peer] block installed on the Pi's WG server for a
+// specific end user. The cloud returns the authoritative set in every
+// heartbeat — the agent diffs against `wg show dump` and calls
+// `wireguard.AddPeer` / `wireguard.RemovePeer` to converge.
+//
+// AllowedIPs is typically a single /32 (e.g. "10.77.42.17/32") — the
+// user's assigned peer IP inside this device's subnet. PersistentKeepalive
+// is advisory (applied only if > 0).
+type ClientPeer struct {
+	PublicKey           string `json:"publicKey"`
+	AllowedIPs          string `json:"allowedIps"`
+	PersistentKeepalive int    `json:"persistentKeepalive,omitempty"`
+}
+
 // HeartbeatResponse is the body returned by POST /api/v1/devices/heartbeat.
 // Two variants: "unclaimed" (the cloud has no Device for this code yet — user
 // hasn't claimed; agent should park with a waiting indicator) and "claimed".
@@ -213,6 +227,12 @@ type HeartbeatResponse struct {
 	// In the post-2026-04-22 no-hub world this describes the agent's OWN WG
 	// server (subnet + own pubkey echo), not a remote hub.
 	VpnPeer *VpnPeer `json:"vpnPeer,omitempty"`
+	// ClientPeers (claimed only): the authoritative set of user peers the
+	// cloud wants installed on this device's wg0 server. The agent diffs
+	// against `wg show dump` and adds/removes to converge. A nil slice (or
+	// missing field) means "no opinion — keep current peers" (legacy
+	// response). An empty slice `[]` means "drop all client peers".
+	ClientPeers []ClientPeer `json:"clientPeers,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.
