@@ -40,12 +40,14 @@ var Version = "dev"
 
 // Agent wires all infrastructure services together and owns the run loop.
 type Agent struct {
-	cfg       *config.Config
-	store     *storage.DeviceStore
-	identity  *device.Identity
-	cloud     *cloud.Client // nil when cloud.Enabled == false
-	srv       *server.Server
-	connSup   *connimpl.Supervisor // nil when auto-AP disabled or in simulated mode
+	cfg             *config.Config
+	store           *storage.DeviceStore
+	identity        *device.Identity
+	cloud           *cloud.Client // nil when cloud.Enabled == false
+	srv             *server.Server
+	usbipH          *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
+	connSup         *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
+	lastAppliedPeer string                 // cache: fingerprint of last applied VPN peer
 }
 
 // New creates an Agent from the given Config.
@@ -91,8 +93,10 @@ func New(cfg *config.Config) (*Agent, error) {
 
 	systemH := handlers.NewSystemHandler(Version, a.identity, netScan, cfg.VPN.ConfigPath, cfg.VPN.Interface)
 	networkH := handlers.NewNetworkHandler(netScan)
-	vpnH := handlers.NewVPNHandler(cfg.VPN.ConfigPath, cfg.VPN.Interface)
+	vpnH := handlers.NewVPNHandler(cfg.VPN.ConfigPath, cfg.VPN.Interface, cfg.VPN.PubkeyPath)
 	usbH := handlers.NewUSBHandler()
+	usbipH := handlers.NewUSBIPHandler(cfg)
+	a.usbipH = usbipH
 
 	// Connectivity (WiFi / cellular / setup-AP) — picks the right backend
 	// for the platform, plus an optional supervisor that auto-raises the
@@ -101,7 +105,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.connSup = connSup
 	connH := handlers.NewConnectivityHandler(connSvc)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, usbH, connH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, usbH, usbipH, connH)
 
 	return a, nil
 }
@@ -127,6 +131,13 @@ func (a *Agent) Run(ctx context.Context) error {
 			go a.firmwareLoop(ctx)
 		}
 	}
+
+	// Independent of cloud connectivity: keep the exported USB/IP set in
+	// sync with the active policy. Catches the case where a remote client
+	// detached (status 3→0) without the operator issuing an explicit PUT
+	// and the current policy has since diverged from what was allowed at
+	// bind time.
+	go a.policySweepLoop(ctx)
 
 	select {
 	case err := <-srvErr:
@@ -302,27 +313,52 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	}
 
 	// ── VPN ───────────────────────────────────────────────────────────────
-	// Only include the VPN section when the config file exists and contains
-	// a peer public key (required by the ES schema).
+	// The `publicKey` field advertised to the cloud is the DEVICE's own
+	// pubkey (from the world-readable mirror install.sh lays down), NOT the
+	// hub pubkey read from wg0.conf's [Peer] block. The cloud uses it to
+	// allocate a tunnel address and whitelist the peer on the hub.
 	var hbVPN *cloud.HBVPN
-	if a.cfg.VPN.ConfigPath != "" {
-		if st, err := wireguard.Read(a.cfg.VPN.ConfigPath); err == nil && st.PublicKey != "" {
-			hbVPN = &cloud.HBVPN{
-				InterfaceName: st.Interface,
-				PublicKey:     st.PublicKey,
-				Connected:     st.Connected,
-				Endpoint:      st.Endpoint,
-				AllowedIps:    st.AllowedIPs,
-				DNS:           st.DNS,
-				PeerCount:     1,
-			}
+	var ownPubkey string
+	if a.cfg.VPN.PubkeyPath != "" {
+		if key, err := wireguard.ReadOwnPubkey(a.cfg.VPN.PubkeyPath); err == nil && key != "" {
+			ownPubkey = key
+		}
+	}
+	if ownPubkey != "" {
+		// Read current config for drift-detection fields (address/endpoint/
+		// connected). Absence of [Peer] is fine — we still report publicKey.
+		iface := a.cfg.VPN.Interface
+		var address, endpoint, allowedIps, dnsStr string
+		var connected bool
+		if st, err := wireguard.Read(a.cfg.VPN.ConfigPath); err == nil {
+			iface = st.Interface
+			address = st.Address
+			endpoint = st.Endpoint
+			allowedIps = st.AllowedIPs
+			dnsStr = st.DNS
+			connected = st.Connected
+		}
+		hbVPN = &cloud.HBVPN{
+			InterfaceName: iface,
+			PublicKey:     ownPubkey,
+			Address:       address,
+			Connected:     connected,
+			Endpoint:      endpoint,
+			AllowedIps:    allowedIps,
+			DNS:           dnsStr,
+			PeerCount:     0,
+		}
+		if endpoint != "" {
+			hbVPN.PeerCount = 1
 		}
 	}
 
 	// ── USB + USB/IP ──────────────────────────────────────────────────────
+	// Share the USBIPServer instance owned by the HTTP handler so
+	// ExportedDevices() reflects actual bind state (a fresh instance would
+	// always report empty).
 	usbDevs, _ := usblister.List()
-	usbipSrv := usblister.NewUSBIPServer(a.cfg.USB.BindPort)
-	exportedIDs := usbipSrv.ExportedDevices()
+	exportedIDs := a.usbipH.Server().ExportedDevices()
 
 	var hbUSB *cloud.HBUSB
 	if len(usbDevs) > 0 || a.cfg.USB.USBIPEnabled {
@@ -352,10 +388,25 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			}
 			devices = append(devices, dev)
 		}
+
+		// Read kernel usbip_status per device to tell the cloud which
+		// shared devices have an active remote client attached. On
+		// non-Linux platforms this returns nil/empty and the field is
+		// omitted from the heartbeat.
+		var inUse []string
+		if sessions, err := usblister.ListSessions(); err == nil {
+			for _, s := range sessions {
+				if s.Attached {
+					inUse = append(inUse, s.BusID)
+				}
+			}
+		}
+
 		hbUSB = &cloud.HBUSB{
 			Devices:        devices,
 			UsbipEnabled:   a.cfg.USB.USBIPEnabled,
 			ExportedBusIDs: exportedIDs,
+			InUseBusIDs:    inUse,
 		}
 	}
 
@@ -370,10 +421,90 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		USB:              hbUSB,
 	}
 
-	if _, err := a.cloud.Heartbeat(ctx, payload); err != nil {
+	resp, err := a.cloud.Heartbeat(ctx, payload)
+	if err != nil {
 		log.Warn().Err(err).Msg("heartbeat send failed")
-	} else {
-		log.Debug().Msg("heartbeat sent")
+		return
+	}
+	log.Debug().Msg("heartbeat sent")
+
+	if resp.VpnPeer != nil {
+		a.maybeApplyPeer(resp.VpnPeer)
+	}
+}
+
+// peerFingerprint summarises a VpnPeer for the "has this changed?" check.
+// Includes every user-visible field so any cloud update triggers a re-apply.
+func peerFingerprint(p *cloud.VpnPeer) string {
+	dns := ""
+	if p.DNS != nil {
+		dns = *p.DNS
+	}
+	return strings.Join([]string{
+		p.ServerPublicKey, p.Endpoint, p.Address, p.AllowedIPs, dns,
+		fmt.Sprintf("%d", p.PersistentKeepalive),
+	}, "|")
+}
+
+// maybeApplyPeer materialises a new wg0.conf when the cloud has sent a peer
+// block different from the last one we applied. No-op on the very common
+// case where the cloud keeps returning the same block every 60 s.
+func (a *Agent) maybeApplyPeer(p *cloud.VpnPeer) {
+	fp := peerFingerprint(p)
+	if fp == a.lastAppliedPeer {
+		return
+	}
+	dns := ""
+	if p.DNS != nil {
+		dns = *p.DNS
+	}
+	assignment := wireguard.PeerAssignment{
+		ServerPublicKey:     p.ServerPublicKey,
+		Endpoint:            p.Endpoint,
+		Address:             p.Address,
+		AllowedIPs:          p.AllowedIPs,
+		DNS:                 dns,
+		PersistentKeepalive: p.PersistentKeepalive,
+	}
+	if err := wireguard.ApplyPeer(a.cfg.VPN.ConfigPath, a.cfg.VPN.PrivateKeyPath, assignment); err != nil {
+		log.Error().Err(err).Msg("vpn: failed to apply peer from heartbeat")
+		return
+	}
+	a.lastAppliedPeer = fp
+	log.Info().
+		Str("address", p.Address).
+		Str("endpoint", p.Endpoint).
+		Msg("vpn: peer applied from cloud heartbeat")
+}
+
+// policySweepInterval is how often the agent re-checks currently-exported
+// bus IDs against the active USB policy. Short enough that a stale
+// permission (e.g. rule removed while a remote client was still attached)
+// is revoked within a minute of the remote client detaching.
+const policySweepInterval = 30 * time.Second
+
+// policySweepLoop periodically invokes the USBIPHandler's policy
+// re-enforcement so phantom exports / rule-drifted shares get cleaned up
+// even if no explicit policy update came in.
+func (a *Agent) policySweepLoop(ctx context.Context) {
+	if a.usbipH == nil {
+		return
+	}
+	ticker := time.NewTicker(policySweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			revoked, errs := a.usbipH.ReenforcePolicy()
+			if len(revoked) > 0 {
+				log.Info().Strs("busIds", revoked).Msg("usbip: periodic sweep revoked exports")
+			}
+			for _, err := range errs {
+				log.Warn().Err(err).Msg("usbip: periodic sweep error")
+			}
+		}
 	}
 }
 

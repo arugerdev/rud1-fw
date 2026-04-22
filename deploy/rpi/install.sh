@@ -164,6 +164,93 @@ if [[ -f "$SCRIPT_DIR/sysctl/99-rud1.conf" ]]; then
   sysctl --system >/dev/null
 fi
 
+# ── WireGuard bootstrap (keys + skeleton conf + auto-start unit) ─────────────
+# Goal: leave the device ready to participate in the cloud-managed mesh as soon
+# as the backend issues a peer config. We generate a per-device keypair on
+# first install, surface the public key to userspace, write a *skeleton*
+# /etc/wireguard/wg0.conf with the private key only (no [Peer] yet), and
+# enable wg-quick@wg0 so it auto-comes-up once the agent's
+# `POST /api/vpn/config` endpoint (or a manual edit) writes the [Peer] block.
+#
+# Idempotent: re-running never overwrites the existing keys or any config that
+# already has a [Peer] section (i.e. cloud-provisioned).
+WG_DIR="/etc/wireguard"
+WG_PRIV="$WG_DIR/privatekey"
+WG_PUB="$WG_DIR/publickey"
+WG_CONF="$WG_DIR/wg0.conf"
+WG_PUB_PUBLIC="$CONFIG_DIR/wg-pubkey.txt"  # world-readable mirror (panel reads it)
+
+install -d -m 0700 "$WG_DIR"
+
+if command -v wg >/dev/null; then
+  if [[ ! -s "$WG_PRIV" ]]; then
+    log "Generating WireGuard keypair → $WG_DIR"
+    umask 077
+    wg genkey | tee "$WG_PRIV" >/dev/null
+    wg pubkey < "$WG_PRIV" > "$WG_PUB"
+    chmod 600 "$WG_PRIV"
+    chmod 644 "$WG_PUB"
+  else
+    ok "WireGuard private key already present, keeping it"
+    # Recompute pubkey if missing (e.g. someone deleted it).
+    if [[ ! -s "$WG_PUB" ]]; then
+      wg pubkey < "$WG_PRIV" > "$WG_PUB"
+      chmod 644 "$WG_PUB"
+    fi
+  fi
+
+  # Skeleton wg0.conf — only written if no config exists yet, OR if the
+  # current config has no [Peer] section (i.e. still a skeleton). This way
+  # we never clobber a cloud-issued peer block on re-install.
+  WG_PRIV_VALUE="$(cat "$WG_PRIV")"
+  if [[ ! -f "$WG_CONF" ]] || ! grep -q '^\[Peer\]' "$WG_CONF" 2>/dev/null; then
+    log "Writing skeleton $WG_CONF (no [Peer] yet — cloud will provision)"
+    umask 077
+    cat > "$WG_CONF" <<EOF
+# Rud1 WireGuard skeleton — written by install.sh.
+# The agent overwrites this file once the cloud issues peer parameters via
+#   POST /api/vpn/config
+# Manual edits between [Interface] and the (future) [Peer] block are safe;
+# re-running install.sh does NOT clobber a config that already has a [Peer].
+
+[Interface]
+PrivateKey = ${WG_PRIV_VALUE}
+# Address = 10.200.x.y/32      ← assigned by the cloud during pairing
+# DNS     = 10.200.0.1
+# ListenPort is intentionally omitted: clients dial out, no inbound port.
+
+# [Peer]                        ← appended by the agent or by the cloud
+# PublicKey  = <server-pubkey>
+# Endpoint   = vpn.rud1.es:51820
+# AllowedIPs = 10.200.0.0/16
+# PersistentKeepalive = 25
+EOF
+    chmod 600 "$WG_CONF"
+  else
+    ok "$WG_CONF already has a [Peer] block, leaving it untouched"
+  fi
+
+  # Mirror the pubkey under /etc/rud1-agent so the agent / panel can show it
+  # without needing to read /etc/wireguard (which is 0700, root-only).
+  install -d -m 0755 "$CONFIG_DIR"
+  install -m 0644 "$WG_PUB" "$WG_PUB_PUBLIC"
+
+  # Enable the auto-start target. wg-quick refuses to bring an interface up
+  # without a [Peer], so this is a no-op until the cloud writes one — at
+  # which point a `systemctl start wg-quick@wg0` (or a reboot) attaches it.
+  if systemctl list-unit-files 'wg-quick@.service' >/dev/null 2>&1; then
+    systemctl enable wg-quick@wg0.service >/dev/null 2>&1 || true
+    # If the conf already has a [Peer], try to bring it up now (idempotent).
+    if grep -q '^\[Peer\]' "$WG_CONF" 2>/dev/null; then
+      log "Bringing wg0 up (config has a [Peer])"
+      systemctl restart wg-quick@wg0.service 2>/dev/null || \
+        warn "wg-quick@wg0 failed to start — check: journalctl -u wg-quick@wg0"
+    fi
+  fi
+else
+  warn "wg binary not found — skipping WireGuard bootstrap (was apt blocked?)"
+fi
+
 # ── Install binary ───────────────────────────────────────────────────────────
 if [[ -f "$SCRIPT_DIR/bin/rud1-agent" ]]; then
   log "Installing bundled agent binary → $INSTALL_BIN"
@@ -332,4 +419,20 @@ if [[ -n "$REG_CODE" ]]; then
 else
   warn "Could not read registration code yet. Watch the logs:"
   echo "     journalctl -u rud1-agent -f"
+fi
+
+# ── WireGuard public key ─────────────────────────────────────────────────────
+if [[ -s "$WG_PUB" ]]; then
+  WG_PUB_VALUE="$(cat "$WG_PUB")"
+  WG_STATE="not connected (no [Peer] in $WG_CONF yet)"
+  if ip link show wg0 >/dev/null 2>&1; then
+    WG_STATE="up"
+  fi
+  echo "  ────────────────────────────────────────────────────"
+  echo "   WireGuard public key:"
+  echo "     ${WG_PUB_VALUE}"
+  echo "   Interface state: ${WG_STATE}"
+  echo "   Mirror (read-only): ${WG_PUB_PUBLIC}"
+  echo "  ────────────────────────────────────────────────────"
+  echo
 fi

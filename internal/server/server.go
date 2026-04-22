@@ -27,15 +27,18 @@ type Server struct {
 }
 
 // New assembles the Server with all routes and middleware.
+//
+// usbipH is shared with the agent's heartbeat loop so the authoritative
+// ExportedDevices() list comes from a single USBIPServer instance.
 func New(
 	cfg *config.Config,
 	systemH *handlers.SystemHandler,
 	networkH *handlers.NetworkHandler,
 	vpnH *handlers.VPNHandler,
 	usbH *handlers.USBHandler,
+	usbipH *handlers.USBIPHandler,
 	connH *handlers.ConnectivityHandler,
 ) *Server {
-	usbipH := handlers.NewUSBIPHandler(&cfg.USB)
 
 	r := chi.NewRouter()
 
@@ -95,11 +98,23 @@ func New(
 
 		r.Get("/api/usb/devices", usbH.List)
 
-		// USB/IP server management (authorized nets only)
+		// USB/IP server management (authorized nets only).
+		//
+		// export/attach and unexport/detach are intentional aliases — the
+		// former match `usbip bind/unbind` terminology and the latter match
+		// the client-facing "attach/detach" verbs used by rud1-es Connect
+		// tab and the rud1-desktop Electron bridge. Both paths go through
+		// the same policy-checked code path.
 		r.Get("/api/usbip/status", usbipH.Status)
 		r.Get("/api/usbip/exportable", usbipH.Exportable)
+		r.Get("/api/usbip/sessions", usbipH.Sessions)
+		r.Get("/api/usbip/policy", usbipH.Policy)
+		r.Put("/api/usbip/policy", usbipH.SetPolicy)
+		r.Get("/api/usbip/revocations", usbipH.RevocationsList)
 		r.Post("/api/usbip/export", usbipH.Export)
 		r.Delete("/api/usbip/export", usbipH.Unexport)
+		r.Post("/api/usbip/attach", usbipH.Attach)
+		r.Delete("/api/usbip/attach", usbipH.Detach)
 	})
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

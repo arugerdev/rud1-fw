@@ -134,7 +134,8 @@ type HBNetwork struct {
 // Only included when the VPN config exists and has a public key.
 type HBVPN struct {
 	InterfaceName string  `json:"interfaceName"`
-	PublicKey     string  `json:"publicKey"`
+	PublicKey     string  `json:"publicKey"` // device's OWN pubkey
+	Address       string  `json:"address,omitempty"`
 	Connected     bool    `json:"connected"`
 	Endpoint      string  `json:"endpoint,omitempty"`
 	AllowedIps    string  `json:"allowedIps,omitempty"`
@@ -156,16 +157,35 @@ type HBUSBDevice struct {
 
 // HBUSB wraps the USB device list and USB/IP server state.
 type HBUSB struct {
-	Devices         []HBUSBDevice `json:"devices"`
-	UsbipEnabled    bool          `json:"usbipEnabled"`
-	ExportedBusIDs  []string      `json:"exportedBusIds,omitempty"`
+	Devices        []HBUSBDevice `json:"devices"`
+	UsbipEnabled   bool          `json:"usbipEnabled"`
+	ExportedBusIDs []string      `json:"exportedBusIds,omitempty"`
+	// InUseBusIDs lists bus IDs for which the kernel reports an active
+	// remote client attachment (usbip_status == 3). Useful for the
+	// Connect tab's "Attached" badge and for the VPN_DOWN cleanup logic.
+	InUseBusIDs []string `json:"inUseBusIds,omitempty"`
+}
+
+// VpnPeer is the [Peer] block the cloud pushes to the agent when it has
+// assigned this device a tunnel address. The agent materialises a full
+// wg0.conf from it. All fields are required when VpnPeer is non-nil.
+type VpnPeer struct {
+	ServerPublicKey     string  `json:"serverPublicKey"`
+	Endpoint            string  `json:"endpoint"`
+	Address             string  `json:"address"`    // e.g. "10.200.1.7/32"
+	AllowedIPs          string  `json:"allowedIps"` // e.g. "10.200.0.0/16"
+	DNS                 *string `json:"dns"`
+	PersistentKeepalive int     `json:"persistentKeepalive"`
 }
 
 // HeartbeatResponse is the body returned by POST /api/v1/devices/heartbeat.
 type HeartbeatResponse struct {
-	OK                 bool   `json:"ok"`
-	DeviceID           string `json:"deviceId"`
-	NextCheckInSeconds int    `json:"nextCheckInSeconds"`
+	OK                 bool     `json:"ok"`
+	DeviceID           string   `json:"deviceId"`
+	NextCheckInSeconds int      `json:"nextCheckInSeconds"`
+	// VpnPeer is the peer config the device must install, or nil if the
+	// cloud isn't acting as a WG hub (WG_SERVER_* env vars not set).
+	VpnPeer            *VpnPeer `json:"vpnPeer,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.

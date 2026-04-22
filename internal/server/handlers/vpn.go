@@ -14,48 +14,83 @@ import (
 
 // VPNHandler serves VPN-related API endpoints.
 type VPNHandler struct {
-	configPath string
-	iface      string
+	configPath    string
+	iface         string
+	ownPubkeyPath string
 }
 
-// NewVPNHandler creates a VPNHandler for the given WireGuard config file and interface name.
-func NewVPNHandler(configPath, iface string) *VPNHandler {
-	return &VPNHandler{configPath: configPath, iface: iface}
+// NewVPNHandler creates a VPNHandler for the given WireGuard config file and
+// interface name. ownPubkeyPath points at the world-readable mirror of the
+// device's own WG public key (see VPNConfig.PubkeyPath) — may be empty on
+// older deployments, in which case the `ownPublicKey` field is omitted.
+func NewVPNHandler(configPath, iface, ownPubkeyPath string) *VPNHandler {
+	return &VPNHandler{configPath: configPath, iface: iface, ownPubkeyPath: ownPubkeyPath}
 }
 
 // vpnStatusResponse is the payload returned by GET /api/vpn/status.
+//
+// `publicKey` is the [Peer] pubkey (the hub's) parsed from wg0.conf.
+// `ownPublicKey` is the DEVICE's own pubkey — useful for the local panel to
+// display the identity this device advertises to the cloud.
+// `lastHandshake` is the most recent handshake across peers as unix seconds,
+// 0 when the device has never handshaked (or hardware is simulated).
 type vpnStatusResponse struct {
-	Interface  string `json:"interface"`
-	Connected  bool   `json:"connected"`
-	Address    string `json:"address"`
-	DNS        string `json:"dns"`
-	Endpoint   string `json:"endpoint"`
-	AllowedIPs string `json:"allowedIPs"`
-	PublicKey  string `json:"publicKey"`
+	Interface     string `json:"interface"`
+	Connected     bool   `json:"connected"`
+	Address       string `json:"address"`
+	DNS           string `json:"dns"`
+	Endpoint      string `json:"endpoint"`
+	AllowedIPs    string `json:"allowedIPs"`
+	PublicKey     string `json:"publicKey"`
+	OwnPublicKey  string `json:"ownPublicKey,omitempty"`
+	LastHandshake int64  `json:"lastHandshake"`
 }
 
 // Status handles GET /api/vpn/status.
 func (h *VPNHandler) Status(w http.ResponseWriter, r *http.Request) {
+	ownPubkey := h.readOwnPubkey()
+
 	st, err := wireguard.Read(h.configPath)
 	if err != nil {
 		log.Warn().Err(err).Str("path", h.configPath).Msg("could not read wireguard config")
 		// Return a minimal status rather than erroring when the file simply doesn't exist yet.
 		writeJSON(w, http.StatusOK, vpnStatusResponse{
-			Interface: h.iface,
-			Connected: wireguard.IsConnected(h.iface),
+			Interface:    h.iface,
+			Connected:    wireguard.IsConnected(h.iface),
+			OwnPublicKey: ownPubkey,
 		})
 		return
 	}
 
+	var handshake int64
+	if st.Connected {
+		if ts, err := wireguard.LatestHandshake(st.Interface); err == nil && !ts.IsZero() {
+			handshake = ts.Unix()
+		}
+	}
+
 	writeJSON(w, http.StatusOK, vpnStatusResponse{
-		Interface:  st.Interface,
-		Connected:  st.Connected,
-		Address:    st.Address,
-		DNS:        st.DNS,
-		Endpoint:   st.Endpoint,
-		AllowedIPs: st.AllowedIPs,
-		PublicKey:  st.PublicKey,
+		Interface:     st.Interface,
+		Connected:     st.Connected,
+		Address:       st.Address,
+		DNS:           st.DNS,
+		Endpoint:      st.Endpoint,
+		AllowedIPs:    st.AllowedIPs,
+		PublicKey:     st.PublicKey,
+		OwnPublicKey:  ownPubkey,
+		LastHandshake: handshake,
 	})
+}
+
+func (h *VPNHandler) readOwnPubkey() string {
+	if h.ownPubkeyPath == "" {
+		return ""
+	}
+	key, err := wireguard.ReadOwnPubkey(h.ownPubkeyPath)
+	if err != nil {
+		return ""
+	}
+	return key
 }
 
 // Reconnect handles POST /api/vpn/reconnect.
