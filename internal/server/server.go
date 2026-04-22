@@ -41,6 +41,7 @@ func New(
 	connH *handlers.ConnectivityHandler,
 	identityH *handlers.IdentityHandler,
 	lanH *handlers.LANHandler,
+	lanProbeH *handlers.LANProbeHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -120,6 +121,11 @@ func New(
 		r.Post("/api/lan/routes", lanH.Add)
 		r.Put("/api/lan/routes", lanH.Set)
 		r.Delete("/api/lan/routes", lanH.Remove)
+
+		// LAN reachability probe — read-only, does not touch iptables.
+		// Lets rud1-app validate a host/IP before asking the operator to
+		// commit a new route.
+		r.Get("/api/lan/probe", lanProbeH.Probe)
 
 		r.Get("/api/usb/devices", usbH.List)
 

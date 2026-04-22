@@ -180,6 +180,9 @@ func New(cfg *config.Config) (*Agent, error) {
 	lanMgr.Configure(deriveSubnet(a.identity.RegistrationCode)+".0/24", uplink)
 	a.lanMgr = lanMgr
 	lanH := handlers.NewLANHandler(cfg, lanMgr)
+	// Reachability probe lives next to the routes API so the UI can
+	// sanity-check a target before asking the operator to expose it.
+	lanProbeH := handlers.NewLANProbeHandler(&lan.Prober{})
 	// Seed the kernel with the persisted desired set so a reboot re-installs
 	// any rules the operator had enabled before.
 	if cfg.LAN.Enabled && len(cfg.LAN.Routes) > 0 {
@@ -197,7 +200,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.connSup = connSup
 	connH := handlers.NewConnectivityHandler(connSvc)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH)
 
 	return a, nil
 }
