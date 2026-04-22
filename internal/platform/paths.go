@@ -69,3 +69,21 @@ func LogDir() string {
 func EnsureDir(path string) error {
 	return os.MkdirAll(path, 0o755)
 }
+
+// BootIdentityPath returns the path where the device's code + PIN identity
+// is persisted. The file is 0400 and lives on /boot (FAT partition) so it
+// survives an OS reinstall as long as the SD card is physically preserved.
+// Manufacturing can also pre-seed this file before shipping the device.
+//
+//   - Linux production:  /boot/rud1-identity.json
+//   - Dev/simulated:     <DataDir>/rud1-identity.json  (easier to clear)
+//   - Override:          $RUD1_IDENTITY_PATH
+func BootIdentityPath() string {
+	if env := os.Getenv("RUD1_IDENTITY_PATH"); env != "" {
+		return env
+	}
+	if IsLinux() && !SimulateHardware() {
+		return "/boot/rud1-identity.json"
+	}
+	return filepath.Join(DataDir(), "rud1-identity.json")
+}

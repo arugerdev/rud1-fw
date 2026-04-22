@@ -76,14 +76,20 @@ func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterRe
 
 // HeartbeatPayload matches the nested schema expected by POST /api/v1/devices/heartbeat.
 type HeartbeatPayload struct {
-	RegistrationCode string      `json:"registrationCode"`
-	SerialNumber     string      `json:"serialNumber,omitempty"`
-	FirmwareVersion  string      `json:"firmwareVersion,omitempty"`
-	Info             *HBInfo     `json:"info,omitempty"`
-	Metrics          *HBMetrics  `json:"metrics,omitempty"`
-	Network          *HBNetwork  `json:"network,omitempty"`
-	VPN              *HBVPN      `json:"vpn,omitempty"`
-	USB              *HBUSB      `json:"usb,omitempty"`
+	RegistrationCode string     `json:"registrationCode"`
+	// RegistrationPin is the 6-digit PIN from /boot/rud1-identity.json.
+	// Required on the bootstrap heartbeat (no Device yet) so the cloud can
+	// stage the DeviceIdentity row the user will claim against. Also
+	// verified on every subsequent heartbeat to prevent a code-only attacker
+	// from impersonating the device.
+	RegistrationPin string     `json:"registrationPin,omitempty"`
+	SerialNumber    string     `json:"serialNumber,omitempty"`
+	FirmwareVersion string     `json:"firmwareVersion,omitempty"`
+	Info            *HBInfo    `json:"info,omitempty"`
+	Metrics         *HBMetrics `json:"metrics,omitempty"`
+	Network         *HBNetwork `json:"network,omitempty"`
+	VPN             *HBVPN     `json:"vpn,omitempty"`
+	USB             *HBUSB     `json:"usb,omitempty"`
 }
 
 // HBInfo carries static device identification fields.
@@ -134,14 +140,26 @@ type HBNetwork struct {
 // Only included when the VPN config exists and has a public key.
 type HBVPN struct {
 	InterfaceName string  `json:"interfaceName"`
-	PublicKey     string  `json:"publicKey"` // device's OWN pubkey
+	PublicKey     string  `json:"publicKey"` // device's own WG SERVER pubkey
 	Address       string  `json:"address,omitempty"`
 	Connected     bool    `json:"connected"`
-	Endpoint      string  `json:"endpoint,omitempty"`
-	AllowedIps    string  `json:"allowedIps,omitempty"`
-	DNS           string  `json:"dns,omitempty"`
-	PeerCount     int     `json:"peerCount"`
-	LastHandshake *string `json:"lastHandshake,omitempty"`
+	// Endpoint kept for legacy readers — equivalent to PublicEndpoint now.
+	Endpoint        string  `json:"endpoint,omitempty"`
+	// PublicEndpoint is the router-visible "host:port" the agent discovered
+	// via UPnP / STUN / /echo-ip. rud1-es stores it on VpnConfig.endpoint
+	// and serves it as the Endpoint in client .conf files.
+	PublicEndpoint  string  `json:"publicEndpoint,omitempty"`
+	// UPnPOK signals whether the NAT mapping was successfully negotiated.
+	// Nil means we never tried; false means we tried and failed (fell back
+	// to STUN + keepalive); true means the port is authoritatively open.
+	UPnPOK          *bool   `json:"upnpOk,omitempty"`
+	// NATType is the STUN-derived classification of our outgoing NAT:
+	// "open" | "restricted" | "symmetric" | "unknown".
+	NATType         string  `json:"natType,omitempty"`
+	AllowedIps      string  `json:"allowedIps,omitempty"`
+	DNS             string  `json:"dns,omitempty"`
+	PeerCount       int     `json:"peerCount"`
+	LastHandshake   *string `json:"lastHandshake,omitempty"`
 }
 
 // HBUSBDevice is one USB device in a heartbeat.
@@ -179,13 +197,22 @@ type VpnPeer struct {
 }
 
 // HeartbeatResponse is the body returned by POST /api/v1/devices/heartbeat.
+// Two variants: "unclaimed" (the cloud has no Device for this code yet — user
+// hasn't claimed; agent should park with a waiting indicator) and "claimed".
 type HeartbeatResponse struct {
-	OK                 bool     `json:"ok"`
-	DeviceID           string   `json:"deviceId"`
-	NextCheckInSeconds int      `json:"nextCheckInSeconds"`
-	// VpnPeer is the peer config the device must install, or nil if the
-	// cloud isn't acting as a WG hub (WG_SERVER_* env vars not set).
-	VpnPeer            *VpnPeer `json:"vpnPeer,omitempty"`
+	OK                 bool   `json:"ok"`
+	// Status is "claimed" or "unclaimed". Older firmware pre-pivot doesn't
+	// branch on this; new firmware MUST check before trusting DeviceID.
+	Status             string `json:"status,omitempty"`
+	// RegistrationCode echoes the code on unclaimed responses so the agent
+	// can log it without inspecting its own config.
+	RegistrationCode   string `json:"registrationCode,omitempty"`
+	DeviceID           string `json:"deviceId,omitempty"`
+	NextCheckInSeconds int    `json:"nextCheckInSeconds"`
+	// VpnPeer (claimed only): the peer descriptor the device applies locally.
+	// In the post-2026-04-22 no-hub world this describes the agent's OWN WG
+	// server (subnet + own pubkey echo), not a remote hub.
+	VpnPeer *VpnPeer `json:"vpnPeer,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.

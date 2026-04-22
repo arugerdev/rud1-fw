@@ -38,6 +38,7 @@ func New(
 	usbH *handlers.USBHandler,
 	usbipH *handlers.USBIPHandler,
 	connH *handlers.ConnectivityHandler,
+	identityH *handlers.IdentityHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -59,6 +60,13 @@ func New(
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}` + "\n"))
 	})
+
+	// Identity — NO auth required because rud1-app displays this to the
+	// user during setup (before any token is agreed on) and the info is
+	// the same as what's printed on the device's sticker. Binding the
+	// local API to LAN only keeps the blast radius the same as physical
+	// access, which is the intended trust model.
+	r.Get("/api/identity", identityH.Get)
 
 	// Authenticated API routes.
 	r.Group(func(r chi.Router) {

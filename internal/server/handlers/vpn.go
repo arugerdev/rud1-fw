@@ -8,56 +8,86 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/nat"
 	wireguard "github.com/rud1-es/rud1-fw/internal/infrastructure/vpn"
 	"github.com/rud1-es/rud1-fw/internal/platform"
 )
+
+// NatSnapshot is a callback the agent provides so this handler can surface
+// the most recent NAT discovery (public endpoint, UPnP state, NAT type)
+// without the handler having to own the discovery loop. Returning the zero
+// value is safe — the handler treats empty fields as "not discovered yet".
+type NatSnapshot func() nat.Discovery
 
 // VPNHandler serves VPN-related API endpoints.
 type VPNHandler struct {
 	configPath    string
 	iface         string
 	ownPubkeyPath string
+	natSnapshot   NatSnapshot // may be nil in legacy wiring
 }
 
 // NewVPNHandler creates a VPNHandler for the given WireGuard config file and
 // interface name. ownPubkeyPath points at the world-readable mirror of the
-// device's own WG public key (see VPNConfig.PubkeyPath) — may be empty on
-// older deployments, in which case the `ownPublicKey` field is omitted.
-func NewVPNHandler(configPath, iface, ownPubkeyPath string) *VPNHandler {
-	return &VPNHandler{configPath: configPath, iface: iface, ownPubkeyPath: ownPubkeyPath}
+// device's own WG public key. `natSnap` is optional — when nil the handler
+// omits the NAT-related response fields.
+func NewVPNHandler(configPath, iface, ownPubkeyPath string, natSnap NatSnapshot) *VPNHandler {
+	return &VPNHandler{
+		configPath:    configPath,
+		iface:         iface,
+		ownPubkeyPath: ownPubkeyPath,
+		natSnapshot:   natSnap,
+	}
 }
 
 // vpnStatusResponse is the payload returned by GET /api/vpn/status.
 //
-// `publicKey` is the [Peer] pubkey (the hub's) parsed from wg0.conf.
-// `ownPublicKey` is the DEVICE's own pubkey — useful for the local panel to
-// display the identity this device advertises to the cloud.
-// `lastHandshake` is the most recent handshake across peers as unix seconds,
-// 0 when the device has never handshaked (or hardware is simulated).
+// Post-2026-04-22 (no hub) semantics:
+//   - publicKey      → the device's own WG server pubkey (also = ownPublicKey,
+//                      kept as an alias for legacy UI consumers).
+//   - publicEndpoint → the router-visible "host:port" the agent discovered.
+//   - upnpOk         → true iff UPnP/NAT-PMP mapped the port successfully.
+//   - natType        → "open" | "restricted" | "symmetric" | "unknown".
+//   - natSource      → which discovery path produced the endpoint.
 type vpnStatusResponse struct {
-	Interface     string `json:"interface"`
-	Connected     bool   `json:"connected"`
-	Address       string `json:"address"`
-	DNS           string `json:"dns"`
-	Endpoint      string `json:"endpoint"`
-	AllowedIPs    string `json:"allowedIPs"`
-	PublicKey     string `json:"publicKey"`
-	OwnPublicKey  string `json:"ownPublicKey,omitempty"`
-	LastHandshake int64  `json:"lastHandshake"`
+	Interface      string `json:"interface"`
+	Connected      bool   `json:"connected"`
+	Address        string `json:"address"`
+	DNS            string `json:"dns"`
+	Endpoint       string `json:"endpoint"`
+	AllowedIPs     string `json:"allowedIPs"`
+	PublicKey      string `json:"publicKey"`
+	OwnPublicKey   string `json:"ownPublicKey,omitempty"`
+	LastHandshake  int64  `json:"lastHandshake"`
+	PublicEndpoint string `json:"publicEndpoint,omitempty"`
+	UPnPOK         bool   `json:"upnpOk"`
+	NATType        string `json:"natType,omitempty"`
+	NATSource      string `json:"natSource,omitempty"`
 }
 
 // Status handles GET /api/vpn/status.
 func (h *VPNHandler) Status(w http.ResponseWriter, r *http.Request) {
 	ownPubkey := h.readOwnPubkey()
 
+	// Fetch NAT snapshot up-front so both the happy-path and the "no config
+	// file yet" branch can populate the response.
+	var natSnap nat.Discovery
+	if h.natSnapshot != nil {
+		natSnap = h.natSnapshot()
+	}
+
 	st, err := wireguard.Read(h.configPath)
 	if err != nil {
 		log.Warn().Err(err).Str("path", h.configPath).Msg("could not read wireguard config")
-		// Return a minimal status rather than erroring when the file simply doesn't exist yet.
 		writeJSON(w, http.StatusOK, vpnStatusResponse{
-			Interface:    h.iface,
-			Connected:    wireguard.IsConnected(h.iface),
-			OwnPublicKey: ownPubkey,
+			Interface:      h.iface,
+			Connected:      wireguard.IsConnected(h.iface),
+			PublicKey:      ownPubkey, // no hub — our own key is the peer ref.
+			OwnPublicKey:   ownPubkey,
+			PublicEndpoint: natSnap.PublicEndpoint,
+			UPnPOK:         natSnap.UPnPOK,
+			NATType:        natSnap.NATType,
+			NATSource:      natSnap.Source,
 		})
 		return
 	}
@@ -70,16 +100,32 @@ func (h *VPNHandler) Status(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, vpnStatusResponse{
-		Interface:     st.Interface,
-		Connected:     st.Connected,
-		Address:       st.Address,
-		DNS:           st.DNS,
-		Endpoint:      st.Endpoint,
-		AllowedIPs:    st.AllowedIPs,
-		PublicKey:     st.PublicKey,
-		OwnPublicKey:  ownPubkey,
-		LastHandshake: handshake,
+		Interface:      st.Interface,
+		Connected:      st.Connected,
+		Address:        st.Address,
+		DNS:            st.DNS,
+		// Prefer the NAT-discovered endpoint over whatever might be
+		// written in the config. Falls back to st.Endpoint only if the
+		// discovery hasn't populated yet.
+		Endpoint:       firstNonEmpty(natSnap.PublicEndpoint, st.Endpoint),
+		AllowedIPs:     st.AllowedIPs,
+		PublicKey:      firstNonEmpty(ownPubkey, st.PublicKey),
+		OwnPublicKey:   ownPubkey,
+		LastHandshake:  handshake,
+		PublicEndpoint: natSnap.PublicEndpoint,
+		UPnPOK:         natSnap.UPnPOK,
+		NATType:        natSnap.NATType,
+		NATSource:      natSnap.Source,
 	})
+}
+
+func firstNonEmpty(candidates ...string) string {
+	for _, c := range candidates {
+		if c != "" {
+			return c
+		}
+	}
+	return ""
 }
 
 func (h *VPNHandler) readOwnPubkey() string {

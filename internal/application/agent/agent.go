@@ -10,12 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -23,13 +24,15 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/config"
 	"github.com/rud1-es/rud1-fw/internal/domain/device"
 	domainnet "github.com/rud1-es/rud1-fw/internal/domain/network"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/bootidentity"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/cloud"
 	connimpl "github.com/rud1-es/rud1-fw/internal/infrastructure/connectivity"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/nat"
 	netscanner "github.com/rud1-es/rud1-fw/internal/infrastructure/network"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/storage"
 	sysinfo "github.com/rud1-es/rud1-fw/internal/infrastructure/system"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
-	"github.com/rud1-es/rud1-fw/internal/infrastructure/vpn"
+	wireguard "github.com/rud1-es/rud1-fw/internal/infrastructure/vpn"
 	"github.com/rud1-es/rud1-fw/internal/platform"
 	"github.com/rud1-es/rud1-fw/internal/server"
 	"github.com/rud1-es/rud1-fw/internal/server/handlers"
@@ -40,39 +43,68 @@ var Version = "dev"
 
 // Agent wires all infrastructure services together and owns the run loop.
 type Agent struct {
-	cfg             *config.Config
-	store           *storage.DeviceStore
-	identity        *device.Identity
-	cloud           *cloud.Client // nil when cloud.Enabled == false
-	srv             *server.Server
-	usbipH          *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
-	connSup         *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
-	lastAppliedPeer string                 // cache: fingerprint of last applied VPN peer
+	cfg      *config.Config
+	store    *storage.DeviceStore
+	identity *device.Identity
+	boot     bootidentity.Identity // immutable code+pin from /boot
+	cloud    *cloud.Client         // nil when cloud.Enabled == false
+	srv      *server.Server
+	usbipH   *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
+	connSup  *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
+
+	// WireGuard SERVER identity — generated at first boot, persisted under
+	// /var/lib/rud1-agent and mirrored (public half only) for the heartbeat.
+	wgPubkey string
+
+	// NAT discovery cache. Populated by `natDiscoveryLoop` every ~20 min and
+	// read by every heartbeat. Guarded by `natMu` because the loop writes
+	// from its own goroutine.
+	natMu    sync.RWMutex
+	natState nat.Discovery
+
+	lastAppliedSubnet string // cache: which subnet we last materialised in wg0.conf
 }
 
 // New creates an Agent from the given Config.
 func New(cfg *config.Config) (*Agent, error) {
 	a := &Agent{cfg: cfg}
 
-	// --- Storage & identity ---
+	// --- Boot identity (immutable code+pin) ---
+	// Loaded once from /boot/rud1-identity.json (or generated if missing).
+	// This is the source of truth for RegistrationCode/Pin — the runtime
+	// storage below just caches hostname and post-claim DeviceID.
+	bootID, err := bootidentity.EnsureIdentity(platform.BootIdentityPath())
+	if err != nil {
+		return nil, fmt.Errorf("ensure boot identity: %w", err)
+	}
+	a.boot = bootID
+
+	// --- Runtime identity (hostname + post-claim device_id cache) ---
 	a.store = storage.NewDeviceStore()
 	id, err := a.store.Load()
 	if err != nil && !errors.Is(err, storage.ErrNoIdentity) {
 		return nil, fmt.Errorf("load device identity: %w", err)
 	}
 	if errors.Is(err, storage.ErrNoIdentity) {
-		regCode := cfg.Cloud.RegistrationCode
-		if regCode == "" {
-			regCode = generateRegistrationCode()
-		}
 		hostname, _ := os.Hostname()
 		id = &device.Identity{
-			RegistrationCode: regCode,
+			RegistrationCode: bootID.RegistrationCode,
+			RegistrationPin:  bootID.RegistrationPin,
 			SerialNumber:     machineID(),
 			Hostname:         hostname,
 		}
 		if saveErr := a.store.Save(id); saveErr != nil {
 			log.Warn().Err(saveErr).Msg("could not persist initial identity (non-fatal)")
+		}
+	} else {
+		// Sync cached identity with the authoritative /boot file in case it
+		// was rotated out-of-band (factory reset flow).
+		if id.RegistrationCode != bootID.RegistrationCode ||
+			id.RegistrationPin != bootID.RegistrationPin {
+			id.RegistrationCode = bootID.RegistrationCode
+			id.RegistrationPin = bootID.RegistrationPin
+			id.DeviceID = "" // force re-claim if the boot identity changed
+			_ = a.store.Save(id)
 		}
 	}
 	a.identity = id
@@ -82,6 +114,35 @@ func New(cfg *config.Config) (*Agent, error) {
 		Str("device_id", a.identity.DeviceID).
 		Str("serial_number", a.identity.SerialNumber).
 		Msg("device identity loaded")
+
+	// --- WireGuard SERVER identity + config (no hub — each Pi is its own) ---
+	//
+	// The server subnet is computed deterministically from the registration
+	// code: clients never rewire their routing when a Pi reinstalls the
+	// same identity. The listen port is the DefaultListenPort from the
+	// wireguard package (51820).
+	privkeyPath := cfg.VPN.PrivateKeyPath
+	if privkeyPath == "" {
+		privkeyPath = filepath.Join(platform.DataDir(), "wg-server.key")
+	}
+	pubkeyPath := cfg.VPN.PubkeyPath
+	if pubkeyPath == "" {
+		pubkeyPath = filepath.Join(platform.DataDir(), "wg-server.pub")
+	}
+	wgPub, err := wireguard.EnsureKeypair(privkeyPath, pubkeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("ensure wg keypair: %w", err)
+	}
+	a.wgPubkey = wgPub
+
+	subnet := deriveSubnet(a.identity.RegistrationCode)
+	serverCIDR := subnet + ".1/24"
+	if err := a.writeServerConfigIfNeeded(privkeyPath, serverCIDR); err != nil {
+		// Non-fatal: the device still runs, heartbeats still flow, the
+		// cloud surfaces the error in endpointReady=false.
+		log.Warn().Err(err).Msg("wireguard: server config write failed")
+	}
+	a.lastAppliedSubnet = serverCIDR
 
 	// --- Cloud client ---
 	if cfg.Cloud.Enabled {
@@ -93,10 +154,16 @@ func New(cfg *config.Config) (*Agent, error) {
 
 	systemH := handlers.NewSystemHandler(Version, a.identity, netScan, cfg.VPN.ConfigPath, cfg.VPN.Interface)
 	networkH := handlers.NewNetworkHandler(netScan)
-	vpnH := handlers.NewVPNHandler(cfg.VPN.ConfigPath, cfg.VPN.Interface, cfg.VPN.PubkeyPath)
+	vpnH := handlers.NewVPNHandler(
+		cfg.VPN.ConfigPath,
+		cfg.VPN.Interface,
+		cfg.VPN.PubkeyPath,
+		a.snapshotNAT,
+	)
 	usbH := handlers.NewUSBHandler()
 	usbipH := handlers.NewUSBIPHandler(cfg)
 	a.usbipH = usbipH
+	identityH := handlers.NewIdentityHandler(bootID)
 
 	// Connectivity (WiFi / cellular / setup-AP) — picks the right backend
 	// for the platform, plus an optional supervisor that auto-raises the
@@ -105,9 +172,46 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.connSup = connSup
 	connH := handlers.NewConnectivityHandler(connSvc)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, usbH, usbipH, connH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, usbH, usbipH, connH, identityH)
 
 	return a, nil
+}
+
+// deriveSubnet turns a registration code into the "10.77.N" prefix of the
+// device's /24 (matches rud1-es/deviceSubnetFor exactly). We do it locally
+// to avoid a chicken-and-egg dependency on the cloud before first claim.
+func deriveSubnet(registrationCode string) string {
+	h := sha256.Sum256([]byte(registrationCode))
+	bucket := int(h[0])%254 + 1
+	return fmt.Sprintf("10.77.%d", bucket)
+}
+
+// writeServerConfigIfNeeded materialises wg0.conf as a SERVER config the
+// first time (or after the subnet changed due to an identity rotation).
+// Restarts wg-quick@<iface> to activate. No-op on simulated hardware.
+func (a *Agent) writeServerConfigIfNeeded(privkeyPath, addressCIDR string) error {
+	privkey, err := wireguard.ReadPrivateKey(privkeyPath)
+	if err != nil {
+		return err
+	}
+	spec := wireguard.ServerSpec{
+		Interface:   a.cfg.VPN.Interface,
+		PrivateKey:  privkey,
+		AddressCIDR: addressCIDR,
+		ListenPort:  wireguard.DefaultListenPort,
+	}
+	if err := wireguard.WriteServerConfig(a.cfg.VPN.ConfigPath, spec); err != nil {
+		return err
+	}
+	if err := wireguard.RestartServer(a.cfg.VPN.Interface); err != nil {
+		return fmt.Errorf("wg-quick restart: %w", err)
+	}
+	log.Info().
+		Str("interface", a.cfg.VPN.Interface).
+		Str("address", addressCIDR).
+		Int("listen_port", wireguard.DefaultListenPort).
+		Msg("wireguard: server config applied")
+	return nil
 }
 
 // Run starts the HTTP server and cloud loops, blocking until ctx is cancelled.
@@ -123,13 +227,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		go a.connSup.Run(ctx)
 	}
 
+	// NAT discovery runs independently of cloud connectivity so the
+	// heartbeat has fresh data on its first tick.
+	go a.natDiscoveryLoop(ctx)
+
 	if a.cfg.Cloud.Enabled && a.cloud != nil {
-		if a.identity.DeviceID == "" {
-			go a.registrationLoop(ctx)
-		} else {
-			go a.heartbeatLoop(ctx)
-			go a.firmwareLoop(ctx)
-		}
+		// Single loop in the no-hub world: every heartbeat is both a
+		// "registration/claim" nudge (if not yet claimed) and a normal
+		// telemetry push (once claimed). The cloud discriminates via the
+		// `status` field.
+		go a.heartbeatLoop(ctx)
+		go a.firmwareLoop(ctx)
 	}
 
 	// Independent of cloud connectivity: keep the exported USB/IP set in
@@ -148,63 +256,52 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-// registrationLoop retries device registration every 30 s until it succeeds.
-func (a *Agent) registrationLoop(ctx context.Context) {
-	log.Info().
-		Str("registration_code", a.identity.RegistrationCode).
-		Msg("waiting for registration — enter this code in rud1-es dashboard")
+// natDiscoveryInterval controls how often we re-run Discover. 20 min is a
+// compromise: short enough that a router reboot recovers its port mapping
+// within one cycle; long enough to avoid STUN spam across the fleet.
+const natDiscoveryInterval = 20 * time.Minute
 
-	hostname, _ := os.Hostname()
-	req := cloud.RegisterRequest{
-		RegistrationCode: a.identity.RegistrationCode,
-		SerialNumber:     a.identity.SerialNumber,
-		FirmwareVersion:  Version,
-		Platform:         platform.OS(),
-		Arch:             platform.Arch(),
-	}
-
-	ticker := time.NewTicker(30 * time.Second)
+// natDiscoveryLoop keeps `natState` fresh. First discovery runs immediately
+// so the first heartbeat has populated fields.
+func (a *Agent) natDiscoveryLoop(ctx context.Context) {
+	a.refreshNAT(ctx)
+	ticker := time.NewTicker(natDiscoveryInterval)
 	defer ticker.Stop()
-
 	for {
-		resp, err := a.cloud.Register(ctx, req)
-		if err == nil {
-			a.identity.DeviceID = resp.DeviceID
-			a.identity.Hostname = hostname
-			a.identity.RegisteredAt = time.Now()
-			// Use serialNumber from ES DB (may differ from machineID if device
-			// was pre-created in the dashboard with its own serial).
-			if resp.SerialNumber != "" {
-				a.identity.SerialNumber = resp.SerialNumber
-			}
-
-			if saveErr := a.store.Save(a.identity); saveErr != nil {
-				log.Error().Err(saveErr).Msg("failed to persist registration")
-			}
-			log.Info().
-				Str("device_id", resp.DeviceID).
-				Msg("device registered successfully")
-
-			go a.heartbeatLoop(ctx)
-			go a.firmwareLoop(ctx)
-			return
-		}
-
-		// 409 = already provisioned — can happen on restart after partial save.
-		if strings.Contains(err.Error(), "already provisioned") {
-			log.Warn().Msg("device already provisioned in cloud — sending heartbeat anyway")
-			go a.heartbeatLoop(ctx)
-			go a.firmwareLoop(ctx)
-			return
-		}
-
-		log.Warn().Err(err).Msg("registration attempt failed — retrying in 30 s")
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			a.refreshNAT(ctx)
 		}
 	}
+}
+
+// refreshNAT discovers the current public endpoint (UPnP → STUN) and caches
+// it under natMu. Failures leave the previous cache in place so a flaky
+// STUN server doesn't temporarily wipe a good endpoint.
+func (a *Agent) refreshNAT(ctx context.Context) {
+	d := nat.Discover(ctx, wireguard.DefaultListenPort)
+	a.natMu.Lock()
+	if d.PublicEndpoint != "" || a.natState.PublicEndpoint == "" {
+		// Accept the new discovery if it yielded a result OR if we had
+		// nothing cached. Never overwrite a good endpoint with empty.
+		a.natState = d
+	}
+	a.natMu.Unlock()
+	log.Info().
+		Str("endpoint", d.PublicEndpoint).
+		Bool("upnp_ok", d.UPnPOK).
+		Str("nat_type", d.NATType).
+		Str("source", d.Source).
+		Msg("nat: discovery complete")
+}
+
+// snapshotNAT returns the latest cached discovery under read-lock.
+func (a *Agent) snapshotNAT() nat.Discovery {
+	a.natMu.RLock()
+	defer a.natMu.RUnlock()
+	return a.natState
 }
 
 // heartbeatLoop sends a heartbeat on every HeartbeatInterval tick.
@@ -313,43 +410,42 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	}
 
 	// ── VPN ───────────────────────────────────────────────────────────────
-	// The `publicKey` field advertised to the cloud is the DEVICE's own
-	// pubkey (from the world-readable mirror install.sh lays down), NOT the
-	// hub pubkey read from wg0.conf's [Peer] block. The cloud uses it to
-	// allocate a tunnel address and whitelist the peer on the hub.
+	// In the no-hub model, the `publicKey` we advertise is this device's own
+	// WG SERVER pubkey — rud1-es writes it verbatim as the `[Peer]
+	// PublicKey` in client .conf files.
 	var hbVPN *cloud.HBVPN
-	var ownPubkey string
-	if a.cfg.VPN.PubkeyPath != "" {
-		if key, err := wireguard.ReadOwnPubkey(a.cfg.VPN.PubkeyPath); err == nil && key != "" {
+	ownPubkey := a.wgPubkey
+	if ownPubkey == "" && a.cfg.VPN.PubkeyPath != "" {
+		if key, err := wireguard.ReadOwnPubkey(a.cfg.VPN.PubkeyPath); err == nil {
 			ownPubkey = key
 		}
 	}
 	if ownPubkey != "" {
-		// Read current config for drift-detection fields (address/endpoint/
-		// connected). Absence of [Peer] is fine — we still report publicKey.
 		iface := a.cfg.VPN.Interface
-		var address, endpoint, allowedIps, dnsStr string
-		var connected bool
-		if st, err := wireguard.Read(a.cfg.VPN.ConfigPath); err == nil {
-			iface = st.Interface
-			address = st.Address
-			endpoint = st.Endpoint
-			allowedIps = st.AllowedIPs
-			dnsStr = st.DNS
-			connected = st.Connected
+		connected := wireguard.IsConnected(iface)
+		natSnap := a.snapshotNAT()
+		peerCount := 0
+		var lastHandshakePtr *string
+		if ts, err := wireguard.LatestHandshake(iface); err == nil && !ts.IsZero() {
+			hs := ts.UTC().Format(time.RFC3339)
+			lastHandshakePtr = &hs
 		}
+		if peers, err := wireguard.ListPeers(iface); err == nil {
+			peerCount = len(peers)
+		}
+		upnpOK := natSnap.UPnPOK
 		hbVPN = &cloud.HBVPN{
-			InterfaceName: iface,
-			PublicKey:     ownPubkey,
-			Address:       address,
-			Connected:     connected,
-			Endpoint:      endpoint,
-			AllowedIps:    allowedIps,
-			DNS:           dnsStr,
-			PeerCount:     0,
-		}
-		if endpoint != "" {
-			hbVPN.PeerCount = 1
+			InterfaceName:  iface,
+			PublicKey:      ownPubkey,
+			Address:        a.lastAppliedSubnet,
+			Connected:      connected,
+			Endpoint:       natSnap.PublicEndpoint,
+			PublicEndpoint: natSnap.PublicEndpoint,
+			UPnPOK:         &upnpOK,
+			NATType:        natSnap.NATType,
+			AllowedIps:     deriveSubnet(a.identity.RegistrationCode) + ".0/24",
+			PeerCount:      peerCount,
+			LastHandshake:  lastHandshakePtr,
 		}
 	}
 
@@ -412,6 +508,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
+		RegistrationPin:  a.identity.RegistrationPin,
 		SerialNumber:     a.identity.SerialNumber,
 		FirmwareVersion:  Version,
 		Info:             info,
@@ -426,55 +523,57 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		log.Warn().Err(err).Msg("heartbeat send failed")
 		return
 	}
+
+	// Two response variants: "unclaimed" (no Device yet — waiting for the
+	// user to claim on the dashboard) or "claimed" (normal operation). On
+	// first transition to "claimed" we persist the DeviceID so rud1-app's
+	// identity card can show the "paired" state.
+	if resp.Status == "unclaimed" {
+		log.Info().
+			Str("registration_code", resp.RegistrationCode).
+			Msg("heartbeat: device unclaimed — waiting for dashboard claim")
+		return
+	}
+	if resp.DeviceID != "" && resp.DeviceID != a.identity.DeviceID {
+		a.identity.DeviceID = resp.DeviceID
+		a.identity.RegisteredAt = time.Now()
+		if err := a.store.Save(a.identity); err != nil {
+			log.Warn().Err(err).Msg("heartbeat: failed to persist device id")
+		}
+		log.Info().Str("device_id", resp.DeviceID).Msg("heartbeat: device claimed")
+	}
 	log.Debug().Msg("heartbeat sent")
 
+	// In the no-hub world the VpnPeer block echoes the agent's own server
+	// spec (subnet, pubkey). The agent has already applied it in New() —
+	// but if the cloud reports a different subnet (e.g. because a previous
+	// deployment used a different derivation) we re-apply.
 	if resp.VpnPeer != nil {
-		a.maybeApplyPeer(resp.VpnPeer)
+		a.maybeReapplyServer(resp.VpnPeer)
 	}
 }
 
-// peerFingerprint summarises a VpnPeer for the "has this changed?" check.
-// Includes every user-visible field so any cloud update triggers a re-apply.
-func peerFingerprint(p *cloud.VpnPeer) string {
-	dns := ""
-	if p.DNS != nil {
-		dns = *p.DNS
-	}
-	return strings.Join([]string{
-		p.ServerPublicKey, p.Endpoint, p.Address, p.AllowedIPs, dns,
-		fmt.Sprintf("%d", p.PersistentKeepalive),
-	}, "|")
-}
-
-// maybeApplyPeer materialises a new wg0.conf when the cloud has sent a peer
-// block different from the last one we applied. No-op on the very common
-// case where the cloud keeps returning the same block every 60 s.
-func (a *Agent) maybeApplyPeer(p *cloud.VpnPeer) {
-	fp := peerFingerprint(p)
-	if fp == a.lastAppliedPeer {
+// maybeReapplyServer handles the unusual case where the cloud tells us the
+// server spec (subnet, interface Address) should differ from what we have
+// installed. This typically only fires after a manual admin correction on
+// the rud1-es side — normal heartbeats just echo our current subnet back
+// and the `if fp == lastAppliedSubnet` guard makes this a no-op.
+func (a *Agent) maybeReapplyServer(p *cloud.VpnPeer) {
+	if p.Address == "" || p.Address == a.lastAppliedSubnet {
 		return
 	}
-	dns := ""
-	if p.DNS != nil {
-		dns = *p.DNS
+	privkeyPath := a.cfg.VPN.PrivateKeyPath
+	if privkeyPath == "" {
+		privkeyPath = filepath.Join(platform.DataDir(), "wg-server.key")
 	}
-	assignment := wireguard.PeerAssignment{
-		ServerPublicKey:     p.ServerPublicKey,
-		Endpoint:            p.Endpoint,
-		Address:             p.Address,
-		AllowedIPs:          p.AllowedIPs,
-		DNS:                 dns,
-		PersistentKeepalive: p.PersistentKeepalive,
-	}
-	if err := wireguard.ApplyPeer(a.cfg.VPN.ConfigPath, a.cfg.VPN.PrivateKeyPath, assignment); err != nil {
-		log.Error().Err(err).Msg("vpn: failed to apply peer from heartbeat")
+	if err := a.writeServerConfigIfNeeded(privkeyPath, p.Address); err != nil {
+		log.Warn().Err(err).Msg("vpn: failed to re-apply server config from heartbeat")
 		return
 	}
-	a.lastAppliedPeer = fp
+	a.lastAppliedSubnet = p.Address
 	log.Info().
 		Str("address", p.Address).
-		Str("endpoint", p.Endpoint).
-		Msg("vpn: peer applied from cloud heartbeat")
+		Msg("vpn: server subnet updated from cloud")
 }
 
 // policySweepInterval is how often the agent re-checks currently-exported
@@ -640,16 +739,6 @@ func (a *Agent) checkAndApplyFirmware(ctx context.Context) {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-func generateRegistrationCode() string {
-	return fmt.Sprintf("RUD1-%s-%s", randomHex(4), randomHex(4))
-}
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return strings.ToUpper(hex.EncodeToString(b))
-}
 
 // machineID reads the Linux machine-id. Falls back to hostname.
 func machineID() string {
