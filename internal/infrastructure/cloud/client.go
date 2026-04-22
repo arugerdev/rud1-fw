@@ -90,6 +90,23 @@ type HeartbeatPayload struct {
 	Network         *HBNetwork `json:"network,omitempty"`
 	VPN             *HBVPN     `json:"vpn,omitempty"`
 	USB             *HBUSB     `json:"usb,omitempty"`
+	LAN             *HBLAN     `json:"lan,omitempty"`
+}
+
+// HBLANRoute is a single LAN-exposure rule echoed in the heartbeat.
+type HBLANRoute struct {
+	Subnet  string `json:"subnet"`
+	Applied bool   `json:"applied"`
+}
+
+// HBLAN tells the cloud which LAN subnets the Pi is actively NAT'ing for
+// WG peers, so the cloud can advertise them in each client peer's
+// AllowedIPs. `Enabled=false` or empty `Routes` ⇒ cloud ignores the field
+// and emits only the Pi's own /24.
+type HBLAN struct {
+	Enabled bool         `json:"enabled"`
+	Uplink  string       `json:"uplink,omitempty"`
+	Routes  []HBLANRoute `json:"routes,omitempty"`
 }
 
 // HBInfo carries static device identification fields.

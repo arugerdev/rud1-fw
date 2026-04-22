@@ -40,6 +40,7 @@ func New(
 	usbipH *handlers.USBIPHandler,
 	connH *handlers.ConnectivityHandler,
 	identityH *handlers.IdentityHandler,
+	lanH *handlers.LANHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -111,6 +112,14 @@ func New(
 		r.Get("/api/vpn/peers", vpnPeerH.List)
 		r.Post("/api/vpn/peers", vpnPeerH.Add)
 		r.Delete("/api/vpn/peers", vpnPeerH.Remove)
+
+		// LAN routing — opt-in exposure of the Pi's LAN subnet(s) over the
+		// WireGuard tunnel. Mutations persist to config.yaml via
+		// config.Config.Save (same mechanism USB policy uses).
+		r.Get("/api/lan/routes", lanH.Get)
+		r.Post("/api/lan/routes", lanH.Add)
+		r.Put("/api/lan/routes", lanH.Set)
+		r.Delete("/api/lan/routes", lanH.Remove)
 
 		r.Get("/api/usb/devices", usbH.List)
 

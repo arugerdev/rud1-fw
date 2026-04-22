@@ -27,6 +27,7 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/bootidentity"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/cloud"
 	connimpl "github.com/rud1-es/rud1-fw/internal/infrastructure/connectivity"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/lan"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/nat"
 	netscanner "github.com/rud1-es/rud1-fw/internal/infrastructure/network"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/storage"
@@ -50,6 +51,7 @@ type Agent struct {
 	cloud    *cloud.Client         // nil when cloud.Enabled == false
 	srv      *server.Server
 	usbipH   *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
+	lanMgr   *lan.Manager           // owns the LAN-routing iptables rules
 	connSup  *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
 
 	// WireGuard SERVER identity — generated at first boot, persisted under
@@ -166,6 +168,28 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.usbipH = usbipH
 	identityH := handlers.NewIdentityHandler(bootID)
 
+	// LAN routing manager — source subnet is the Pi's own /24 so WG peers
+	// reaching LAN targets get correctly NAT'd out the uplink. We detect
+	// the uplink interface here so the user doesn't have to edit yaml by
+	// hand on non-standard hardware.
+	lanMgr := lan.NewManager()
+	uplink := cfg.LAN.UplinkInterface
+	if strings.TrimSpace(uplink) == "" {
+		uplink = lan.DetectDefaultUplink()
+	}
+	lanMgr.Configure(deriveSubnet(a.identity.RegistrationCode)+".0/24", uplink)
+	a.lanMgr = lanMgr
+	lanH := handlers.NewLANHandler(cfg, lanMgr)
+	// Seed the kernel with the persisted desired set so a reboot re-installs
+	// any rules the operator had enabled before.
+	if cfg.LAN.Enabled && len(cfg.LAN.Routes) > 0 {
+		if _, errs := lanMgr.Apply(cfg.LAN.Routes); len(errs) > 0 {
+			for _, err := range errs {
+				log.Warn().Err(err).Msg("lan: initial apply error")
+			}
+		}
+	}
+
 	// Connectivity (WiFi / cellular / setup-AP) — picks the right backend
 	// for the platform, plus an optional supervisor that auto-raises the
 	// setup AP when the device has been offline too long.
@@ -173,7 +197,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.connSup = connSup
 	connH := handlers.NewConnectivityHandler(connSvc)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH)
 
 	return a, nil
 }
@@ -507,6 +531,25 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		}
 	}
 
+	// ── LAN ────────────────────────────────────────────────────────────────
+	// Echo the user's chosen LAN-exposure rules to the cloud so rud1-es can
+	// widen each user peer's AllowedIPs to include them. Only populated when
+	// LAN is enabled; a disabled LAN field stays nil so the cloud can tell
+	// the difference between "not configured" and "explicitly off".
+	var hbLAN *cloud.HBLAN
+	if a.lanMgr != nil && a.cfg.LAN.Enabled {
+		live := a.lanMgr.Snapshot()
+		routes := make([]cloud.HBLANRoute, 0, len(live))
+		for _, r := range live {
+			routes = append(routes, cloud.HBLANRoute{Subnet: r.TargetSubnet, Applied: r.Applied})
+		}
+		hbLAN = &cloud.HBLAN{
+			Enabled: true,
+			Uplink:  a.lanMgr.Uplink(),
+			Routes:  routes,
+		}
+	}
+
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
 		RegistrationPin:  a.identity.RegistrationPin,
@@ -517,6 +560,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		Network:          hbNetwork,
 		VPN:              hbVPN,
 		USB:              hbUSB,
+		LAN:              hbLAN,
 	}
 
 	resp, err := a.cloud.Heartbeat(ctx, payload)

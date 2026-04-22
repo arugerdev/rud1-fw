@@ -24,6 +24,7 @@ type Config struct {
 	VPN      VPNConfig     `yaml:"vpn"`
 	USB      USBConfig     `yaml:"usb"`
 	Network  NetworkConfig `yaml:"network"`
+	LAN      LANConfig     `yaml:"lan"`
 
 	// Path is the filesystem location the config was loaded from. Set by
 	// Load(); used by runtime Save() calls so the agent can persist mutations
@@ -102,6 +103,26 @@ type VPNConfig struct {
 	// cloud returns a `vpnPeer` block in the heartbeat response so it can
 	// materialise a complete wg0.conf.
 	PrivateKeyPath string `yaml:"private_key_path"`
+}
+
+// LANConfig configures the Pi's LAN-exposure behaviour over WireGuard.
+//
+// When Enabled is true and one or more Routes are declared, the agent:
+//   1. Flips `net.ipv4.ip_forward=1` on the host.
+//   2. Inserts an `iptables -t nat -A POSTROUTING -s <route> -o <uplink>
+//      -j MASQUERADE` rule per route so packets from WG peers hitting a
+//      LAN subnet get NAT'd out the uplink.
+//   3. Advertises the routes in the heartbeat so rud1-es can broaden the
+//      client peers' AllowedIPs to include them.
+//
+// Routes are CIDR strings (e.g. "192.168.1.0/24"). They must not overlap
+// the WG subnet — the agent rejects overlapping entries at API level.
+// UplinkInterface defaults to "eth0" on the Pi; if blank, the agent
+// auto-detects the default-route interface at apply-time.
+type LANConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	UplinkInterface string   `yaml:"uplink_interface,omitempty"`
+	Routes          []string `yaml:"routes,omitempty"`
 }
 
 // USBConfig configures the USB-over-IP subsystem.
