@@ -18,9 +18,10 @@ import (
 
 // revocationLogSize is the maximum number of revocation entries kept in
 // memory. Entries are surfaced to rud1-app so the operator can see which
-// bus IDs were unbound by a policy sweep (and why). 32 is plenty for a
-// poll-every-5s UI — older entries get overwritten silently.
-const revocationLogSize = 32
+// bus IDs were unbound by a policy sweep (and why). 256 slots ~= hours of
+// history at realistic churn rates; older entries get overwritten silently.
+// Disk-backed persistence would be better but is out of scope here.
+const revocationLogSize = 256
 
 // RevocationReason enumerates why a previously-exported bus ID was unbound
 // by ReenforcePolicy. "policy" means the rule set no longer permits the
@@ -89,6 +90,7 @@ func NewUSBIPHandler(full *config.Config) *USBIPHandler {
 			log.Info().Int("port", cfg.BindPort).Msg("usbipd started")
 		}
 	}
+	log.Info().Int("ringSize", revocationLogSize).Msg("usbip: revocation ring buffer initialised")
 	return &USBIPHandler{
 		server: srv,
 		full:   full,
@@ -532,53 +534,55 @@ func (h *USBIPHandler) RecentRevocations(limit int) []RevocationEntry {
 	return entries
 }
 
-// RevocationsList handles GET /api/usbip/revocations — returns the last N
-// bus IDs that ReenforcePolicy unbound, with timestamp and reason. The
-// optional `since` query param (unix seconds) filters to entries strictly
-// after that timestamp so rud1-app can poll without surfacing duplicate
-// toasts.
+// RevocationsList handles GET /api/usbip/revocations — paginated history of
+// policy revocations. Query params: limit (1..revocationLogSize, default 50),
+// offset (>=0, default 0). Entries are ordered newest-first so offset=0
+// gives the most recent page.
 func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 	if !h.isAuthorized(r) {
 		writeError(w, http.StatusForbidden, "client IP not in authorized_nets")
 		return
 	}
-	var since int64
-	if raw := r.URL.Query().Get("since"); raw != "" {
-		v, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "since must be a unix-seconds integer")
-			return
-		}
-		since = v
-	}
-	// limit: optional, 1..100. When omitted we return the full buffer so
-	// pre-existing callers that poll for a full snapshot keep working.
-	var limit int
+	limit := 50
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		v, err := strconv.Atoi(raw)
-		if err != nil || v < 1 || v > 100 {
-			writeError(w, http.StatusBadRequest, "limit must be an integer in [1,100]")
+		if err != nil || v < 1 || v > revocationLogSize {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("limit must be an integer in [1,%d]", revocationLogSize))
 			return
 		}
 		limit = v
 	}
-	entries := h.Revocations()
-	if since > 0 {
-		filtered := make([]RevocationEntry, 0, len(entries))
-		for _, e := range entries {
-			if e.At > since {
-				filtered = append(filtered, e)
-			}
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
 		}
-		entries = filtered
+		offset = v
 	}
-	// Apply limit AFTER `since`: keep the N newest entries (the buffer is
-	// already chronological, so that's the tail).
-	if limit > 0 && len(entries) > limit {
-		entries = entries[len(entries)-limit:]
+
+	all := h.Revocations() // chronological (oldest first); total = len(all)
+	total := len(all)
+	// Reverse to newest-first for pagination.
+	reversed := make([]RevocationEntry, total)
+	for i, e := range all {
+		reversed[total-1-i] = e
 	}
+	start := offset
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	items := reversed[start:end]
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"revocations": entries,
-		"now":         time.Now().Unix(),
+		"items":  items,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
 	})
 }
