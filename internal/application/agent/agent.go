@@ -278,8 +278,9 @@ func New(cfg *config.Config) (*Agent, error) {
 		}
 	}
 	sysUptimeEvH := handlers.NewSystemUptimeEventsHandler(a.uptimeS)
+	sysUptimeEvExpH := handlers.NewSystemUptimeEventsExportHandler(a.uptimeS)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH)
 
 	return a, nil
 }

@@ -48,6 +48,7 @@ func New(
 	sysPctHistH *handlers.SystemPercentilesHistoryHandler,
 	sysPctExpH *handlers.SystemPercentilesExportHandler,
 	sysUptimeEvH *handlers.SystemUptimeEventsHandler,
+	sysUptimeEvExpH *handlers.SystemUptimeEventsExportHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -85,6 +86,7 @@ func New(
 		r.Get("/api/system/stats", sysStatsH.Stats)
 		r.Get("/api/system/health", sysHealthH.Health)
 		r.Get("/api/system/uptime-events", sysUptimeEvH.Events)
+		r.Get("/api/system/uptime-events/export", sysUptimeEvExpH.Export)
 		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Get("/api/percentiles/export", sysPctExpH.Export)
 		r.Post("/api/system/reboot", systemH.Reboot)
