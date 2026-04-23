@@ -513,6 +513,25 @@ func (h *USBIPHandler) Revocations() []RevocationEntry {
 	return out
 }
 
+// RecentRevocations returns at most `limit` chronologically-ordered entries
+// (oldest first), keeping the newest tail when the ring buffer holds more
+// than `limit` items. A non-positive limit yields an empty slice. The
+// returned slice is a copy — callers may mutate it freely.
+//
+// Exposed so consolidated diagnostic endpoints (e.g. /api/system/health)
+// can include the last few revocations without having to hit
+// /api/usbip/revocations separately.
+func (h *USBIPHandler) RecentRevocations(limit int) []RevocationEntry {
+	if limit <= 0 {
+		return []RevocationEntry{}
+	}
+	entries := h.Revocations() // already a copy, already chronological
+	if len(entries) > limit {
+		entries = entries[len(entries)-limit:]
+	}
+	return entries
+}
+
 // RevocationsList handles GET /api/usbip/revocations — returns the last N
 // bus IDs that ReenforcePolicy unbound, with timestamp and reason. The
 // optional `since` query param (unix seconds) filters to entries strictly
