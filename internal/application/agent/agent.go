@@ -32,6 +32,7 @@ import (
 	netscanner "github.com/rud1-es/rud1-fw/internal/infrastructure/network"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/storage"
 	sysinfo "github.com/rud1-es/rud1-fw/internal/infrastructure/system"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
 	wireguard "github.com/rud1-es/rud1-fw/internal/infrastructure/vpn"
 	"github.com/rud1-es/rud1-fw/internal/platform"
@@ -53,6 +54,7 @@ type Agent struct {
 	usbipH   *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
 	lanMgr   *lan.Manager           // owns the LAN-routing iptables rules
 	connSup  *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
+	sysstats *sysstat.Collector     // shared between HTTP handler + heartbeat loop
 
 	// WireGuard SERVER identity — generated at first boot, persisted under
 	// /var/lib/rud1-agent and mirrored (public half only) for the heartbeat.
@@ -201,7 +203,13 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.connSup = connSup
 	connH := handlers.NewConnectivityHandler(connSvc)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH)
+	// System stats collector — shared between the HTTP handler (/api/system/stats)
+	// and the heartbeat loop (HBSystem block). Stateless apart from the optional
+	// Uplink hint, so a single instance is safe to reuse concurrently.
+	a.sysstats = &sysstat.Collector{Uplink: lan.DetectDefaultUplink()}
+	sysStatsH := handlers.NewSystemStatsHandler(a.sysstats)
+
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH)
 
 	return a, nil
 }
@@ -575,6 +583,32 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		}
 	}
 
+	// ── System (extended stats) ───────────────────────────────────────────
+	// Run with a tight 1s timeout so a slow /proc read never blocks the
+	// heartbeat itself. On error / cancellation we leave System=nil — the
+	// cloud can fall back to the legacy Metrics block.
+	var hbSystem *cloud.HBSystem
+	if a.sysstats != nil {
+		sysCtx, sysCancel := context.WithTimeout(ctx, time.Second)
+		snap, err := a.sysstats.Snapshot(sysCtx)
+		sysCancel()
+		if err != nil {
+			log.Debug().Err(err).Msg("heartbeat: system snapshot failed — omitting System block")
+		} else if snap != nil {
+			hbSystem = &cloud.HBSystem{
+				LoadAvg1:    snap.LoadAvg1,
+				LoadAvg5:    snap.LoadAvg5,
+				LoadAvg15:   snap.LoadAvg15,
+				CPUUsage:    snap.CPUUsage,
+				MemUsedPct:  snap.MemUsedPct,
+				DiskUsedPct: snap.DiskUsedPct,
+				TempCPU:     snap.TempCPU,
+				Uptime:      snap.Uptime,
+				CapturedAt:  snap.CapturedAt,
+			}
+		}
+	}
+
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
 		RegistrationPin:  a.identity.RegistrationPin,
@@ -586,6 +620,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		VPN:              hbVPN,
 		USB:              hbUSB,
 		LAN:              hbLAN,
+		System:           hbSystem,
 	}
 
 	resp, err := a.cloud.Heartbeat(ctx, payload)

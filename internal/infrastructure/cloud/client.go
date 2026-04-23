@@ -91,6 +91,30 @@ type HeartbeatPayload struct {
 	VPN             *HBVPN     `json:"vpn,omitempty"`
 	USB             *HBUSB     `json:"usb,omitempty"`
 	LAN             *HBLAN     `json:"lan,omitempty"`
+	// System is the extended host-stats subset populated from
+	// sysstat.Collector. It overlaps Metrics intentionally — Metrics is the
+	// legacy payload still consumed by older rud1-es code paths, while
+	// System carries the richer figures (load averages, swap, etc.) the
+	// dashboard health page needs. Nil when the snapshot failed or timed
+	// out so the heartbeat stays send-first, metrics-second.
+	System *HBSystem `json:"system,omitempty"`
+}
+
+// HBSystem is the subset of sysstat.Stats propagated via heartbeats.
+//
+// It is deliberately narrower than the /api/system/stats response: the
+// cloud only needs enough to plot health graphs and trigger alerts.
+// Fields stay ordered to match the HTTP response for easy diffing.
+type HBSystem struct {
+	LoadAvg1    float64  `json:"loadAvg1"`
+	LoadAvg5    float64  `json:"loadAvg5"`
+	LoadAvg15   float64  `json:"loadAvg15"`
+	CPUUsage    float64  `json:"cpuUsage"`
+	MemUsedPct  float64  `json:"memUsedPct"`
+	DiskUsedPct float64  `json:"diskUsedPct"`
+	TempCPU     *float64 `json:"tempCpu,omitempty"`
+	Uptime      int64    `json:"uptime"`
+	CapturedAt  string   `json:"capturedAt,omitempty"`
 }
 
 // HBLANRoute is a single LAN-exposure rule echoed in the heartbeat.
