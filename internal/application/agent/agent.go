@@ -264,6 +264,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		go a.connSup.Run(ctx)
 	}
 
+	// Start the rolling-window sampler for CPU% / LoadAvg1 percentiles
+	// so /api/system/stats?percentiles=1 has data as soon as the API is
+	// reachable. Idempotent via sync.Once — safe even if Run ever gets
+	// re-entered by supervisor glue.
+	if a.sysstats != nil {
+		a.sysstats.Start(ctx)
+	}
+
 	// NAT discovery runs independently of cloud connectivity so the
 	// heartbeat has fresh data on its first tick.
 	go a.natDiscoveryLoop(ctx)

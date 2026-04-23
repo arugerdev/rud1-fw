@@ -18,6 +18,7 @@ package sysstat
 import (
 	"context"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -84,6 +85,17 @@ type Stats struct {
 // lan.DetectDefaultUplink() at construction time; empty string is fine.
 type Collector struct {
 	Uplink string
+
+	// samples holds the rolling window used by Percentiles(). It is
+	// allocated on the first Start() call; concurrent reads via
+	// Percentiles() before Start are safe and simply return a zero
+	// snapshot.
+	samples *RingBuffer
+
+	// startOnce guards the background sampler goroutine so repeated
+	// Start() calls are idempotent (useful if the agent ever re-invokes
+	// wiring under supervision).
+	startOnce sync.Once
 }
 
 // Snapshot collects the current system stats, respecting ctx for the CPU
