@@ -614,6 +614,18 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 				Uptime:      snap.Uptime,
 				CapturedAt:  snap.CapturedAt,
 			}
+			// Mirrors the library's own guard — below 5 samples the
+			// percentile values are zeroed and would be misleading.
+			if p := a.sysstats.Percentiles(); p.WindowSize >= 5 {
+				hbSystem.Percentiles = &cloud.HBSystemPercentiles{
+					P50Cpu:        p.P50Cpu,
+					P95Cpu:        p.P95Cpu,
+					P50Load:       p.P50Load,
+					P95Load:       p.P95Load,
+					WindowSize:    p.WindowSize,
+					WindowMinutes: p.WindowMinutes,
+				}
+			}
 		}
 	}
 

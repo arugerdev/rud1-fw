@@ -106,15 +106,28 @@ type HeartbeatPayload struct {
 // cloud only needs enough to plot health graphs and trigger alerts.
 // Fields stay ordered to match the HTTP response for easy diffing.
 type HBSystem struct {
-	LoadAvg1    float64  `json:"loadAvg1"`
-	LoadAvg5    float64  `json:"loadAvg5"`
-	LoadAvg15   float64  `json:"loadAvg15"`
-	CPUUsage    float64  `json:"cpuUsage"`
-	MemUsedPct  float64  `json:"memUsedPct"`
-	DiskUsedPct float64  `json:"diskUsedPct"`
-	TempCPU     *float64 `json:"tempCpu,omitempty"`
-	Uptime      int64    `json:"uptime"`
-	CapturedAt  string   `json:"capturedAt,omitempty"`
+	LoadAvg1    float64              `json:"loadAvg1"`
+	LoadAvg5    float64              `json:"loadAvg5"`
+	LoadAvg15   float64              `json:"loadAvg15"`
+	CPUUsage    float64              `json:"cpuUsage"`
+	MemUsedPct  float64              `json:"memUsedPct"`
+	DiskUsedPct float64              `json:"diskUsedPct"`
+	TempCPU     *float64             `json:"tempCpu,omitempty"`
+	Uptime      int64                `json:"uptime"`
+	CapturedAt  string               `json:"capturedAt,omitempty"`
+	Percentiles *HBSystemPercentiles `json:"percentiles,omitempty"`
+}
+
+// HBSystemPercentiles mirrors sysstat.PercentilesSnapshot for transport
+// inside the heartbeat. Populated only once the sampler has accumulated
+// enough data for stable p50/p95 figures.
+type HBSystemPercentiles struct {
+	P50Cpu        float64 `json:"p50Cpu"`
+	P95Cpu        float64 `json:"p95Cpu"`
+	P50Load       float64 `json:"p50Load"`
+	P95Load       float64 `json:"p95Load"`
+	WindowSize    int     `json:"windowSize"`
+	WindowMinutes int     `json:"windowMinutes"`
 }
 
 // HBLANRoute is a single LAN-exposure rule echoed in the heartbeat.
