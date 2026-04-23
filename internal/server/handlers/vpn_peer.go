@@ -35,15 +35,23 @@ func NewVPNPeerHandler(iface string) *VPNPeerHandler {
 }
 
 type peerListItem struct {
-	PublicKey     string `json:"publicKey"`
-	AllowedIPs    string `json:"allowedIps"`
-	LastHandshake int64  `json:"lastHandshake"` // unix seconds; 0 = never
+	PublicKey           string `json:"publicKey"`
+	AllowedIPs          string `json:"allowedIps"`
+	Endpoint            string `json:"endpoint,omitempty"`
+	LastHandshake       int64  `json:"lastHandshake"` // unix seconds; 0 = never
+	BytesRx             uint64 `json:"bytesRx"`
+	BytesTx             uint64 `json:"bytesTx"`
+	PersistentKeepalive int    `json:"persistentKeepalive,omitempty"`
 }
 
 type peerListResponse struct {
 	Interface string         `json:"interface"`
 	Peers     []peerListItem `json:"peers"`
 	Now       int64          `json:"now"`
+	// ActiveCount is the number of peers with a handshake within the
+	// last 3 minutes — the conventional WireGuard "fresh" threshold
+	// (PersistentKeepalive defaults to 25s, and rekeys fire at 120s).
+	ActiveCount int `json:"activeCount"`
 }
 
 // List handles GET /api/vpn/peers — returns the live peer set on the server.
@@ -56,22 +64,32 @@ func (h *VPNPeerHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list WireGuard peers")
 		return
 	}
+	now := time.Now()
 	items := make([]peerListItem, 0, len(live))
+	activeCount := 0
 	for _, p := range live {
 		var hs int64
 		if !p.LatestHshake.IsZero() {
 			hs = p.LatestHshake.Unix()
+			if now.Sub(p.LatestHshake) <= 3*time.Minute {
+				activeCount++
+			}
 		}
 		items = append(items, peerListItem{
-			PublicKey:     p.PublicKey,
-			AllowedIPs:    p.AllowedIPs,
-			LastHandshake: hs,
+			PublicKey:           p.PublicKey,
+			AllowedIPs:          p.AllowedIPs,
+			Endpoint:            p.Endpoint,
+			LastHandshake:       hs,
+			BytesRx:             p.BytesRx,
+			BytesTx:             p.BytesTx,
+			PersistentKeepalive: p.PersistentKeepalive,
 		})
 	}
 	writeJSON(w, http.StatusOK, peerListResponse{
-		Interface: h.iface,
-		Peers:     items,
-		Now:       time.Now().Unix(),
+		Interface:   h.iface,
+		Peers:       items,
+		Now:         now.Unix(),
+		ActiveCount: activeCount,
 	})
 }
 

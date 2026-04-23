@@ -176,7 +176,31 @@ type HBVPN struct {
 	AllowedIps      string  `json:"allowedIps,omitempty"`
 	DNS             string  `json:"dns,omitempty"`
 	PeerCount       int     `json:"peerCount"`
+	// ActivePeers counts peers whose most recent handshake is within
+	// 3 minutes (the WireGuard "fresh" window). Cheaper proxy for
+	// "how many users are really connected right now" than PeerCount,
+	// which reports every peer the cloud ever pushed.
+	ActivePeers     int     `json:"activePeers"`
 	LastHandshake   *string `json:"lastHandshake,omitempty"`
+	// PeerTelemetry is the per-peer snapshot the Pi emits each heartbeat
+	// so rud1-es can persist handshake freshness + cumulative bytes on
+	// `UserVPNPeer` without having to reach into the Pi on demand.
+	// Omitted when the VPN interface isn't up or listing failed.
+	PeerTelemetry []HBVPNPeerTelemetry `json:"peerTelemetry,omitempty"`
+}
+
+// HBVPNPeerTelemetry is one `wg show dump` row serialised for the cloud.
+// PublicKey is the peer's WG pubkey (matches `UserVPNPeer.publicKey` in
+// rud1-es). LastHandshake is RFC3339 UTC; empty when never. Endpoint is
+// the router-visible "host:port" seen by the Pi (useful for detecting
+// asymmetric-NAT / split-horizon from the cloud side). BytesRx/Tx are
+// cumulative since the wg interface came up on the Pi.
+type HBVPNPeerTelemetry struct {
+	PublicKey     string `json:"publicKey"`
+	LastHandshake string `json:"lastHandshake,omitempty"`
+	Endpoint      string `json:"endpoint,omitempty"`
+	BytesRx       uint64 `json:"bytesRx"`
+	BytesTx       uint64 `json:"bytesTx"`
 }
 
 // HBUSBDevice is one USB device in a heartbeat.

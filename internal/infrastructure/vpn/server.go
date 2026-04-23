@@ -43,11 +43,20 @@ type ServerSpec struct {
 
 // RuntimePeer describes one [Peer] block in the live `wg show`-equivalent
 // view. Returned by ListPeers so the agent can diff against what the cloud
-// says the peer set should be.
+// says the peer set should be, and so the UI can render live traffic
+// counters per peer.
+//
+// Endpoint/BytesRx/BytesTx/PersistentKeepalive come straight from
+// `wg show <iface> dump` and are zero-valued when the peer has never
+// completed a handshake or the kernel hasn't populated the stat yet.
 type RuntimePeer struct {
-	PublicKey     string
-	AllowedIPs    string
-	LatestHshake  time.Time // zero if never
+	PublicKey           string
+	AllowedIPs          string
+	Endpoint            string    // router-visible host:port of the remote peer
+	LatestHshake        time.Time // zero if never
+	BytesRx             uint64    // cumulative bytes received from this peer
+	BytesTx             uint64    // cumulative bytes sent to this peer
+	PersistentKeepalive int       // seconds; 0 = not configured or "off"
 }
 
 // EnsureKeypair generates a new (privkey, pubkey) pair with `wg genkey`
@@ -240,12 +249,52 @@ func ListPeers(iface string) ([]RuntimePeer, error) {
 			PublicKey:  fields[0],
 			AllowedIPs: fields[3],
 		}
+		// Endpoint column is `(none)` for peers that never connected —
+		// normalise to empty so callers can compare against zero-value.
+		if ep := strings.TrimSpace(fields[2]); ep != "" && ep != "(none)" {
+			peer.Endpoint = ep
+		}
 		if secs, err := parseInt64(fields[4]); err == nil && secs > 0 {
 			peer.LatestHshake = time.Unix(secs, 0)
+		}
+		if len(fields) >= 7 {
+			if rx, err := parseUint64(fields[5]); err == nil {
+				peer.BytesRx = rx
+			}
+			if tx, err := parseUint64(fields[6]); err == nil {
+				peer.BytesTx = tx
+			}
+		}
+		if len(fields) >= 8 {
+			// `off` is the wg-tool sentinel for "no persistent-keepalive".
+			if ka := strings.TrimSpace(fields[7]); ka != "" && ka != "off" {
+				if n, err := parseInt(ka); err == nil {
+					peer.PersistentKeepalive = n
+				}
+			}
 		}
 		peers = append(peers, peer)
 	}
 	return peers, nil
+}
+
+// parseUint64 trims whitespace and converts decimal digits. Shared with
+// parseInt64 but preserves the full unsigned range — WireGuard byte
+// counters are monotonically increasing since the interface came up and
+// can exceed math.MaxInt64 on long-lived tunnels.
+func parseUint64(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	var n uint64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("non-digit")
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	return n, nil
 }
 
 // ReadPrivateKey loads the server's private key from disk. Kept separate

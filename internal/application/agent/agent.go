@@ -459,8 +459,27 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			hs := ts.UTC().Format(time.RFC3339)
 			lastHandshakePtr = &hs
 		}
+		var peerTelemetry []cloud.HBVPNPeerTelemetry
+		activePeers := 0
 		if peers, err := wireguard.ListPeers(iface); err == nil {
 			peerCount = len(peers)
+			freshCutoff := time.Now().Add(-3 * time.Minute)
+			peerTelemetry = make([]cloud.HBVPNPeerTelemetry, 0, len(peers))
+			for _, p := range peers {
+				row := cloud.HBVPNPeerTelemetry{
+					PublicKey: p.PublicKey,
+					Endpoint:  p.Endpoint,
+					BytesRx:   p.BytesRx,
+					BytesTx:   p.BytesTx,
+				}
+				if !p.LatestHshake.IsZero() {
+					row.LastHandshake = p.LatestHshake.UTC().Format(time.RFC3339)
+					if p.LatestHshake.After(freshCutoff) {
+						activePeers++
+					}
+				}
+				peerTelemetry = append(peerTelemetry, row)
+			}
 		}
 		upnpOK := natSnap.UPnPOK
 		hbVPN = &cloud.HBVPN{
@@ -474,7 +493,9 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			NATType:        natSnap.NATType,
 			AllowedIps:     deriveSubnet(a.identity.RegistrationCode) + ".0/24",
 			PeerCount:      peerCount,
+			ActivePeers:    activePeers,
 			LastHandshake:  lastHandshakePtr,
+			PeerTelemetry:  peerTelemetry,
 		}
 	}
 
