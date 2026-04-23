@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat"
+	"github.com/rud1-es/rud1-fw/internal/server/httputil"
 )
 
 // SystemPercentilesExportHandler serves /api/percentiles/export.
@@ -133,11 +135,17 @@ func (h *SystemPercentilesExportHandler) Export(w http.ResponseWriter, r *http.R
 		filtered = append(filtered, p)
 	}
 
-	// Headers MUST be set before any byte of the body. Filename embeds the
-	// raw since/until (defaults applied) so two downloads in the same folder
-	// don't collide.
+	// Headers MUST be set before any byte of the body, and — critically —
+	// before MaybeGzip wraps the writer (gzip starts framing on first Write,
+	// so late header mutations silently vanish). Content-Type /
+	// Content-Disposition are unchanged by compression; only the filename
+	// gains a ".gz" suffix downstream so operators can tell the two variants
+	// apart in a Downloads folder.
 	ext := format
 	filename := fmt.Sprintf("rud1-percentiles-%d-%d.%s", effSince, effUntil, ext)
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		filename += ".gz"
+	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
 	if format == "json" {
 		w.Header().Set("Content-Type", "application/json")
@@ -146,7 +154,14 @@ func (h *SystemPercentilesExportHandler) Export(w http.ResponseWriter, r *http.R
 	}
 	w.WriteHeader(http.StatusOK)
 
-	bw := bufio.NewWriter(w)
+	// Transparent gzip layer: returns w unchanged when the client didn't
+	// request gzip, so the no-gzip path is byte-identical to the pre-iter-16
+	// behaviour. closeFn flushes+closes the gzip.Writer trailer; MUST be
+	// deferred.
+	bodyW, closeFn := httputil.MaybeGzip(w, r)
+	defer func() { _ = closeFn() }()
+
+	bw := bufio.NewWriter(bodyW)
 	enc := json.NewEncoder(bw)
 
 	if format == "json" {

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/config"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/usb/revlog"
+	"github.com/rud1-es/rud1-fw/internal/server/httputil"
 )
 
 // revocationLogSize is the maximum number of revocation entries kept in
@@ -777,10 +779,16 @@ func (h *USBIPHandler) RevocationsExport(w http.ResponseWriter, r *http.Request)
 		items[i], items[j] = items[j], items[i]
 	}
 
-	// Headers MUST be set before any byte of the body. filename includes the
-	// raw since/until values (0 when unbounded) so operators can tell windows
-	// apart at a glance in a downloads folder.
+	// Headers MUST be set before any byte of the body, and — critically —
+	// before MaybeGzip wraps the writer (gzip starts framing on first Write).
+	// filename includes the raw since/until values (0 when unbounded) so
+	// operators can tell windows apart at a glance; the ".gz" suffix is
+	// appended only when we're actually going to compress, so the no-gzip
+	// path stays byte-identical to pre-iter-16 behaviour.
 	filename := fmt.Sprintf("rud1-revocations-%d-%d.%s", since, until, format)
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		filename += ".gz"
+	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
 	if format == "json" {
 		w.Header().Set("Content-Type", "application/json")
@@ -789,7 +797,12 @@ func (h *USBIPHandler) RevocationsExport(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(http.StatusOK)
 
-	bw := bufio.NewWriter(w)
+	// Transparent gzip layer: returns w unchanged when the client didn't
+	// request gzip. closeFn flushes+closes the gzip trailer; MUST be deferred.
+	bodyW, closeFn := httputil.MaybeGzip(w, r)
+	defer func() { _ = closeFn() }()
+
+	bw := bufio.NewWriter(bodyW)
 	enc := json.NewEncoder(bw)
 
 	if format == "json" {
