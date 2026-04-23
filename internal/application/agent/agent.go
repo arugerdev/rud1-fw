@@ -33,6 +33,7 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/storage"
 	sysinfo "github.com/rud1-es/rud1-fw/internal/infrastructure/system"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat/uptime"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/usb/revlog"
 	wireguard "github.com/rud1-es/rud1-fw/internal/infrastructure/vpn"
@@ -57,6 +58,7 @@ type Agent struct {
 	lanMgr   *lan.Manager           // owns the LAN-routing iptables rules
 	connSup  *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
 	sysstats *sysstat.Collector     // shared between HTTP handler + heartbeat loop
+	uptimeS  *uptime.Store          // nil when /var/lib/rud1/uptime isn't writable
 
 	// WireGuard SERVER identity — generated at first boot, persisted under
 	// /var/lib/rud1-agent and mirrored (public half only) for the heartbeat.
@@ -248,7 +250,36 @@ func New(cfg *config.Config) (*Agent, error) {
 	sysPctHistH := handlers.NewSystemPercentilesHistoryHandler(a.sysstats)
 	sysPctExpH := handlers.NewSystemPercentilesExportHandler(a.sysstats)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH)
+	// Disk-backed uptime/lifecycle event ring. Used by the diagnostics view
+	// to disambiguate warning bursts caused by reboots/agent restarts from
+	// sustained issues. Failure to open is non-fatal — the handler returns
+	// 503 and the rest of the agent boots normally.
+	if us, err := uptime.OpenStore(); err != nil {
+		log.Warn().Err(err).Msg("uptime: store unavailable, /api/system/uptime-events will return 503")
+	} else {
+		a.uptimeS = us
+		// Detect a real kernel reboot via /proc/sys/kernel/random/boot_id —
+		// agent restarts on the same kernel boot are intentionally NOT
+		// recorded as boot events (that path is handled below as a "restart"
+		// in the shutdown branches of Run).
+		prev, _ := uptime.ReadStoredBootID()
+		if ev, ok := uptime.DetectBootEvent(prev); ok {
+			if err := a.uptimeS.Append(ev); err != nil {
+				log.Warn().Err(err).Msg("uptime: append boot event failed")
+			}
+		}
+		// Always refresh the sidecar so the next agent restart has the
+		// current kernel id to compare against, even when no event was
+		// emitted this round (e.g. an in-place agent restart).
+		if cur := uptime.CurrentBootID(); cur != "" {
+			if err := uptime.WriteStoredBootID(cur); err != nil {
+				log.Debug().Err(err).Msg("uptime: persist boot_id sidecar failed")
+			}
+		}
+	}
+	sysUptimeEvH := handlers.NewSystemUptimeEventsHandler(a.uptimeS)
+
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH)
 
 	return a, nil
 }
@@ -333,6 +364,17 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	select {
 	case err := <-srvErr:
+		if a.uptimeS != nil {
+			if appendErr := a.uptimeS.Append(uptime.Event{
+				Kind:   "shutdown",
+				Reason: "server error: " + err.Error(),
+			}); appendErr != nil {
+				log.Warn().Err(appendErr).Msg("uptime: append shutdown event failed")
+			}
+			if closeErr := a.uptimeS.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("uptime store close failed")
+			}
+		}
 		if a.revLog != nil {
 			if closeErr := a.revLog.Close(); closeErr != nil {
 				log.Warn().Err(closeErr).Msg("revocation log close failed")
@@ -341,6 +383,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("server: %w", err)
 	case <-ctx.Done():
 		log.Info().Msg("agent context cancelled — shutting down")
+		if a.uptimeS != nil {
+			if appendErr := a.uptimeS.Append(uptime.Event{Kind: "shutdown"}); appendErr != nil {
+				log.Warn().Err(appendErr).Msg("uptime: append shutdown event failed")
+			}
+			if closeErr := a.uptimeS.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("uptime store close failed")
+			}
+		}
 		if a.revLog != nil {
 			if closeErr := a.revLog.Close(); closeErr != nil {
 				log.Warn().Err(closeErr).Msg("revocation log close failed")
