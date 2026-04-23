@@ -183,6 +183,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	// Reachability probe lives next to the routes API so the UI can
 	// sanity-check a target before asking the operator to expose it.
 	lanProbeH := handlers.NewLANProbeHandler(&lan.Prober{})
+	lanTraceH := handlers.NewLANTracerouteHandler(&lan.Tracer{})
 	// Seed the kernel with the persisted desired set so a reboot re-installs
 	// any rules the operator had enabled before.
 	if cfg.LAN.Enabled && len(cfg.LAN.Routes) > 0 {
@@ -200,7 +201,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.connSup = connSup
 	connH := handlers.NewConnectivityHandler(connSvc)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH)
 
 	return a, nil
 }

@@ -532,6 +532,17 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 		}
 		since = v
 	}
+	// limit: optional, 1..100. When omitted we return the full buffer so
+	// pre-existing callers that poll for a full snapshot keep working.
+	var limit int
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 || v > 100 {
+			writeError(w, http.StatusBadRequest, "limit must be an integer in [1,100]")
+			return
+		}
+		limit = v
+	}
 	entries := h.Revocations()
 	if since > 0 {
 		filtered := make([]RevocationEntry, 0, len(entries))
@@ -541,6 +552,11 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		entries = filtered
+	}
+	// Apply limit AFTER `since`: keep the N newest entries (the buffer is
+	// already chronological, so that's the tail).
+	if limit > 0 && len(entries) > limit {
+		entries = entries[len(entries)-limit:]
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"revocations": entries,

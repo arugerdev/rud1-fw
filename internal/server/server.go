@@ -42,6 +42,7 @@ func New(
 	identityH *handlers.IdentityHandler,
 	lanH *handlers.LANHandler,
 	lanProbeH *handlers.LANProbeHandler,
+	lanTraceH *handlers.LANTracerouteHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -126,6 +127,7 @@ func New(
 		// Lets rud1-app validate a host/IP before asking the operator to
 		// commit a new route.
 		r.Get("/api/lan/probe", lanProbeH.Probe)
+		r.Get("/api/lan/traceroute", lanTraceH.Trace)
 
 		r.Get("/api/usb/devices", usbH.List)
 

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,30 +32,74 @@ func NewLANProbeHandler(prober *lan.Prober) *LANProbeHandler {
 // a single "rules are simulated" banner regardless of which sub-endpoint
 // produced the data.
 type lanProbeResponse struct {
-	Target     string  `json:"target"`
-	Reachable  bool    `json:"reachable"`
-	RttMs      float64 `json:"rttMs"`
-	PacketLoss float64 `json:"packetLoss"`
-	Simulated  bool    `json:"simulated"`
+	Target      string  `json:"target"`
+	Reachable   bool    `json:"reachable"`
+	RttMs       float64 `json:"rttMs"`
+	PacketLoss  float64 `json:"packetLoss"`
+	PacketsSent int     `json:"packetsSent"`
+	PacketsRecv int     `json:"packetsRecv"`
+	Simulated   bool    `json:"simulated"`
 }
 
-// probeTimeout is the upper bound on a single probe request. `ping -c 3
-// -W 2` can spend at most ~6s in the worst case (3 × 2s per-packet
-// timeout), which is why the HTTP context is sized to match.
-const probeTimeout = 6 * time.Second
+// Default and bound constants for the tunable options. The outer context
+// timeout must always dominate the ping process's own internal timeout,
+// otherwise a slow target gets cut off by Go before ping has a chance to
+// print its summary line.
+const (
+	defaultProbeTimeout = 6 * time.Second
+	minProbeTimeout     = 1000 * time.Millisecond
+	maxProbeTimeout     = 20000 * time.Millisecond
 
-// Probe handles GET /api/lan/probe?target=<host-or-ip>.
+	defaultProbeCount = 3
+	minProbeCount     = 1
+	maxProbeCount     = 10
+)
+
+// Probe handles GET /api/lan/probe?target=<host-or-ip>[&count=N][&timeout=MS].
 func (h *LANProbeHandler) Probe(w http.ResponseWriter, r *http.Request) {
-	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	q := r.URL.Query()
+
+	target := strings.TrimSpace(q.Get("target"))
 	if err := lan.ValidateTarget(target); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), probeTimeout)
+	count := defaultProbeCount
+	if raw := strings.TrimSpace(q.Get("count")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < minProbeCount || v > maxProbeCount {
+			writeError(w, http.StatusBadRequest, "count must be an integer in [1,10]")
+			return
+		}
+		count = v
+	}
+
+	timeout := defaultProbeTimeout
+	if raw := strings.TrimSpace(q.Get("timeout")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < int(minProbeTimeout/time.Millisecond) || v > int(maxProbeTimeout/time.Millisecond) {
+			writeError(w, http.StatusBadRequest, "timeout must be an integer (ms) in [1000,20000]")
+			return
+		}
+		timeout = time.Duration(v) * time.Millisecond
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	res, err := h.prober.Ping(ctx, target)
+	// Divide the outer budget across the packets so a single -W cap can't
+	// outlast the HTTP context. Integer ms division with a 1s floor matches
+	// the clamp inside Prober.Ping.
+	perPing := timeout / time.Duration(count)
+	if perPing < time.Second {
+		perPing = time.Second
+	}
+
+	res, err := h.prober.Ping(ctx, target, lan.PingOptions{
+		Count:          count,
+		PerPingTimeout: perPing,
+	})
 	if err != nil {
 		log.Warn().Err(err).Str("target", target).Msg("lan: probe failed")
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -62,10 +107,12 @@ func (h *LANProbeHandler) Probe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, lanProbeResponse{
-		Target:     res.Target,
-		Reachable:  res.Reachable,
-		RttMs:      res.RttMs,
-		PacketLoss: res.PacketLoss,
-		Simulated:  platform.SimulateHardware(),
+		Target:      res.Target,
+		Reachable:   res.Reachable,
+		RttMs:       res.RttMs,
+		PacketLoss:  res.PacketLoss,
+		PacketsSent: res.PacketsSent,
+		PacketsRecv: res.PacketsRecv,
+		Simulated:   platform.SimulateHardware(),
 	})
 }
