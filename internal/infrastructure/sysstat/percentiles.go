@@ -170,6 +170,27 @@ func (c *Collector) Percentiles() PercentilesSnapshot {
 	return c.samples.percentiles()
 }
 
+// SetHistoryStore attaches a disk-backed history store so every sample
+// pushed by the background sampler is also mirrored to /var/lib/rud1/
+// percentiles/. Must be called before Start so the first sample hits disk.
+// A nil store is valid and disables persistence.
+func (c *Collector) SetHistoryStore(h *HistoryStore) {
+	if c == nil {
+		return
+	}
+	c.history = h
+}
+
+// History returns the attached HistoryStore (may be nil). Exposed so the
+// HTTP handler for /api/percentiles/history can query without leaking a
+// pointer through a second wiring path.
+func (c *Collector) History() *HistoryStore {
+	if c == nil {
+		return nil
+	}
+	return c.history
+}
+
 // Start launches the background sampler goroutine. It is idempotent —
 // subsequent calls after the first successful start are no-ops — so
 // callers don't need to coordinate. The goroutine exits when ctx is
@@ -177,6 +198,11 @@ func (c *Collector) Percentiles() PercentilesSnapshot {
 //
 // The first sample is taken immediately so Percentiles() has something
 // to report on cold start; subsequent samples follow bucketInterval.
+//
+// If SetHistoryStore was called with a non-nil store, any samples that
+// already existed on disk are replayed into the in-memory ring (up to
+// maxBuckets) so post-reboot the 1h percentile window is pre-warmed
+// rather than starting from zero.
 func (c *Collector) Start(ctx context.Context) {
 	if c == nil {
 		return
@@ -184,6 +210,15 @@ func (c *Collector) Start(ctx context.Context) {
 	c.startOnce.Do(func() {
 		if c.samples == nil {
 			c.samples = newRingBuffer(maxBuckets)
+		}
+		// Warm-start from disk: feed the most recent maxBuckets points
+		// into the ring so Percentiles() is meaningful immediately after
+		// a reboot.
+		if c.history != nil {
+			warm := c.history.History(time.Duration(maxBuckets) * bucketInterval)
+			for _, p := range warm {
+				c.samples.Push(sample{cpu: p.CPUPct, load: p.LoadAvg1, at: p.At})
+			}
 		}
 		go c.sampleLoop(ctx)
 	})
@@ -202,11 +237,17 @@ func (c *Collector) sampleLoop(ctx context.Context) {
 			log.Debug().Err(err).Msg("sysstat: background sample failed")
 			return
 		}
+		at := time.Now().UTC()
 		c.samples.Push(sample{
 			cpu:  s.CPUUsage,
 			load: s.LoadAvg1,
-			at:   time.Now().UTC(),
+			at:   at,
 		})
+		if c.history != nil {
+			if err := c.history.Append(at, s.CPUUsage, s.LoadAvg1); err != nil {
+				log.Debug().Err(err).Msg("sysstat: history append failed")
+			}
+		}
 	}
 
 	take()

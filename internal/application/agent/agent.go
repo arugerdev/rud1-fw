@@ -227,10 +227,27 @@ func New(cfg *config.Config) (*Agent, error) {
 	// and the heartbeat loop (HBSystem block). Stateless apart from the optional
 	// Uplink hint, so a single instance is safe to reuse concurrently.
 	a.sysstats = &sysstat.Collector{Uplink: lan.DetectDefaultUplink()}
+
+	// Disk-backed percentile history: 24h rolling sample trail that
+	// survives reboots. /var/lib/rud1/percentiles/ on prod, $TMPDIR on
+	// simulated hardware (Windows dev). A failure here is non-fatal —
+	// the in-memory 1h ring still serves /api/system/stats percentiles.
+	pctHistDir := "/var/lib/rud1/percentiles"
+	if platform.SimulateHardware() {
+		pctHistDir = filepath.Join(os.TempDir(), "rud1-percentiles")
+	}
+	if hs, err := sysstat.NewHistoryStore(pctHistDir); err != nil {
+		log.Warn().Err(err).Str("dir", pctHistDir).Msg("percentile history disk store unavailable")
+	} else {
+		a.sysstats.SetHistoryStore(hs)
+		log.Info().Str("dir", pctHistDir).Int("samples", hs.Size()).Msg("sysstat: percentile history warm-started from disk")
+	}
+
 	sysStatsH := handlers.NewSystemStatsHandler(a.sysstats)
 	sysHealthH := handlers.NewSystemHealthHandler(a.sysstats, cfg.VPN.Interface, a.lanMgr, a.usbipH)
+	sysPctHistH := handlers.NewSystemPercentilesHistoryHandler(a.sysstats)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH)
 
 	return a, nil
 }

@@ -92,6 +92,11 @@ type Collector struct {
 	// snapshot.
 	samples *RingBuffer
 
+	// history is the optional disk-backed mirror of `samples`. Populated
+	// via SetHistoryStore before Start; a nil store disables persistence
+	// (unit tests + constrained boards).
+	history *HistoryStore
+
 	// startOnce guards the background sampler goroutine so repeated
 	// Start() calls are idempotent (useful if the agent ever re-invokes
 	// wiring under supervision).

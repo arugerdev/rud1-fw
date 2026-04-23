@@ -45,6 +45,7 @@ func New(
 	lanTraceH *handlers.LANTracerouteHandler,
 	sysStatsH *handlers.SystemStatsHandler,
 	sysHealthH *handlers.SystemHealthHandler,
+	sysPctHistH *handlers.SystemPercentilesHistoryHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -81,6 +82,7 @@ func New(
 		r.Get("/api/system/info", systemH.Info)
 		r.Get("/api/system/stats", sysStatsH.Stats)
 		r.Get("/api/system/health", sysHealthH.Health)
+		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Post("/api/system/reboot", systemH.Reboot)
 
 		r.Get("/api/network/status", networkH.Status)
