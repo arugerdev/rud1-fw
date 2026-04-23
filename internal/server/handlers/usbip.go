@@ -14,6 +14,7 @@ import (
 
 	"github.com/rud1-es/rud1-fw/internal/config"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/usb/revlog"
 )
 
 // revocationLogSize is the maximum number of revocation entries kept in
@@ -73,6 +74,13 @@ type USBIPHandler struct {
 	revMu  sync.Mutex
 	revLog []RevocationEntry // ring buffer; len grows up to revocationLogSize
 	revPos int               // next write index when len == revocationLogSize
+
+	// revLogger is the optional disk-backed append-only log (daily-rotated
+	// JSONL under /var/lib/rud1/revocations). When nil we fall back to the
+	// in-memory ring buffer only; when set, recordRevocation mirrors each
+	// entry to disk synchronously (still inside revMu) so the paginated
+	// Revocations() endpoint can serve full history beyond 256 entries.
+	revLogger *revlog.Logger
 }
 
 // NewUSBIPHandler creates and (if enabled) starts the USB/IP server.
@@ -105,6 +113,17 @@ func (h *USBIPHandler) Server() *usblister.USBIPServer { return h.server }
 
 // Stop shuts down the USB/IP daemon.
 func (h *USBIPHandler) Stop() { h.server.Stop() }
+
+// SetRevLogger wires an optional disk-backed revocation log. Called by the
+// agent bootstrap after NewUSBIPHandler so we don't complicate the
+// constructor signature for a dependency that's allowed to be nil (e.g.
+// when /var/lib/rud1/revocations isn't writable). Safe to call at most once
+// and before the handler starts serving requests.
+func (h *USBIPHandler) SetRevLogger(l *revlog.Logger) {
+	h.revMu.Lock()
+	h.revLogger = l
+	h.revMu.Unlock()
+}
 
 // isAuthorized checks whether the request comes from an authorized CIDR.
 func (h *USBIPHandler) isAuthorized(r *http.Request) bool {
@@ -485,18 +504,39 @@ func (h *USBIPHandler) ReenforcePolicy() (revoked []string, errs []error) {
 	return revoked, errs
 }
 
-// recordRevocation appends an entry to the in-memory ring buffer. Once
-// the buffer is full, new entries overwrite the oldest slot; callers see
-// a chronologically-sorted slice via Revocations().
+// recordRevocation appends an entry to the in-memory ring buffer and, if a
+// disk-backed logger is wired, mirrors the same entry synchronously to
+// JSONL on disk so it survives process restarts. Disk errors are logged at
+// warn level and swallowed — revocation logging must never block policy
+// enforcement.
+//
+// Both writes happen under revMu so readers (via Revocations) see a
+// consistent view and the disk file is always a strict superset of the ring
+// buffer, which is the invariant RevocationsList relies on to paginate
+// straight from disk when revLogger != nil.
 func (h *USBIPHandler) recordRevocation(e RevocationEntry) {
 	h.revMu.Lock()
 	defer h.revMu.Unlock()
 	if len(h.revLog) < revocationLogSize {
 		h.revLog = append(h.revLog, e)
-		return
+	} else {
+		h.revLog[h.revPos] = e
+		h.revPos = (h.revPos + 1) % revocationLogSize
 	}
-	h.revLog[h.revPos] = e
-	h.revPos = (h.revPos + 1) % revocationLogSize
+	if h.revLogger != nil {
+		if err := h.revLogger.Append(revlog.Entry{
+			BusID:       e.BusID,
+			VendorID:    e.VendorID,
+			ProductID:   e.ProductID,
+			Serial:      e.Serial,
+			VendorName:  e.VendorName,
+			ProductName: e.ProductName,
+			Reason:      string(e.Reason),
+			At:          e.At,
+		}); err != nil {
+			log.Warn().Err(err).Str("busId", e.BusID).Msg("usbip: revocation disk append failed (in-memory still recorded)")
+		}
+	}
 }
 
 // Revocations returns the log entries in chronological order (oldest
@@ -534,20 +574,42 @@ func (h *USBIPHandler) RecentRevocations(limit int) []RevocationEntry {
 	return entries
 }
 
+// revocationListMaxLimit caps the per-request page size. When a disk-backed
+// logger is wired we allow much larger pages than the in-memory ring size
+// so the UI can render a "last 90 days" export without hammering the
+// endpoint; without disk we stay inside the ring buffer.
+const revocationListMaxLimit = 1000
+
 // RevocationsList handles GET /api/usbip/revocations — paginated history of
-// policy revocations. Query params: limit (1..revocationLogSize, default 50),
-// offset (>=0, default 0). Entries are ordered newest-first so offset=0
-// gives the most recent page.
+// policy revocations. Query params: limit (1..revocationListMaxLimit when a
+// disk logger is wired, otherwise 1..revocationLogSize), offset (>=0).
+// Entries are ordered newest-first so offset=0 gives the most recent page.
+//
+// When SetRevLogger has been called the handler reads paginated history
+// straight from disk; otherwise it falls back to the in-memory ring buffer.
+// Because recordRevocation performs the disk Append synchronously under the
+// same revMu as the ring write, the disk file is always a superset of the
+// ring buffer — there is no merge step to do on the read path.
 func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 	if !h.isAuthorized(r) {
 		writeError(w, http.StatusForbidden, "client IP not in authorized_nets")
 		return
 	}
+
+	h.revMu.Lock()
+	logger := h.revLogger
+	h.revMu.Unlock()
+
+	maxLimit := revocationLogSize
+	if logger != nil {
+		maxLimit = revocationListMaxLimit
+	}
+
 	limit := 50
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		v, err := strconv.Atoi(raw)
-		if err != nil || v < 1 || v > revocationLogSize {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("limit must be an integer in [1,%d]", revocationLogSize))
+		if err != nil || v < 1 || v > maxLimit {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("limit must be an integer in [1,%d]", maxLimit))
 			return
 		}
 		limit = v
@@ -560,6 +622,36 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		offset = v
+	}
+
+	if logger != nil {
+		items, total, err := logger.List(revlog.ListOptions{Limit: limit, Offset: offset})
+		if err != nil {
+			// Fall through to the in-memory path so a transient read failure
+			// still returns something useful (the most recent 256 entries).
+			log.Warn().Err(err).Msg("usbip: revocation disk list failed, falling back to in-memory")
+		} else {
+			out := make([]RevocationEntry, len(items))
+			for i, e := range items {
+				out[i] = RevocationEntry{
+					BusID:       e.BusID,
+					VendorID:    e.VendorID,
+					ProductID:   e.ProductID,
+					Serial:      e.Serial,
+					VendorName:  e.VendorName,
+					ProductName: e.ProductName,
+					Reason:      RevocationReason(e.Reason),
+					At:          e.At,
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"items":  out,
+				"total":  total,
+				"limit":  limit,
+				"offset": offset,
+			})
+			return
+		}
 	}
 
 	all := h.Revocations() // chronological (oldest first); total = len(all)

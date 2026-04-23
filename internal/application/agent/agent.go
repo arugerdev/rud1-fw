@@ -34,6 +34,7 @@ import (
 	sysinfo "github.com/rud1-es/rud1-fw/internal/infrastructure/system"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/usb/revlog"
 	wireguard "github.com/rud1-es/rud1-fw/internal/infrastructure/vpn"
 	"github.com/rud1-es/rud1-fw/internal/platform"
 	"github.com/rud1-es/rud1-fw/internal/server"
@@ -52,6 +53,7 @@ type Agent struct {
 	cloud    *cloud.Client         // nil when cloud.Enabled == false
 	srv      *server.Server
 	usbipH   *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
+	revLog   *revlog.Logger         // nil when /var/lib/rud1/revocations isn't writable
 	lanMgr   *lan.Manager           // owns the LAN-routing iptables rules
 	connSup  *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
 	sysstats *sysstat.Collector     // shared between HTTP handler + heartbeat loop
@@ -168,6 +170,24 @@ func New(cfg *config.Config) (*Agent, error) {
 	usbH := handlers.NewUSBHandler()
 	usbipH := handlers.NewUSBIPHandler(cfg)
 	a.usbipH = usbipH
+
+	// Disk-backed revocation log: daily-rotated JSONL under
+	// /var/lib/rud1/revocations in prod, OS temp dir on simulated hardware
+	// so Windows dev still exercises the same code path. A failure here is
+	// non-fatal — the agent keeps booting and falls back to the in-memory
+	// ring buffer only.
+	revocationsDir := "/var/lib/rud1/revocations"
+	if platform.SimulateHardware() {
+		revocationsDir = filepath.Join(os.TempDir(), "rud1-revocations")
+	}
+	if rl, err := revlog.New(revocationsDir, 30); err != nil {
+		log.Warn().Err(err).Str("dir", revocationsDir).Msg("revocation disk log unavailable, using in-memory only")
+	} else {
+		a.revLog = rl
+		usbipH.SetRevLogger(rl)
+		log.Info().Str("dir", revocationsDir).Msg("usbip: disk-backed revocation log enabled")
+	}
+
 	identityH := handlers.NewIdentityHandler(bootID)
 
 	// LAN routing manager — source subnet is the Pi's own /24 so WG peers
@@ -295,9 +315,19 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	select {
 	case err := <-srvErr:
+		if a.revLog != nil {
+			if closeErr := a.revLog.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("revocation log close failed")
+			}
+		}
 		return fmt.Errorf("server: %w", err)
 	case <-ctx.Done():
 		log.Info().Msg("agent context cancelled — shutting down")
+		if a.revLog != nil {
+			if closeErr := a.revLog.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("revocation log close failed")
+			}
+		}
 		return nil
 	}
 }
