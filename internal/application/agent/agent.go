@@ -208,8 +208,9 @@ func New(cfg *config.Config) (*Agent, error) {
 	// Uplink hint, so a single instance is safe to reuse concurrently.
 	a.sysstats = &sysstat.Collector{Uplink: lan.DetectDefaultUplink()}
 	sysStatsH := handlers.NewSystemStatsHandler(a.sysstats)
+	sysHealthH := handlers.NewSystemHealthHandler(a.sysstats, cfg.VPN.Interface)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH)
 
 	return a, nil
 }
