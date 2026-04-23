@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -677,4 +678,185 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 		"limit":  limit,
 		"offset": offset,
 	})
+}
+
+// exportUntilMaxSkew caps the upper-bound timestamp accepted by the export
+// endpoint at "now + 1 day". Anything further in the future is almost certainly
+// a client-side clock bug and we'd rather 400 than serve a confusing empty
+// window.
+const exportUntilMaxSkew = 24 * time.Hour
+
+// parseExportWindow validates the optional since/until query params (both in
+// unix seconds). A zero return value for either bound means "no bound"; the
+// error is non-nil iff the caller sent malformed or out-of-range input, in
+// which case the 400 message is user-facing.
+func parseExportWindow(q map[string][]string, now time.Time) (since, until int64, err error) {
+	if raw, ok := q["since"]; ok && len(raw) > 0 && raw[0] != "" {
+		v, perr := strconv.ParseInt(raw[0], 10, 64)
+		if perr != nil {
+			return 0, 0, fmt.Errorf("since must be a unix-seconds integer")
+		}
+		if v < 0 {
+			return 0, 0, fmt.Errorf("since must be >= 0")
+		}
+		since = v
+	}
+	if raw, ok := q["until"]; ok && len(raw) > 0 && raw[0] != "" {
+		v, perr := strconv.ParseInt(raw[0], 10, 64)
+		if perr != nil {
+			return 0, 0, fmt.Errorf("until must be a unix-seconds integer")
+		}
+		if v < 0 {
+			return 0, 0, fmt.Errorf("until must be >= 0")
+		}
+		maxUntil := now.Add(exportUntilMaxSkew).Unix()
+		if v > maxUntil {
+			return 0, 0, fmt.Errorf("until must be <= now + 1 day")
+		}
+		until = v
+	}
+	if since != 0 && until != 0 && until <= since {
+		return 0, 0, fmt.Errorf("until must be greater than since")
+	}
+	return since, until, nil
+}
+
+// RevocationsExport handles GET /api/usbip/revocations/export — streams the
+// full filtered history as a downloadable JSONL (default) or JSON array
+// attachment for operator audit purposes.
+//
+// Unlike RevocationsList (paginated, newest-first for UI scrolling), this
+// endpoint emits entries in chronological order (oldest-first) so the file
+// reads top-to-bottom as a traditional audit log. We write line-by-line via a
+// bufio.Writer and Flush on every entry to keep memory use bounded even on
+// very long windows.
+func (h *USBIPHandler) RevocationsExport(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthorized(r) {
+		writeError(w, http.StatusForbidden, "client IP not in authorized_nets")
+		return
+	}
+
+	h.revMu.Lock()
+	logger := h.revLogger
+	h.revMu.Unlock()
+
+	if logger == nil {
+		writeError(w, http.StatusServiceUnavailable, "disk log unavailable")
+		return
+	}
+
+	since, until, err := parseExportWindow(r.URL.Query(), time.Now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Format selection: "jsonl" (default) produces application/x-ndjson,
+	// "json" produces a single JSON array. Anything else is rejected so a
+	// typo doesn't silently fall back to an unexpected shape.
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "jsonl"
+	}
+	if format != "jsonl" && format != "json" {
+		writeError(w, http.StatusBadRequest, "format must be jsonl or json")
+		return
+	}
+
+	// Limit=0 requests the full filtered window from the disk logger.
+	items, _, err := logger.List(revlog.ListOptions{Since: since, Until: until})
+	if err != nil {
+		log.Error().Err(err).Msg("usbip: revocation export list failed")
+		writeError(w, http.StatusInternalServerError, "failed to read revocation log")
+		return
+	}
+
+	// List returns newest-first; reverse in place to oldest-first so the
+	// exported file reads as a chronological audit trail.
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+
+	// Headers MUST be set before any byte of the body. filename includes the
+	// raw since/until values (0 when unbounded) so operators can tell windows
+	// apart at a glance in a downloads folder.
+	filename := fmt.Sprintf("rud1-revocations-%d-%d.%s", since, until, format)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
+	if format == "json" {
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+	}
+	w.WriteHeader(http.StatusOK)
+
+	bw := bufio.NewWriter(w)
+	enc := json.NewEncoder(bw)
+
+	if format == "json" {
+		// Stream as a JSON array: open bracket, comma-separated elements,
+		// close bracket. We hand-roll the separators because json.Encoder
+		// emits one value at a time; flushing after each keeps peak memory
+		// bounded regardless of window size.
+		if _, err := bw.WriteString("["); err != nil {
+			log.Warn().Err(err).Msg("usbip: export write failed")
+			return
+		}
+		for i, e := range items {
+			if i > 0 {
+				if _, err := bw.WriteString(","); err != nil {
+					log.Warn().Err(err).Msg("usbip: export write failed")
+					return
+				}
+			}
+			out := RevocationEntry{
+				BusID:       e.BusID,
+				VendorID:    e.VendorID,
+				ProductID:   e.ProductID,
+				Serial:      e.Serial,
+				VendorName:  e.VendorName,
+				ProductName: e.ProductName,
+				Reason:      RevocationReason(e.Reason),
+				At:          e.At,
+			}
+			// json.Encoder.Encode appends a trailing newline; acceptable
+			// inside the array since JSON ignores whitespace between tokens.
+			if err := enc.Encode(out); err != nil {
+				log.Warn().Err(err).Msg("usbip: export encode failed")
+				return
+			}
+			if err := bw.Flush(); err != nil {
+				log.Warn().Err(err).Msg("usbip: export flush failed")
+				return
+			}
+		}
+		if _, err := bw.WriteString("]\n"); err != nil {
+			log.Warn().Err(err).Msg("usbip: export write failed")
+			return
+		}
+		_ = bw.Flush()
+		return
+	}
+
+	// jsonl: one JSON object per line; flush per entry so memory stays flat
+	// even for multi-thousand-entry exports.
+	for _, e := range items {
+		out := RevocationEntry{
+			BusID:       e.BusID,
+			VendorID:    e.VendorID,
+			ProductID:   e.ProductID,
+			Serial:      e.Serial,
+			VendorName:  e.VendorName,
+			ProductName: e.ProductName,
+			Reason:      RevocationReason(e.Reason),
+			At:          e.At,
+		}
+		if err := enc.Encode(out); err != nil {
+			log.Warn().Err(err).Msg("usbip: export encode failed")
+			return
+		}
+		if err := bw.Flush(); err != nil {
+			log.Warn().Err(err).Msg("usbip: export flush failed")
+			return
+		}
+	}
 }

@@ -148,6 +148,7 @@ func New(
 		r.Get("/api/usbip/policy", usbipH.Policy)
 		r.Put("/api/usbip/policy", usbipH.SetPolicy)
 		r.Get("/api/usbip/revocations", usbipH.RevocationsList)
+		r.Get("/api/usbip/revocations/export", usbipH.RevocationsExport)
 		r.Post("/api/usbip/export", usbipH.Export)
 		r.Delete("/api/usbip/export", usbipH.Unexport)
 		r.Post("/api/usbip/attach", usbipH.Attach)
