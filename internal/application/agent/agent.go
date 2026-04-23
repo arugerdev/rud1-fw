@@ -246,8 +246,9 @@ func New(cfg *config.Config) (*Agent, error) {
 	sysStatsH := handlers.NewSystemStatsHandler(a.sysstats)
 	sysHealthH := handlers.NewSystemHealthHandler(a.sysstats, cfg.VPN.Interface, a.lanMgr, a.usbipH)
 	sysPctHistH := handlers.NewSystemPercentilesHistoryHandler(a.sysstats)
+	sysPctExpH := handlers.NewSystemPercentilesExportHandler(a.sysstats)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH)
 
 	return a, nil
 }
