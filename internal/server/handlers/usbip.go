@@ -647,7 +647,11 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 					At:          e.At,
 				}
 			}
-			writeJSON(w, http.StatusOK, map[string]interface{}{
+			// Gzip-eligible: a page of 100 revocations with full metadata hovers
+			// around 20-30 KB JSON — easily compressible to <5 KB for clients
+			// that advertise Accept-Encoding. Matches the pattern used by the
+			// /export endpoint so the whole audit surface is consistent.
+			writeJSONMaybeGzip(w, r, http.StatusOK, map[string]interface{}{
 				"items":  out,
 				"total":  total,
 				"limit":  limit,
@@ -674,7 +678,7 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 	}
 	items := reversed[start:end]
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	writeJSONMaybeGzip(w, r, http.StatusOK, map[string]interface{}{
 		"items":  items,
 		"total":  total,
 		"limit":  limit,

@@ -306,3 +306,132 @@ func TestRevocationsExport_NoGzipWhenNotRequested(t *testing.T) {
 		t.Fatalf("body[0] = %v, want '{' (plain JSONL)", body[0])
 	}
 }
+
+// TestRevocationsList_GzipWhenRequested asserts the iter-20 extension: the
+// paginated list endpoint now honours Accept-Encoding: gzip. Unlike the
+// export path the filename stays attachment-free (it's a JSON payload for
+// UI consumption, not a download) — only Content-Encoding/Vary should flip.
+// Decoding must produce the same shape the uncompressed path emits.
+func TestRevocationsList_GzipWhenRequested(t *testing.T) {
+	dir := t.TempDir()
+	logger, err := revlog.New(dir, 200)
+	if err != nil {
+		t.Fatalf("revlog.New: %v", err)
+	}
+	defer logger.Close()
+
+	// Seed a handful of entries so the response is actually worth compressing.
+	base := time.Date(2026, 4, 24, 10, 0, 0, 0, time.UTC)
+	const count = 50
+	for i := 0; i < count; i++ {
+		if err := logger.Append(revlog.Entry{
+			BusID:       fmt.Sprintf("2-%d", i+1),
+			VendorID:    "1d6b",
+			ProductID:   "0003",
+			Serial:      fmt.Sprintf("ABC-%04d", i),
+			VendorName:  "Linux Foundation",
+			ProductName: "3.0 root hub",
+			Reason:      "policy",
+			At:          base.Add(time.Duration(i) * time.Second).Unix(),
+		}); err != nil {
+			t.Fatalf("Append[%d]: %v", i, err)
+		}
+	}
+
+	h := &USBIPHandler{full: &config.Config{}, cfg: &config.USBConfig{}}
+	h.SetRevLogger(logger)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/usbip/revocations?limit=50", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rr := httptest.NewRecorder()
+	h.RevocationsList(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	if got := rr.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("Vary = %q, want Accept-Encoding", got)
+	}
+	// List responses are NOT attachments — they are JSON for in-page consumption.
+	if cd := rr.Header().Get("Content-Disposition"); cd != "" {
+		t.Fatalf("Content-Disposition = %q, want empty (not a download)", cd)
+	}
+
+	body := rr.Body.Bytes()
+	if len(body) < 2 || body[0] != 0x1f || body[1] != 0x8b {
+		t.Fatalf("body does not start with gzip magic (got %x)", body[:2])
+	}
+	gzr, err := gzip.NewReader(strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer gzr.Close()
+	plain, err := io.ReadAll(gzr)
+	if err != nil {
+		t.Fatalf("read decompressed: %v", err)
+	}
+	var decoded struct {
+		Items  []RevocationEntry `json:"items"`
+		Total  int               `json:"total"`
+		Limit  int               `json:"limit"`
+		Offset int               `json:"offset"`
+	}
+	if err := json.Unmarshal(plain, &decoded); err != nil {
+		t.Fatalf("unmarshal decompressed body: %v — %s", err, string(plain))
+	}
+	if decoded.Total != count {
+		t.Fatalf("total = %d, want %d", decoded.Total, count)
+	}
+	if len(decoded.Items) != count {
+		t.Fatalf("items = %d, want %d", len(decoded.Items), count)
+	}
+	if decoded.Limit != 50 || decoded.Offset != 0 {
+		t.Fatalf("limit/offset = %d/%d, want 50/0", decoded.Limit, decoded.Offset)
+	}
+}
+
+// TestRevocationsList_NoGzipWhenNotRequested locks in the no-compression
+// path: without Accept-Encoding the response is plain JSON (Content-Type
+// application/json, no Content-Encoding, no Vary) so existing admin clients
+// see exactly the pre-iter-20 bytes.
+func TestRevocationsList_NoGzipWhenNotRequested(t *testing.T) {
+	dir := t.TempDir()
+	logger, err := revlog.New(dir, 30)
+	if err != nil {
+		t.Fatalf("revlog.New: %v", err)
+	}
+	defer logger.Close()
+
+	if err := logger.Append(revlog.Entry{
+		BusID:  "3-1",
+		Reason: "policy",
+		At:     time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC).Unix(),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	h := &USBIPHandler{full: &config.Config{}, cfg: &config.USBConfig{}}
+	h.SetRevLogger(logger)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/usbip/revocations", nil)
+	// No Accept-Encoding header — must stay plain JSON.
+	rr := httptest.NewRecorder()
+	h.RevocationsList(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if got := rr.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want empty", got)
+	}
+	if got := rr.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	body := rr.Body.Bytes()
+	if len(body) == 0 || body[0] != '{' {
+		t.Fatalf("body[0] = %v, want '{' (plain JSON)", body[0])
+	}
+}
