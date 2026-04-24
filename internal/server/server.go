@@ -36,6 +36,7 @@ func New(
 	networkH *handlers.NetworkHandler,
 	vpnH *handlers.VPNHandler,
 	vpnPeerH *handlers.VPNPeerHandler,
+	vpnPeersSumH *handlers.VPNPeersSummaryHandler,
 	usbH *handlers.USBHandler,
 	usbipH *handlers.USBIPHandler,
 	connH *handlers.ConnectivityHandler,
@@ -128,6 +129,12 @@ func New(
 		r.Get("/api/vpn/peers", vpnPeerH.List)
 		r.Post("/api/vpn/peers", vpnPeerH.Add)
 		r.Delete("/api/vpn/peers", vpnPeerH.Remove)
+
+		// Precomputed dashboard tile: peer counts + handshake aggregates
+		// within a short enumerated window. Mirrors /api/system/uptime-
+		// summary — saves mobile clients from reducing the full peer
+		// list on every poll.
+		r.Get("/api/vpn/peers/summary", vpnPeersSumH.Summary)
 
 		// LAN routing — opt-in exposure of the Pi's LAN subnet(s) over the
 		// WireGuard tunnel. Mutations persist to config.yaml via
