@@ -37,6 +37,7 @@ func New(
 	vpnH *handlers.VPNHandler,
 	vpnPeerH *handlers.VPNPeerHandler,
 	vpnPeersSumH *handlers.VPNPeersSummaryHandler,
+	vpnPeerDetailH *handlers.VPNPeerDetailHandler,
 	usbH *handlers.USBHandler,
 	usbipH *handlers.USBIPHandler,
 	connH *handlers.ConnectivityHandler,
@@ -135,6 +136,12 @@ func New(
 		// summary — saves mobile clients from reducing the full peer
 		// list on every poll.
 		r.Get("/api/vpn/peers/summary", vpnPeersSumH.Summary)
+
+		// Per-peer drill-down — companion to /summary. Returns one peer
+		// object with bytes, endpoint, and handshake age so the UI can
+		// open a detail panel from a row tap without re-fetching the
+		// whole list. Pubkey is validated client-side before hitting wg.
+		r.Get("/api/vpn/peers/{pubkey}", vpnPeerDetailH.Detail)
 
 		// LAN routing — opt-in exposure of the Pi's LAN subnet(s) over the
 		// WireGuard tunnel. Mutations persist to config.yaml via

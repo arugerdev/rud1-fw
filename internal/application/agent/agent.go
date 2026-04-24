@@ -170,6 +170,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	)
 	vpnPeerH := handlers.NewVPNPeerHandler(cfg.VPN.Interface)
 	vpnPeersSumH := handlers.NewVPNPeersSummaryHandler(cfg.VPN.Interface)
+	vpnPeerDetailH := handlers.NewVPNPeerDetailHandler(cfg.VPN.Interface)
 	usbH := handlers.NewUSBHandler()
 	usbipH := handlers.NewUSBIPHandler(cfg)
 	a.usbipH = usbipH
@@ -282,7 +283,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	sysUptimeEvExpH := handlers.NewSystemUptimeEventsExportHandler(a.uptimeS)
 	sysUptimeSumH := handlers.NewSystemUptimeSummaryHandler(a.uptimeS)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH)
 
 	return a, nil
 }
