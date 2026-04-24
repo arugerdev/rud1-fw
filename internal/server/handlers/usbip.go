@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
 
 	"github.com/rud1-es/rud1-fw/internal/config"
@@ -262,6 +264,44 @@ func (h *USBIPHandler) Sessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"sessions": sessions})
+}
+
+// SessionForBusID handles GET /api/usbip/sessions/{busId} — a drill-down from
+// the bulk Sessions endpoint for UIs that only care about one device. Returns
+// the Session object directly (unwrapped) so callers don't have to index into
+// a single-element slice.
+//
+// Status codes:
+//   - 200: body is the Session JSON.
+//   - 400: busId path param is empty.
+//   - 403: client IP not in authorized_nets.
+//   - 404: bus id not found in /sys/bus/usb/devices.
+//   - 503: usbip_status read not supported on this platform (non-Linux builds).
+//   - 500: any other lookup error.
+func (h *USBIPHandler) SessionForBusID(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthorized(r) {
+		writeError(w, http.StatusForbidden, "client IP not in authorized_nets")
+		return
+	}
+	busID := chi.URLParam(r, "busId")
+	if busID == "" {
+		writeError(w, http.StatusBadRequest, "busId required")
+		return
+	}
+	sess, err := usblister.SessionFor(busID)
+	if err != nil {
+		switch {
+		case errors.Is(err, usblister.ErrSessionsUnsupported):
+			writeError(w, http.StatusServiceUnavailable, "not supported on this platform")
+		case errors.Is(err, os.ErrNotExist):
+			writeError(w, http.StatusNotFound, "bus id not found")
+		default:
+			log.Error().Err(err).Str("busId", busID).Msg("usbip session lookup failed")
+			writeError(w, http.StatusInternalServerError, "failed to read usbip session")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, sess)
 }
 
 // policyResponse is the shape of both GET and PUT /api/usbip/policy.

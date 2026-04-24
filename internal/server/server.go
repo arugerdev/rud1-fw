@@ -155,6 +155,7 @@ func New(
 		r.Get("/api/usbip/status", usbipH.Status)
 		r.Get("/api/usbip/exportable", usbipH.Exportable)
 		r.Get("/api/usbip/sessions", usbipH.Sessions)
+		r.Get("/api/usbip/sessions/{busId}", usbipH.SessionForBusID)
 		r.Get("/api/usbip/policy", usbipH.Policy)
 		r.Put("/api/usbip/policy", usbipH.SetPolicy)
 		r.Get("/api/usbip/revocations", usbipH.RevocationsList)

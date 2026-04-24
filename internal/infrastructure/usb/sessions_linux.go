@@ -3,12 +3,19 @@
 package usblister
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+// ErrSessionsUnsupported is returned by SessionFor / ListSessions on platforms
+// where /sys/bus/usb/devices is not available. On Linux it is never returned
+// by the live implementation but is declared here so platform-neutral handler
+// code can reference it without build tags.
+var ErrSessionsUnsupported = errors.New("usbip sessions: not supported on this platform")
 
 // Session is the live USB/IP state for a single bus ID as exposed by the
 // kernel via /sys/bus/usb/devices/<busid>/usbip_status.
