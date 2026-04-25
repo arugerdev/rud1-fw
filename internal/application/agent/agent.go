@@ -1268,6 +1268,7 @@ func buildHeartbeatConfig(cfg *config.Config, auditLog auditStatsSource) *cloud.
 	hbStats := &cloud.HBAuditRetentionStats{
 		TotalEntries: stats.TotalEntries,
 		TotalBytes:   stats.TotalBytes,
+		EntryBytes:   stats.EntryBytes,
 		FileCount:    stats.FileCount,
 	}
 	if !stats.OldestEntryAt.IsZero() {

@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +140,7 @@ func TestBuildHeartbeatConfig_StatsForwardedAndFormatted(t *testing.T) {
 	src := fakeAuditStats{out: configlog.Stats{
 		TotalEntries:  1234,
 		TotalBytes:    567890,
+		EntryBytes:    1500000,
 		FileCount:     7,
 		OldestEntryAt: oldest,
 		NewestEntryAt: newest,
@@ -150,6 +153,9 @@ func TestBuildHeartbeatConfig_StatsForwardedAndFormatted(t *testing.T) {
 	s := got.AuditRetentionStats
 	if s.TotalEntries != 1234 || s.TotalBytes != 567890 || s.FileCount != 7 {
 		t.Fatalf("count fields: %+v", s)
+	}
+	if s.EntryBytes != 1500000 {
+		t.Fatalf("EntryBytes: got %d, want 1500000", s.EntryBytes)
 	}
 	if s.OldestEntryAt != "2025-04-01T12:30:45Z" {
 		t.Fatalf("OldestEntryAt: got %q, want RFC3339 UTC", s.OldestEntryAt)
@@ -180,5 +186,64 @@ func TestBuildHeartbeatConfig_ZeroTimesOmitted(t *testing.T) {
 	s := got.AuditRetentionStats
 	if s.OldestEntryAt != "" || s.NewestEntryAt != "" || s.LastPruneAt != "" {
 		t.Fatalf("zero times should marshal as empty: %+v", s)
+	}
+}
+
+// TestBuildHeartbeatConfig_EntryBytesOmittedWhenZero (iter 42) pins the
+// `omitempty` contract for the new EntryBytes wire field. iter ≤41
+// cloud has no consumer for it; iter 42+ cloud renders the
+// uncompressed/compressed ratio when present and falls back to
+// "unknown" when absent. Marshalling a zero EntryBytes as the literal
+// `0` would force iter ≤41 cloud to either silently ignore it (fine)
+// OR misinterpret it as "0 uncompressed bytes" if a future caller
+// special-cases zero. Cheap to keep it omitted.
+func TestBuildHeartbeatConfig_EntryBytesOmittedWhenZero(t *testing.T) {
+	cfg := config.Default()
+	src := fakeAuditStats{out: configlog.Stats{
+		TotalEntries: 0,
+		TotalBytes:   0,
+		EntryBytes:   0,
+		FileCount:    0,
+	}}
+	got := buildHeartbeatConfig(cfg, src)
+	if got.AuditRetentionStats == nil {
+		t.Fatal("stats block missing")
+	}
+	if got.AuditRetentionStats.EntryBytes != 0 {
+		t.Fatalf("zero EntryBytes should pass through, got %d", got.AuditRetentionStats.EntryBytes)
+	}
+	// Marshal and confirm the JSON token is absent (omitempty). This is
+	// a wire-shape regression — a struct-tag drop here would leak a
+	// literal `"entryBytes":0` to iter ≤41 cloud schemas.
+	buf, err := json.Marshal(got.AuditRetentionStats)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(buf), "entryBytes") {
+		t.Fatalf("zero EntryBytes leaked to wire: %s", buf)
+	}
+}
+
+// TestBuildHeartbeatConfig_EntryBytesEmittedWhenNonZero (iter 42)
+// counterpart: when configlog reports a non-zero uncompressed footprint
+// the wire JSON must carry it under `entryBytes` (camelCase). Cloud
+// reads this exact key — a tag-rename here would silently break the
+// compression-ratio chip on /dashboard/devices/[id]/audit without any
+// type error to flag the drift.
+func TestBuildHeartbeatConfig_EntryBytesEmittedWhenNonZero(t *testing.T) {
+	cfg := config.Default()
+	src := fakeAuditStats{out: configlog.Stats{
+		TotalEntries: 10,
+		TotalBytes:   100,
+		EntryBytes:   400,
+		FileCount:    1,
+	}}
+	got := buildHeartbeatConfig(cfg, src)
+	buf, err := json.Marshal(got.AuditRetentionStats)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(buf), `"entryBytes":400`) {
+		t.Fatalf("expected entryBytes:400 in wire payload, got %s", buf)
 	}
 }

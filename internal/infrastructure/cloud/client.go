@@ -216,9 +216,18 @@ type HBConfigSnapshot struct {
 // Time fields use RFC3339 (UTC) so the cloud can parse them with the
 // same Date constructor used elsewhere; nil means "unknown" — distinct
 // from "epoch zero" which would be a misconfiguration.
+//
+// EntryBytes (iter 42) is the uncompressed JSONL footprint, paired with
+// TotalBytes (the on-disk gzip-compressed footprint introduced in
+// iter 41). The ratio is the operator-visible "is gzip working" signal
+// on the audit retention chip. Marshalled `omitempty` so iter ≤41 fw
+// (no awareness of the field) and iter ≤41 cloud (no consumer) keep
+// round-tripping cleanly: zero on the wire means "unknown" — distinct
+// from a real all-zero log which would also legitimately omit it.
 type HBAuditRetentionStats struct {
 	TotalEntries  int    `json:"totalEntries"`
 	TotalBytes    int64  `json:"totalBytes"`
+	EntryBytes    int64  `json:"entryBytes,omitempty"`
 	FileCount     int    `json:"fileCount"`
 	OldestEntryAt string `json:"oldestEntryAt,omitempty"` // RFC3339 UTC; "" when unknown
 	NewestEntryAt string `json:"newestEntryAt,omitempty"` // RFC3339 UTC; "" when unknown
