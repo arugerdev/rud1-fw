@@ -1278,3 +1278,126 @@ func TestStatsCompressionByDayMalformedGzip(t *testing.T) {
 		t.Fatalf("FileCount=%d, want 1 (malformed .gz still inventoried)", got.FileCount)
 	}
 }
+
+// TestStatsCompressionByDayCapBoundedAt90 (iter 45): when the on-disk
+// archive holds more than maxCompressionDays compressible day-files,
+// CompressionByDay is bounded at the cap and the entries kept are the
+// newest ones. Aggregates (FileCount, TotalBytes, EntryBytes) are NOT
+// trimmed — the cap is purely on the histogram.
+func TestStatsCompressionByDayCapBoundedAt90(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write 95 compressible `.jsonl.gz` archives spanning 95 distinct
+	// days. The newest day is "2026-04-25"; we walk backwards. The cap
+	// is maxCompressionDays (=90), so the histogram should retain the
+	// 90 most recent days and drop the 5 oldest.
+	const total = 95
+	const cap = 90 // maxCompressionDays
+	newest := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
+
+	var body strings.Builder
+	for i := 0; i < 40; i++ {
+		body.WriteString(`{"at":1745318400,"action":"compressible.repeat.action","actor":"operator","ok":true}` + "\n")
+	}
+	bodyBytes := []byte(body.String())
+
+	for i := 0; i < total; i++ {
+		day := newest.AddDate(0, 0, -i).Format("2006-01-02")
+		gzPath := filepath.Join(dir, "audit-"+day+".jsonl.gz")
+		f, err := os.Create(gzPath)
+		if err != nil {
+			t.Fatalf("create %s: %v", day, err)
+		}
+		gw := gzip.NewWriter(f)
+		if _, err := gw.Write(bodyBytes); err != nil {
+			t.Fatalf("gz write %s: %v", day, err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatalf("gz close %s: %v", day, err)
+		}
+		_ = f.Close()
+	}
+
+	// MaxFiles big enough that prune-on-construct doesn't drop files.
+	l, err := New(dir, Options{MaxFiles: total + 5, Now: func() time.Time { return newest }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+
+	if len(got.CompressionByDay) != cap {
+		t.Fatalf("CompressionByDay len=%d, want %d", len(got.CompressionByDay), cap)
+	}
+	// Aggregates remain a full inventory of on-disk state.
+	if got.FileCount != total {
+		t.Fatalf("FileCount=%d, want %d (cap must not affect aggregates)", got.FileCount, total)
+	}
+
+	// The 90 newest days must be present (oldest kept = newest - 89d).
+	for i := 0; i < cap; i++ {
+		day := newest.AddDate(0, 0, -i).Format("2006-01-02")
+		if _, ok := got.CompressionByDay[day]; !ok {
+			t.Fatalf("expected newest-%d day %q to be present in histogram", i, day)
+		}
+	}
+	// The oldest 5 days must be dropped.
+	for i := cap; i < total; i++ {
+		day := newest.AddDate(0, 0, -i).Format("2006-01-02")
+		if _, ok := got.CompressionByDay[day]; ok {
+			t.Fatalf("expected oldest day %q to be dropped from histogram (i=%d)", day, i)
+		}
+	}
+}
+
+// TestStatsCompressionByDayBelowCapNoTrim (iter 45): when the count of
+// compressible days is less than the cap, the histogram is unchanged.
+// Pin the cap as a soft contract — a future bump must not silently
+// degrade the small-fleet path.
+func TestStatsCompressionByDayBelowCapNoTrim(t *testing.T) {
+	dir := t.TempDir()
+	newest := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
+
+	var body strings.Builder
+	for i := 0; i < 40; i++ {
+		body.WriteString(`{"at":1745318400,"action":"compressible.repeat.action","actor":"operator","ok":true}` + "\n")
+	}
+	bodyBytes := []byte(body.String())
+
+	// 5 days — well below the 90-day cap.
+	const days = 5
+	for i := 0; i < days; i++ {
+		day := newest.AddDate(0, 0, -i).Format("2006-01-02")
+		gzPath := filepath.Join(dir, "audit-"+day+".jsonl.gz")
+		f, err := os.Create(gzPath)
+		if err != nil {
+			t.Fatalf("create %s: %v", day, err)
+		}
+		gw := gzip.NewWriter(f)
+		if _, err := gw.Write(bodyBytes); err != nil {
+			t.Fatalf("gz write %s: %v", day, err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatalf("gz close %s: %v", day, err)
+		}
+		_ = f.Close()
+	}
+
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return newest }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(got.CompressionByDay) != days {
+		t.Fatalf("CompressionByDay len=%d, want %d (below cap, no trim)", len(got.CompressionByDay), days)
+	}
+}

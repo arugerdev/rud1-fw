@@ -132,6 +132,18 @@ const (
 	// Bigger errors are clipped with an ellipsis; newlines are
 	// stripped because JSONL is one-record-per-line.
 	errorMaxLen = 256
+
+	// maxCompressionDays caps the size of the iter-44 CompressionByDay
+	// histogram. The cloud-side outlier dashboard only needs a recent
+	// window — typical retention defaults are 14 days, today's hardest
+	// fleet ceiling is ~30 days, so 90 leaves comfortable headroom for
+	// future retention growth while bounding the heartbeat payload. When
+	// the on-disk archive exceeds this bound (e.g. after retention is
+	// raised retroactively), the newest days are kept and older ones
+	// drop off the histogram. Aggregates (TotalBytes/EntryBytes/
+	// FileCount/TotalEntries) are unaffected — only the histogram is
+	// trimmed.
+	maxCompressionDays = 90
 )
 
 // New constructs a DiskLogger rooted at baseDir. The base dir is
@@ -715,13 +727,22 @@ func (l *DiskLogger) Stats() (Stats, error) {
 		// ratio==1.0, no useful signal) as well as days where the
 		// re-marshal estimate dropped to zero (malformed gzip whose
 		// entries can't be parsed back into Entry shapes).
+		//
+		// Iter 45: cap the histogram at maxCompressionDays. `names` is
+		// sorted newest-first so we simply stop adding once we've
+		// reached the bound — keeping the most recent N days, dropping
+		// the oldest. Aggregates above (TotalBytes/EntryBytes/
+		// FileCount/TotalEntries) are NOT affected by this cap; they
+		// remain a full inventory of on-disk state.
 		if fileEntryBytes > 0 && fi.Size() > 0 && fileEntryBytes > fi.Size() {
-			day := dayKeyFromName(name)
-			if day != "" {
-				if out.CompressionByDay == nil {
-					out.CompressionByDay = make(map[string]float64)
+			if len(out.CompressionByDay) < maxCompressionDays {
+				day := dayKeyFromName(name)
+				if day != "" {
+					if out.CompressionByDay == nil {
+						out.CompressionByDay = make(map[string]float64)
+					}
+					out.CompressionByDay[day] = float64(fileEntryBytes) / float64(fi.Size())
 				}
-				out.CompressionByDay[day] = float64(fileEntryBytes) / float64(fi.Size())
 			}
 		}
 	}
