@@ -24,6 +24,7 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/config"
 	"github.com/rud1-es/rud1-fw/internal/domain/device"
 	domainnet "github.com/rud1-es/rud1-fw/internal/domain/network"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/auditcursor"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/bootidentity"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/cloud"
@@ -85,17 +86,29 @@ type Agent struct {
 	lastTimeHealthSent        time.Time
 	lastTimeHealthFingerprint string
 
-	// Audit forwarding fingerprint (iter 31). Stores the joined "at|action"
-	// of the newest entry shipped in the previous heartbeat so we can
-	// skip emitting the Audit block when nothing has changed (typical
-	// steady-state — operators flip TZ/NTP a handful of times per day).
-	// Cloud also dedups by `(deviceId, at, action, actor)` so a missed
-	// heartbeat replaying the same window is idempotent. Reset to ""
-	// on agent restart — the next heartbeat re-ships the rolling
-	// window unconditionally, which is exactly what we want for a
-	// quick fast-forward of the cloud-side trail.
-	auditMu               sync.Mutex
-	lastForwardedAuditFp  string
+	// Audit forwarding cursor (iter 37). The agent ships only audit-log
+	// entries whose `at` is strictly newer than `auditCursor`, capped at
+	// MaxHBAuditEntries per heartbeat. The cursor is persisted to disk
+	// (audit-cursor.json under DataDir) so a reboot doesn't re-ship the
+	// last successfully-forwarded window. On first boot of an upgraded
+	// agent (cursor file genuinely missing) we default to time.Now() —
+	// not zero — so we don't spam-ship the entire on-disk audit history
+	// once.
+	//
+	// `auditMu` serialises cursor reads (in buildHeartbeatAudit) against
+	// commits (after a successful heartbeat send). Cloud already dedups
+	// by (deviceId, at, action, hash) so a transport failure that leaves
+	// the cursor untouched simply replays the same window on the next
+	// tick — idempotent.
+	//
+	// `auditCursorStore` is nil only on the dev/test path where the
+	// data dir is unwritable; in that case we fall back to an
+	// in-memory cursor that resets on every agent restart, which is
+	// safe because the disk audit log is also unavailable in that
+	// configuration (LoggerNoop fallback).
+	auditMu          sync.Mutex
+	auditCursor      time.Time
+	auditCursorStore *auditcursor.Store
 }
 
 // New creates an Agent from the given Config.
@@ -237,6 +250,38 @@ func New(cfg *config.Config) (*Agent, error) {
 	} else {
 		a.auditLog = al
 		log.Info().Str("dir", auditDir).Int("retention_days", auditRetention).Msg("audit: disk-backed config audit log enabled")
+	}
+
+	// Heartbeat audit cursor (iter 37) — persisted next to the rest of
+	// the agent's mutable state in DataDir. A failure here is non-fatal:
+	// the agent boots, but the cursor falls back to an in-memory value
+	// that resets on every restart. On Linux production that path is
+	// unreachable in practice (DataDir is writable), so this is purely
+	// a defensive fallback for dev hardware with an exotic mount layout.
+	//
+	// The cursor is initialised to time.Now() when the cursor file is
+	// genuinely missing (first boot of an upgraded agent). Defaulting to
+	// the zero value here would cause the very next heartbeat to ship
+	// the entire on-disk audit history (up to 14 days of entries) which
+	// would defeat the purpose of cursor-based delta-shipping.
+	if cs, err := auditcursor.New(platform.DataDir()); err != nil {
+		log.Warn().Err(err).Msg("audit cursor disk store unavailable, using in-memory only")
+		a.auditCursor = time.Now()
+	} else {
+		a.auditCursorStore = cs
+		if at, exists, err := cs.Load(); err != nil {
+			log.Warn().Err(err).Str("path", cs.Path()).Msg("audit cursor load failed, defaulting to now")
+			a.auditCursor = time.Now()
+		} else if !exists {
+			// First boot of an upgraded agent: default to now() so we
+			// don't spam-ship the entire on-disk audit history on the
+			// first heartbeat.
+			a.auditCursor = time.Now()
+			log.Info().Str("path", cs.Path()).Msg("audit cursor missing — defaulting to now (first boot of upgraded agent)")
+		} else {
+			a.auditCursor = at
+			log.Info().Str("path", cs.Path()).Time("cursor", at).Msg("audit cursor warm-started from disk")
+		}
 	}
 
 	identityH := handlers.NewIdentityHandler(bootID)
@@ -867,14 +912,15 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// throttle state so the next tick retries with a fresh budget.
 	hbTimeHealth, hbTimeHealthFp, hbTimeHealthEmit := a.buildHeartbeatTimeHealth(ctx, time.Now())
 
-	// ── Audit (iter 31, rolling snapshot) ────────────────────────────────
-	// Newest-first window of up to MaxHBAuditEntries config-mutation
-	// entries from the local JSONL log. The agent ships the block only
-	// when the newest entry's fingerprint changed since the last
-	// successful heartbeat — steady-state heartbeats omit the field.
-	// Cloud dedups by (deviceId, at, action, actor) so a missed heartbeat
-	// replaying the same window is idempotent.
-	hbAudit, hbAuditFp := a.buildHeartbeatAudit()
+	// ── Audit (iter 37, cursor-based delta) ──────────────────────────────
+	// Strictly-newer-than-cursor batch of up to MaxHBAuditEntries
+	// config-mutation entries from the local JSONL log, oldest-first
+	// so a long-offline device drains its backlog in chronological
+	// order. The cursor advance happens AFTER a successful send (see
+	// commitAuditCursor below) so a transport failure replays the
+	// same window on the next tick — cloud dedups by
+	// (deviceId, occurredAt, action, hash).
+	hbAudit, hbAuditNewest := a.buildHeartbeatAudit()
 
 	// ── Config snapshot (iter 33) ────────────────────────────────────────
 	// Compact mirror of the operator-tunable system config values the
@@ -918,13 +964,11 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		a.timeHealthThrottleMu.Unlock()
 	}
 
-	// Audit fingerprint advance (iter 31). Only commit on success so a
-	// transport failure replays the same window next tick. `hbAuditFp`
-	// is empty when we shipped no entries (already caught up).
-	if hbAudit != nil && hbAuditFp != "" {
-		a.auditMu.Lock()
-		a.lastForwardedAuditFp = hbAuditFp
-		a.auditMu.Unlock()
+	// Audit cursor advance (iter 37). Only commit on success so a
+	// transport failure replays the same window next tick. `hbAuditNewest`
+	// is the zero time when we shipped no entries (already caught up).
+	if hbAudit != nil && !hbAuditNewest.IsZero() {
+		a.commitAuditCursor(hbAuditNewest)
 	}
 
 	// Two response variants: "unclaimed" (no Device yet — waiting for the
@@ -1018,52 +1062,71 @@ func (a *Agent) buildHeartbeatTimeHealth(ctx context.Context, now time.Time) (*c
 	}, fp, true
 }
 
-// auditEntryFingerprint is a stable per-entry signature used to decide
-// whether the heartbeat needs to ship the audit block at all. Cloud
-// dedup is done on (deviceId, at, action, actor), so any change to those
-// fields counts as "new content"; we deliberately exclude Previous/Next
-// from the fingerprint so a benign re-emission of an in-progress
-// mutation doesn't trigger a redundant ship.
-func auditEntryFingerprint(e configlog.Entry) string {
-	return fmt.Sprintf("%d|%s|%s|%s", e.At, e.Action, e.Actor, e.ResourceID)
-}
-
-// buildHeartbeatAudit returns the rolling-window audit batch to forward
-// in this heartbeat tick plus the fingerprint the caller must commit on
-// a successful send. Returns (nil, "") when the audit log is unavailable,
-// the log is empty, or the newest entry's fingerprint matches the
-// previously-forwarded one (steady state — no need to retransmit).
+// buildHeartbeatAudit returns the cursor-based audit batch to forward
+// in this heartbeat tick plus the timestamp the caller must commit
+// after a successful send.
 //
-// We always ship the *latest* MaxHBAuditEntries entries (newest-first)
-// instead of cursor-deltas: the audit log is intentionally low-traffic,
-// the cloud dedups by (deviceId, at, action, actor), and a rolling
-// snapshot gives us a clean self-healing path on agent restart (the
-// fingerprint resets to "" so the next heartbeat re-ships the window
-// and the cloud's createMany skipDuplicates absorbs any overlap).
-func (a *Agent) buildHeartbeatAudit() (*cloud.HBAudit, string) {
+// Behaviour (iter 37, replaces the iter-31 rolling-window+fingerprint):
+//   - Reads the current cursor from `a.auditCursor` under `auditMu`.
+//   - Lists audit entries strictly newer than the cursor, capped at
+//     MaxHBAuditEntries per call. The slice is emitted oldest-first so
+//     a backlog drains in chronological order: each successful ship
+//     advances the cursor to the newest of the shipped batch and the
+//     next tick picks up where this one left off. This is the correct
+//     semantics for a long-offline device that just came back online —
+//     a newest-first cap would forever skip the gap older than 16
+//     entries.
+//   - Returns (nil, zero) when the audit log is unavailable, the log
+//     is empty, or there are no entries newer than the cursor (steady
+//     state — operators flip TZ/NTP a handful of times per day, most
+//     heartbeats omit the block entirely).
+//
+// Cloud already dedups by (deviceId, occurredAt, action, hash) so a
+// transport failure that leaves the cursor untouched simply replays
+// the same window on the next tick — idempotent.
+func (a *Agent) buildHeartbeatAudit() (*cloud.HBAudit, time.Time) {
 	if a.auditLog == nil {
-		return nil, ""
-	}
-	rows, err := a.auditLog.List(configlog.ListOptions{
-		Limit: cloud.MaxHBAuditEntries,
-	})
-	if err != nil {
-		log.Debug().Err(err).Msg("heartbeat: audit list failed — omitting audit block")
-		return nil, ""
-	}
-	if len(rows) == 0 {
-		return nil, ""
+		return nil, time.Time{}
 	}
 
 	a.auditMu.Lock()
-	prevFp := a.lastForwardedAuditFp
+	cursor := a.auditCursor
 	a.auditMu.Unlock()
 
-	// Newest entry's fingerprint matches the last successful ship ⇒
-	// steady state, omit the block entirely.
-	newestFp := auditEntryFingerprint(rows[0])
-	if newestFp == prevFp {
-		return nil, ""
+	// `Since` is inclusive in configlog (`e.At < opts.Since` is
+	// filtered out), so we ask for cursor+1s to enforce the strict
+	// "newer than" semantics. Audit timestamps are unix-second so a
+	// 1-second nudge is the smallest valid step; a same-second entry
+	// that arrived after the previous ship is ambiguous either way
+	// (cloud would dedup anyway) but we err on the side of skipping
+	// duplicates rather than re-shipping.
+	since := cursor.Unix() + 1
+	if cursor.IsZero() {
+		since = 0
+	}
+	rows, err := a.auditLog.List(configlog.ListOptions{
+		Since: since,
+		// No Limit — we need the count to know whether more remain
+		// after the cap; the cap is enforced after reversing.
+	})
+	if err != nil {
+		log.Debug().Err(err).Msg("heartbeat: audit list failed — omitting audit block")
+		return nil, time.Time{}
+	}
+	if len(rows) == 0 {
+		return nil, time.Time{}
+	}
+
+	// configlog.List returns newest-first; reverse in place so the
+	// shipped batch is chronological (oldest-first). When the backlog
+	// exceeds MaxHBAuditEntries, the cap takes the *oldest* slice so
+	// the cursor advances by exactly that window per tick — a 30-entry
+	// burst drains in two heartbeats (16 + 14).
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	if len(rows) > cloud.MaxHBAuditEntries {
+		rows = rows[:cloud.MaxHBAuditEntries]
 	}
 
 	entries := make([]cloud.HBAuditEntry, 0, len(rows))
@@ -1083,7 +1146,30 @@ func (a *Agent) buildHeartbeatAudit() (*cloud.HBAudit, string) {
 			newestAt = e.At
 		}
 	}
-	return &cloud.HBAudit{Entries: entries, LastAt: newestAt}, newestFp
+	return &cloud.HBAudit{Entries: entries, LastAt: newestAt}, time.Unix(newestAt, 0).UTC()
+}
+
+// commitAuditCursor advances the in-memory cursor and persists it to
+// disk. Called from `sendHeartbeat` only on a successful cloud ack so
+// a transport failure replays the same window on the next tick.
+//
+// A persistence error is logged but not propagated — we still update
+// the in-memory cursor so subsequent heartbeats this run don't
+// re-ship the same batch. On the next agent restart we'd then re-ship
+// the post-cursor window once, which is acceptable (cloud dedups).
+func (a *Agent) commitAuditCursor(at time.Time) {
+	if at.IsZero() {
+		return
+	}
+	a.auditMu.Lock()
+	a.auditCursor = at
+	a.auditMu.Unlock()
+	if a.auditCursorStore == nil {
+		return
+	}
+	if err := a.auditCursorStore.Commit(at); err != nil {
+		log.Warn().Err(err).Time("at", at).Msg("audit cursor: persist failed")
+	}
 }
 
 // auditStatsSource is the minimal interface buildHeartbeatConfig needs
