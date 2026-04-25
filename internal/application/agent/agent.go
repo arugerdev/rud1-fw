@@ -861,6 +861,13 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// replaying the same window is idempotent.
 	hbAudit, hbAuditFp := a.buildHeartbeatAudit()
 
+	// ── Config snapshot (iter 33) ────────────────────────────────────────
+	// Compact mirror of the operator-tunable system config values the
+	// cloud needs to reflect or alert on. Currently just the effective
+	// audit-log retention so the cloud can warn when a device drops
+	// below an org-wide compliance default. Tiny payload, no throttling.
+	hbConfig := buildHeartbeatConfig(a.cfg)
+
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
 		RegistrationPin:  a.identity.RegistrationPin,
@@ -876,6 +883,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		Setup:            hbSetup,
 		TimeHealth:       hbTimeHealth,
 		Audit:            hbAudit,
+		Config:           hbConfig,
 	}
 
 	resp, err := a.cloud.Heartbeat(ctx, payload)
@@ -1061,6 +1069,18 @@ func (a *Agent) buildHeartbeatAudit() (*cloud.HBAudit, string) {
 		}
 	}
 	return &cloud.HBAudit{Entries: entries, LastAt: newestAt}, newestFp
+}
+
+// buildHeartbeatConfig captures the operator-tunable system config snapshot
+// the cloud needs on every heartbeat. Never returns nil — the cloud expects
+// at least the audit-retention floor so it can flag drift, and the
+// snapshot stays trivially small even as more fields are added in future
+// iterations. Uses the *Default accessor so the value reported is the
+// effective post-clamp window operators actually get at runtime.
+func buildHeartbeatConfig(cfg *config.Config) *cloud.HBConfigSnapshot {
+	return &cloud.HBConfigSnapshot{
+		AuditRetentionDays: cfg.System.AuditRetentionDaysOrDefault(),
+	}
 }
 
 // applyClientPeers converges the live WireGuard server state toward the

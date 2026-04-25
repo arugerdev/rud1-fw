@@ -125,6 +125,14 @@ type HeartbeatPayload struct {
 	// `lastForwardedAuditAt`). Operators see the trail under
 	// /dashboard/devices/[id]/audit without having to SSH into the Pi.
 	Audit *HBAudit `json:"audit,omitempty"`
+	// Config is a compact snapshot of operator-tunable system config
+	// values the cloud needs to reflect on the dashboard or warn about
+	// when they drift from an org-wide default. Currently carries the
+	// effective audit-log retention window so /dashboard/devices/[id]/audit
+	// can flag a divergence (e.g. operator dropped retention to 1 day on a
+	// device under a 30-day compliance policy). Sent on every heartbeat —
+	// tiny payload, no throttling, cloud overwrites on each tick.
+	Config *HBConfigSnapshot `json:"config,omitempty"`
 }
 
 // HBTimeHealth is the compact subset of the time-health response that the
@@ -180,6 +188,20 @@ type HBAuditEntry struct {
 type HBAudit struct {
 	Entries []HBAuditEntry `json:"entries"`
 	LastAt  int64          `json:"lastAt,omitempty"`
+}
+
+// HBConfigSnapshot is the compact operator-tunable config snapshot
+// forwarded with every heartbeat. Kept deliberately tiny: only the
+// values the cloud needs to surface or alert on. New fields here must
+// be `omitempty` and pointer-typed when "absent" needs to be
+// distinguishable from "zero" — otherwise older firmware looks like a
+// device that explicitly set the value to zero.
+type HBConfigSnapshot struct {
+	// AuditRetentionDays is the effective (post-clamp, [1, 365])
+	// retention window in days for the on-disk JSONL audit log. Mirrors
+	// `cfg.System.AuditRetentionDaysOrDefault()`. The cloud uses it to
+	// flag drift against an org default on the per-device audit page.
+	AuditRetentionDays int `json:"auditRetentionDays,omitempty"`
 }
 
 // HBSetup mirrors `cfg.Setup` over the heartbeat. Only sent when at least
