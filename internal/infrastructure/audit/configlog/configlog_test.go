@@ -1,6 +1,7 @@
 package configlog
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"os"
@@ -9,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 // TestAppendAndListRoundTrip writes five entries and reads them back
@@ -971,5 +975,135 @@ func TestAppendAutoFillsAt(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].At != fixed.Unix() {
 		t.Fatalf("At not stamped: %+v", items)
+	}
+}
+
+// captureGlobalLog redirects the global zerolog logger to an
+// in-memory buffer for the duration of the test, restoring the
+// previous logger via t.Cleanup. Returns the buffer; assertions
+// inspect its contents after the call under test runs.
+//
+// We force the level to Debug so info-level emissions from the
+// sweeper are always captured regardless of what the package
+// default happens to be when the test binary starts.
+func captureGlobalLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	prev := log.Logger
+	prevLevel := zerolog.GlobalLevel()
+	buf := &bytes.Buffer{}
+	log.Logger = zerolog.New(buf).With().Timestamp().Logger()
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	t.Cleanup(func() {
+		log.Logger = prev
+		zerolog.SetGlobalLevel(prevLevel)
+	})
+	return buf
+}
+
+// TestNewSweepsOrphanGzipTmp (iter 43): a `.gz.tmp` left behind by a
+// prior process that crashed mid-rotation must be reaped on startup.
+// The sweeper logs at info level with the path so an operator can see
+// what was cleaned.
+func TestNewSweepsOrphanGzipTmp(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "audit-2026-04-20.jsonl.gz.tmp")
+	if err := os.WriteFile(orphan, []byte("partial gzip stream"), 0o644); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+
+	logBuf := captureGlobalLog(t)
+
+	fixed := time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC)
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan should have been removed; stat err=%v", err)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "reaped orphan .gz.tmp") {
+		t.Fatalf("expected info log about reaped orphan, got: %s", out)
+	}
+	if !strings.Contains(out, "audit-2026-04-20.jsonl.gz.tmp") {
+		t.Fatalf("expected log to mention orphan path, got: %s", out)
+	}
+}
+
+// TestNewSilentWhenNoOrphan (iter 43): a clean baseDir at boot must
+// produce no sweeper log spam — operators should not see noise on
+// every restart of a healthy box.
+func TestNewSilentWhenNoOrphan(t *testing.T) {
+	dir := t.TempDir()
+
+	logBuf := captureGlobalLog(t)
+
+	fixed := time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC)
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	out := logBuf.String()
+	if strings.Contains(out, "reaped orphan") {
+		t.Fatalf("did not expect orphan-reaped log on clean dir, got: %s", out)
+	}
+	if strings.Contains(out, "failed to remove orphan") {
+		t.Fatalf("did not expect orphan-failed log on clean dir, got: %s", out)
+	}
+	if strings.Contains(out, "orphan .gz.tmp glob failed") {
+		t.Fatalf("did not expect glob-failed log on clean dir, got: %s", out)
+	}
+}
+
+// TestNewSweepsMultipleOrphans (iter 43): multiple crashed rotations
+// can each leave an orphan; the sweeper must reap all of them in one
+// pass, not just the first match. We also drop a non-matching file
+// (a regular `.jsonl`) and a similarly-named decoy to confirm the
+// glob is appropriately specific.
+func TestNewSweepsMultipleOrphans(t *testing.T) {
+	dir := t.TempDir()
+	orphans := []string{
+		"audit-2026-04-18.jsonl.gz.tmp",
+		"audit-2026-04-19.jsonl.gz.tmp",
+		"audit-2026-04-20.jsonl.gz.tmp",
+	}
+	for _, name := range orphans {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	// Decoys: must NOT be touched by the sweeper.
+	keep := filepath.Join(dir, "audit-2026-04-22.jsonl")
+	if err := os.WriteFile(keep, []byte(`{"at":1,"action":"x","actor":"o","ok":true}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write keep: %v", err)
+	}
+	keepGz := filepath.Join(dir, "audit-2026-04-21.jsonl.gz")
+	if err := os.WriteFile(keepGz, []byte("not actually gzip but glob mustn't match"), 0o644); err != nil {
+		t.Fatalf("write keepGz: %v", err)
+	}
+
+	fixed := time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC)
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	for _, name := range orphans {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("orphan %s should have been removed; stat err=%v", name, err)
+		}
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("non-tmp .jsonl was wrongly removed: %v", err)
+	}
+	if _, err := os.Stat(keepGz); err != nil {
+		t.Fatalf("non-tmp .jsonl.gz was wrongly removed: %v", err)
 	}
 }

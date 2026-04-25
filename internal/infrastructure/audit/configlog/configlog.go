@@ -160,6 +160,15 @@ func New(baseDir string, opts Options) (*DiskLogger, error) {
 	if err := os.MkdirAll(cleaned, 0o755); err != nil {
 		return nil, fmt.Errorf("configlog: mkdir %q: %w", cleaned, err)
 	}
+	// Iter 43: sweep orphan `.gz.tmp` files left behind when a previous
+	// process crashed mid-compression (see compressArchivedFile in iter
+	// 41 for the atomic write→rename flow that produces these). Today
+	// the next rotation truncates any leftover via `O_TRUNC`, but a
+	// long-lived agent that doesn't rotate again (e.g. powered down for
+	// weeks then booted on the same calendar day) would keep the orphan
+	// indefinitely. Cheap glob, best-effort removal — a single failure
+	// must not block construction.
+	sweepOrphanGzipTmps(cleaned)
 	l := &DiskLogger{
 		baseDir:  cleaned,
 		maxFiles: maxFiles,
@@ -171,6 +180,36 @@ func New(baseDir string, opts Options) (*DiskLogger, error) {
 		log.Debug().Err(err).Str("dir", cleaned).Msg("configlog: initial prune failed (non-fatal)")
 	}
 	return l, nil
+}
+
+// sweepOrphanGzipTmps removes any `*.gz.tmp` files in baseDir. These
+// are produced by compressArchivedFile (iter 41) as the intermediate
+// target before the atomic rename to `.gz`; a crash between
+// `os.OpenFile(tmp, ...)` and `os.Rename(tmp, dst)` leaves the partial
+// file behind. We log each reaped file at info level so an operator
+// reviewing boot logs can see what was cleaned. Removal failures are
+// logged at warn level and do not abort the sweep — the next rotation
+// will still truncate the orphan via O_TRUNC.
+func sweepOrphanGzipTmps(baseDir string) {
+	pattern := filepath.Join(baseDir, "*"+gzipSuffix+".tmp")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		// filepath.Glob only fails on malformed patterns — our pattern
+		// is a constant-derived literal, so this is truly defensive.
+		log.Warn().Err(err).Str("dir", baseDir).Msg("configlog: orphan .gz.tmp glob failed; skipping startup sweep")
+		return
+	}
+	for _, p := range matches {
+		var size int64
+		if fi, statErr := os.Stat(p); statErr == nil {
+			size = fi.Size()
+		}
+		if err := os.Remove(p); err != nil {
+			log.Warn().Err(err).Str("path", p).Int64("size", size).Msg("configlog: failed to remove orphan .gz.tmp; will be truncated on next rotation")
+			continue
+		}
+		log.Info().Str("path", p).Int64("size", size).Msg("configlog: reaped orphan .gz.tmp from crashed rotation")
+	}
 }
 
 // dayKey is the local-tz "YYYY-MM-DD" bucket key for a timestamp.
