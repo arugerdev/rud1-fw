@@ -426,6 +426,11 @@ func New(cfg *config.Config) (*Agent, error) {
 	if a.auditLog != nil {
 		sysAuditRetH.SetAuditLogger(a.auditLog)
 	}
+	// Iter 40: forward-status endpoint. Reads the live agent cursor
+	// (a.AuditCursor()) and pending-count from the same on-disk audit
+	// logger the heartbeat uses, so the local panel surfaces exactly
+	// what the next tick would ship.
+	sysAuditFwdH := handlers.NewSystemAuditForwardStatusHandler(a, auditLogIface, cfg.Cloud.Enabled)
 	// Reset the time-health throttle on every PUT so the next heartbeat
 	// re-emits the (potentially changed) timeHealth block immediately,
 	// instead of waiting for the 1h keepalive window.
@@ -436,7 +441,7 @@ func New(cfg *config.Config) (*Agent, error) {
 		a.timeHealthThrottleMu.Unlock()
 	})
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH, sysAuditFwdH)
 
 	return a, nil
 }
@@ -1163,6 +1168,21 @@ func (a *Agent) buildHeartbeatAudit() (*cloud.HBAudit, time.Time) {
 		}
 	}
 	return &cloud.HBAudit{Entries: entries, LastAt: newestAt}, time.Unix(newestAt, 0).UTC()
+}
+
+// AuditCursor returns the timestamp of the newest audit entry the
+// agent has successfully shipped to the cloud. Zero time means the
+// cursor has not yet advanced (first boot of an upgraded agent /
+// in-memory fallback after a fresh restart). Read under auditMu so a
+// concurrent commitAuditCursor doesn't tear the value.
+//
+// Exposed so the SystemAuditForwardStatusHandler (iter 40) can surface
+// the cursor + pending-count window to operators without taking a
+// reach-around dependency on the agent struct internals.
+func (a *Agent) AuditCursor() time.Time {
+	a.auditMu.Lock()
+	defer a.auditMu.Unlock()
+	return a.auditCursor
 }
 
 // commitAuditCursor advances the in-memory cursor and persists it to

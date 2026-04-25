@@ -59,6 +59,7 @@ func New(
 	sysNTPProbeCfgH *handlers.SystemNTPProbeConfigHandler,
 	sysAuditH *handlers.SystemAuditHandler,
 	sysAuditRetH *handlers.SystemAuditRetentionHandler,
+	sysAuditFwdH *handlers.SystemAuditForwardStatusHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -131,6 +132,11 @@ func New(
 		// reflected on disk without waiting for the next rotation.
 		r.Get("/api/system/audit/retention", sysAuditRetH.Get)
 		r.Put("/api/system/audit/retention", sysAuditRetH.Set)
+		// Iter 40: heartbeat audit-forward cursor + pending-count
+		// snapshot. Read-only; surfaces what the next heartbeat tick
+		// would ship so operators can diagnose a stuck cloud-forward
+		// without reading the agent log.
+		r.Get("/api/system/audit/forward-status", sysAuditFwdH.Status)
 		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Get("/api/percentiles/export", sysPctExpH.Export)
 		r.Post("/api/system/reboot", systemH.Reboot)
