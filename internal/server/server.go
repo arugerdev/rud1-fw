@@ -55,6 +55,7 @@ func New(
 	sysUptimeSumH *handlers.SystemUptimeSummaryHandler,
 	setupH *handlers.SetupHandler,
 	sysTzH *handlers.SystemTimezoneHandler,
+	sysTimeHealthH *handlers.SystemTimeHealthHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -109,6 +110,7 @@ func New(
 		r.Get("/api/system/uptime-summary", sysUptimeSumH.Summary)
 		r.Get("/api/system/timezone", sysTzH.Get)
 		r.Post("/api/system/timezone", sysTzH.Set)
+		r.Get("/api/system/time-health", sysTimeHealthH.TimeHealth)
 		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Get("/api/percentiles/export", sysPctExpH.Export)
 		r.Post("/api/system/reboot", systemH.Reboot)
