@@ -1,12 +1,16 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/system/ntpprobe"
 )
 
 func newTimeHealthRouter(h *SystemTimeHealthHandler) *chi.Mux {
@@ -66,6 +70,83 @@ func TestIsEffectivelyUTC(t *testing.T) {
 		if got != want {
 			t.Errorf("isEffectivelyUTC(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// TestSystemTimeHealth_RespondsOKWithClockSkew: when the optional outbound
+// NTP probe is enabled and the stub returns a planted skew, the handler
+// MUST surface it in `clockSkewSeconds` (rounded to 3 decimals) and emit
+// the standard "skew exceeds threshold" warning when |skew| crosses the
+// configured threshold. The probe is wired with a deterministic stub so
+// the test never touches the network.
+func TestSystemTimeHealth_RespondsOKWithClockSkew(t *testing.T) {
+	planted := 42.5 // > 30s threshold so the warning fires
+	probe := ExternalNTPProbeOptions{
+		Enabled:   true,
+		Servers:   []string{"stub.ntp.invalid"},
+		PerServer: time.Second,
+		ProbeNow: func(ctx context.Context, servers []string, perServer time.Duration) (*ntpprobe.Result, error) {
+			return &ntpprobe.Result{
+				Server: servers[0],
+				Skew:   time.Duration(planted * float64(time.Second)),
+			}, nil
+		},
+	}
+	h := NewSystemTimeHealthHandlerWithProbe(probe)
+	r := newTimeHealthRouter(h)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/time-health", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — body=%s", rr.Code, rr.Body.String())
+	}
+	var got systemTimeHealthResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ClockSkewSeconds == nil {
+		t.Fatalf("clockSkewSeconds = nil, want %.3f populated by probe stub", planted)
+	}
+	if *got.ClockSkewSeconds != planted {
+		t.Fatalf("clockSkewSeconds = %v, want %v (3-decimal-rounded planted value)", *got.ClockSkewSeconds, planted)
+	}
+	foundSkewWarning := false
+	for _, w := range got.Warnings {
+		if len(w) >= len("clock skew") && w[:len("clock skew")] == "clock skew" {
+			foundSkewWarning = true
+			break
+		}
+	}
+	if !foundSkewWarning {
+		t.Fatalf("expected a clock-skew warning given planted %.1fs > %v threshold, got: %v",
+			planted, ClockSkewWarnThresholdSeconds, got.Warnings)
+	}
+}
+
+// TestSystemTimeHealth_NoProbe_OmitsField: the default constructor must
+// leave `clockSkewSeconds` nil so the JSON `omitempty` drops the key
+// entirely. This pins the "cheap by default" contract — flipping the
+// probe back off in YAML must produce a payload identical (modulo
+// timestamps) to firmware predating iter 28.
+func TestSystemTimeHealth_NoProbe_OmitsField(t *testing.T) {
+	h := NewSystemTimeHealthHandler()
+	r := newTimeHealthRouter(h)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/time-health", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := raw["clockSkewSeconds"]; present {
+		t.Fatalf("clockSkewSeconds must be omitted when probe is disabled, body=%s", rr.Body.String())
 	}
 }
 

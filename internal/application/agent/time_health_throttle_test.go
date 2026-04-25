@@ -145,6 +145,81 @@ func TestBuildTimeHealthBlock_FirstCallEmits(t *testing.T) {
 	}
 }
 
+// TestFingerprintTimeHealth_ClockSkewBucketBoundary pins the bucket
+// canonicalisation: two snapshots whose skew falls in the SAME 5s
+// bucket must hash identically (so a healthy clock with sub-bucket
+// jitter doesn't churn the cloud) and two snapshots that straddle a
+// bucket boundary MUST hash differently (so an operationally meaningful
+// drift always emits). The boundary itself sits at exact integer
+// multiples of ClockSkewBucketSeconds — 5.0 belongs to bucket 5, not 0.
+func TestFingerprintTimeHealth_ClockSkewBucketBoundary(t *testing.T) {
+	mk := func(skew float64) timeHealthSnapshot {
+		s := skew
+		return timeHealthSnapshot{
+			Timezone:         "UTC",
+			TimezoneSource:   "fallback",
+			IsUTC:            true,
+			ClockSkewSeconds: &s,
+		}
+	}
+	// Same bucket [0,5): two close jittery measurements must be equal.
+	if a, b := fingerprintTimeHealth(mk(0.4)), fingerprintTimeHealth(mk(2.9)); a != b {
+		t.Fatalf("0.4 and 2.9 should share bucket 0:\n a=%q\n b=%q", a, b)
+	}
+	// Boundary case: 4.999 (bucket 0) vs 5.0 (bucket 5).
+	if a, b := fingerprintTimeHealth(mk(4.999)), fingerprintTimeHealth(mk(5.0)); a == b {
+		t.Fatalf("bucket boundary at 5.0 must flip fingerprint:\n a=%q\n b=%q", a, b)
+	}
+	// Negative side mirrors: -4.9 (bucket 0) vs -5.0 (bucket -5).
+	if a, b := fingerprintTimeHealth(mk(-4.9)), fingerprintTimeHealth(mk(-5.0)); a == b {
+		t.Fatalf("negative bucket boundary at -5.0 must flip fingerprint:\n a=%q\n b=%q", a, b)
+	}
+	// Crossing the warning threshold (30s) MUST always emit — verify
+	// 29.999 and 30.001 land in different buckets so this property
+	// can never quietly regress under a future bucket-size change.
+	if a, b := fingerprintTimeHealth(mk(29.999)), fingerprintTimeHealth(mk(30.001)); a == b {
+		t.Fatalf("warning-threshold crossing must flip fingerprint:\n a=%q\n b=%q", a, b)
+	}
+}
+
+// TestFingerprintTimeHealth_NilSkewDistinctFromZero: an absent
+// measurement (probe disabled / all servers failed) must not collide
+// with a measured zero skew. The cloud needs to distinguish the two so
+// the dashboard can show "no probe data" vs "probe says clock is on
+// time".
+func TestFingerprintTimeHealth_NilSkewDistinctFromZero(t *testing.T) {
+	zero := 0.0
+	nilSnap := timeHealthSnapshot{Timezone: "UTC"}
+	zeroSnap := timeHealthSnapshot{Timezone: "UTC", ClockSkewSeconds: &zero}
+	if fingerprintTimeHealth(nilSnap) == fingerprintTimeHealth(zeroSnap) {
+		t.Fatalf("nil ClockSkewSeconds must hash differently from a measured 0s skew")
+	}
+}
+
+// TestBuildTimeHealthBlock_PropagatesClockSkew: when the snapshot
+// carries a measurement, buildTimeHealthBlock must pass the pointer
+// through unchanged so the cloud receives the same float the operator
+// sees on /api/system/time-health.
+func TestBuildTimeHealthBlock_PropagatesClockSkew(t *testing.T) {
+	skew := 12.345
+	snap := timeHealthSnapshot{
+		Timezone:         "Europe/Madrid",
+		TimezoneSource:   "timedatectl",
+		ClockSkewSeconds: &skew,
+	}
+	captured := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	block, _, emit := buildTimeHealthBlock(snap, captured, captured, time.Time{}, "")
+	if !emit || block == nil {
+		t.Fatalf("expected emit=true block!=nil, got emit=%v block=%v", emit, block)
+	}
+	if block.ClockSkewSeconds == nil {
+		t.Fatalf("ClockSkewSeconds = nil, want %v propagated", skew)
+	}
+	if *block.ClockSkewSeconds != skew {
+		t.Fatalf("ClockSkewSeconds = %v, want %v", *block.ClockSkewSeconds, skew)
+	}
+}
+
 // TestBuildTimeHealthBlock_SuppressedWhenUnchanged: same fingerprint,
 // inside the keepalive window → block is nil and emit=false. The caller
 // uses these flags to decide whether to set the heartbeat field AND

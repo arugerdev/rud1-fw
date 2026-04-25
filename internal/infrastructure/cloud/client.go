@@ -130,6 +130,12 @@ type HBTimeHealth struct {
 	NTPEnabled      bool     `json:"ntpEnabled"`
 	Warnings        []string `json:"warnings,omitempty"`
 	CapturedAt      string   `json:"capturedAt"` // RFC3339, agent local clock
+	// ClockSkewSeconds is the signed delta (NTP server − local) measured
+	// at capture time, rounded to 3 decimals. Pointer-typed so the field
+	// is omitted when the optional outbound probe is disabled or every
+	// configured server failed — the cloud distinguishes "no probe data"
+	// from "probe says drift is exactly zero". See iter 28 design notes.
+	ClockSkewSeconds *float64 `json:"clockSkewSeconds,omitempty"`
 }
 
 // HBSetup mirrors `cfg.Setup` over the heartbeat. Only sent when at least

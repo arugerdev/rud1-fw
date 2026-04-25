@@ -34,28 +34,62 @@ const timeHealthKeepaliveInterval = time.Hour
 // throttle logic operates on. Keeping it as a pure data struct (no I/O)
 // makes shouldEmitTimeHealth trivially testable.
 type timeHealthSnapshot struct {
-	Timezone        string
-	TimezoneSource  string
-	IsUTC           bool
-	NTPSynchronized bool
-	NTPEnabled      bool
-	Warnings        []string
+	Timezone         string
+	TimezoneSource   string
+	IsUTC            bool
+	NTPSynchronized  bool
+	NTPEnabled       bool
+	Warnings         []string
+	ClockSkewSeconds *float64
+}
+
+// ClockSkewBucketSeconds is the granularity at which we canonicalise the
+// measured skew before folding it into the throttle fingerprint. Clock
+// drift hovers within ±1s on a healthy system and the SNTP measurement
+// itself has sub-second jitter; rebroadcasting a heartbeat block every
+// time the value moves by 0.4s would defeat the throttle entirely. We
+// bucket to 5-second steps so a healthy clock produces a stable
+// fingerprint and only operationally meaningful drift (≥5s) is treated
+// as a state change. The 30s warning threshold sits at exactly 6 buckets
+// so a clock crossing the warning line ALWAYS emits.
+const ClockSkewBucketSeconds = 5.0
+
+// clockSkewBucket projects a signed skew measurement to its canonical
+// bucket label for fingerprinting. Returns "" when the snapshot
+// has no measurement (probe disabled or all servers failed) so the
+// fingerprint distinguishes "no data" from "0s drift". Otherwise the
+// label is the bucketed integer (e.g. "0", "5", "-10") — using the
+// floor toward zero keeps the boundaries symmetric around the origin.
+func clockSkewBucket(skew *float64) string {
+	if skew == nil {
+		return ""
+	}
+	// Truncate toward zero (consistent with int conversion in Go) so
+	// 4.9 → bucket 0, 5.0 → bucket 5, -5.0 → bucket -5. The
+	// `int(...)` cast on a float64 already does this; we wrap it in
+	// fmt to avoid leaking float formatting (e.g. "-0") into the key.
+	return fmt.Sprintf("%d", int(*skew/ClockSkewBucketSeconds)*int(ClockSkewBucketSeconds))
 }
 
 // fingerprintTimeHealth returns a stable hash-equivalent of the throttle
 // inputs: any change here means "ship a new block". Warnings are sorted
 // to canonicalise slice ordering — two snapshots with identical sets of
 // warnings emitted in different orders MUST produce the same fingerprint.
+//
+// The clock skew is folded in via clockSkewBucket so sub-bucket jitter
+// in a healthy clock doesn't churn the cloud. See ClockSkewBucketSeconds
+// for the boundary semantics.
 func fingerprintTimeHealth(s timeHealthSnapshot) string {
 	warnings := append([]string(nil), s.Warnings...)
 	sort.Strings(warnings)
-	return fmt.Sprintf("%v|%v|%v|%v|%s|%s",
+	return fmt.Sprintf("%v|%v|%v|%v|%s|%s|%s",
 		s.IsUTC,
 		s.NTPEnabled,
 		s.NTPSynchronized,
 		s.TimezoneSource,
 		s.Timezone,
 		strings.Join(warnings, "\x00"),
+		clockSkewBucket(s.ClockSkewSeconds),
 	)
 }
 
@@ -104,13 +138,14 @@ func buildTimeHealthBlock(
 		warnings = nil // ensure JSON omitempty drops the field cleanly
 	}
 	return &hbTimeHealthLite{
-		Timezone:        snap.Timezone,
-		TimezoneSource:  snap.TimezoneSource,
-		IsUTC:           snap.IsUTC,
-		NTPSynchronized: snap.NTPSynchronized,
-		NTPEnabled:      snap.NTPEnabled,
-		Warnings:        warnings,
-		CapturedAt:      capturedAt.UTC().Format(time.RFC3339),
+		Timezone:         snap.Timezone,
+		TimezoneSource:   snap.TimezoneSource,
+		IsUTC:            snap.IsUTC,
+		NTPSynchronized:  snap.NTPSynchronized,
+		NTPEnabled:       snap.NTPEnabled,
+		Warnings:         warnings,
+		CapturedAt:       capturedAt.UTC().Format(time.RFC3339),
+		ClockSkewSeconds: snap.ClockSkewSeconds,
 	}, fp, true
 }
 
@@ -120,13 +155,14 @@ func buildTimeHealthBlock(
 // transport types. The agent's heartbeat builder converts this to the
 // cloud type at the call site.
 type hbTimeHealthLite struct {
-	Timezone        string
-	TimezoneSource  string
-	IsUTC           bool
-	NTPSynchronized bool
-	NTPEnabled      bool
-	Warnings        []string
-	CapturedAt      string
+	Timezone         string
+	TimezoneSource   string
+	IsUTC            bool
+	NTPSynchronized  bool
+	NTPEnabled       bool
+	Warnings         []string
+	CapturedAt       string
+	ClockSkewSeconds *float64
 }
 
 // captureTimeHealth runs the in-process snapshot under a tight 1s

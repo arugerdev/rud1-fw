@@ -26,12 +26,36 @@ type Config struct {
 	Network  NetworkConfig `yaml:"network"`
 	LAN      LANConfig     `yaml:"lan"`
 	Setup    SetupConfig   `yaml:"setup"`
+	System   SystemConfig  `yaml:"system"`
 
 	// Path is the filesystem location the config was loaded from. Set by
 	// Load(); used by runtime Save() calls so the agent can persist mutations
 	// (e.g. USB policy edits from the local panel) back to the same file.
 	// Tagged `-` so it is never serialised into the YAML body.
 	Path string `yaml:"-"`
+}
+
+// SystemConfig holds host-level diagnostics knobs. Today only the
+// external-NTP probe lives here; future iterations may add other
+// telemetry-only toggles without churning the top-level Config struct.
+type SystemConfig struct {
+	// ExternalNTPProbeEnabled flips on a one-shot SNTP query against
+	// ExternalNTPServers each time /api/system/time-health is requested
+	// (or the agent's heartbeat throttle decides to refresh the
+	// timeHealth block). Default false — the existing timedatectl
+	// signal is sufficient for most installs and the probe adds an
+	// outbound UDP query the operator may not want.
+	ExternalNTPProbeEnabled bool `yaml:"external_ntp_probe_enabled"`
+	// ExternalNTPServers is the ordered server list the probe walks
+	// through; the first to reply within ExternalNTPProbeTimeout wins.
+	// Each entry is a "host" or "host:port" — `:123` is implied when
+	// the port is omitted. Empty list disables the probe regardless of
+	// the Enabled flag (defensive: a misconfigured YAML can't accidentally
+	// flood the default pool with traffic).
+	ExternalNTPServers []string `yaml:"external_ntp_servers,omitempty"`
+	// ExternalNTPProbeTimeout caps each per-server attempt. 2s is the
+	// default and matches the heartbeat's 1s budget headroom.
+	ExternalNTPProbeTimeout time.Duration `yaml:"external_ntp_probe_timeout"`
 }
 
 // NetworkConfig controls the WiFi / cellular / setup-AP subsystem.
@@ -219,6 +243,11 @@ func Default() *Config {
 		},
 		Setup: SetupConfig{
 			Complete: false,
+		},
+		System: SystemConfig{
+			ExternalNTPProbeEnabled: false,
+			ExternalNTPServers:      nil,
+			ExternalNTPProbeTimeout: 2 * time.Second,
 		},
 	}
 }

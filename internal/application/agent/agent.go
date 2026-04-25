@@ -304,7 +304,11 @@ func New(cfg *config.Config) (*Agent, error) {
 	sysUptimeEvExpH := handlers.NewSystemUptimeEventsExportHandler(a.uptimeS)
 	sysUptimeSumH := handlers.NewSystemUptimeSummaryHandler(a.uptimeS)
 	sysTzH := handlers.NewSystemTimezoneHandler()
-	sysTimeHealthH := handlers.NewSystemTimeHealthHandler()
+	sysTimeHealthH := handlers.NewSystemTimeHealthHandlerWithProbe(handlers.ExternalNTPProbeOptions{
+		Enabled:   cfg.System.ExternalNTPProbeEnabled,
+		Servers:   cfg.System.ExternalNTPServers,
+		PerServer: cfg.System.ExternalNTPProbeTimeout,
+	})
 
 	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH)
 
@@ -855,15 +859,21 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 // drops the field AND skips the throttle update, ensuring the next tick
 // retries with a fresh budget.
 func (a *Agent) buildHeartbeatTimeHealth(ctx context.Context, now time.Time) (*cloud.HBTimeHealth, string, bool) {
+	probeOpts := handlers.ExternalNTPProbeOptions{
+		Enabled:   a.cfg.System.ExternalNTPProbeEnabled,
+		Servers:   a.cfg.System.ExternalNTPServers,
+		PerServer: a.cfg.System.ExternalNTPProbeTimeout,
+	}
 	snap, ok := captureTimeHealth(ctx, func(c context.Context) timeHealthSnapshot {
-		full := handlers.TimeHealthSnapshot(c)
+		full := handlers.TimeHealthSnapshot(c, probeOpts)
 		return timeHealthSnapshot{
-			Timezone:        full.Timezone,
-			TimezoneSource:  full.TimezoneSource,
-			IsUTC:           full.IsUTC,
-			NTPSynchronized: full.NTPSynchronized,
-			NTPEnabled:      full.NTPEnabled,
-			Warnings:        full.Warnings,
+			Timezone:         full.Timezone,
+			TimezoneSource:   full.TimezoneSource,
+			IsUTC:            full.IsUTC,
+			NTPSynchronized:  full.NTPSynchronized,
+			NTPEnabled:       full.NTPEnabled,
+			Warnings:         full.Warnings,
+			ClockSkewSeconds: full.ClockSkewSeconds,
 		}
 	})
 	if !ok {
@@ -876,13 +886,14 @@ func (a *Agent) buildHeartbeatTimeHealth(ctx context.Context, now time.Time) (*c
 		return nil, fp, false
 	}
 	return &cloud.HBTimeHealth{
-		Timezone:        block.Timezone,
-		TimezoneSource:  block.TimezoneSource,
-		IsUTC:           block.IsUTC,
-		NTPSynchronized: block.NTPSynchronized,
-		NTPEnabled:      block.NTPEnabled,
-		Warnings:        block.Warnings,
-		CapturedAt:      block.CapturedAt,
+		Timezone:         block.Timezone,
+		TimezoneSource:   block.TimezoneSource,
+		IsUTC:            block.IsUTC,
+		NTPSynchronized:  block.NTPSynchronized,
+		NTPEnabled:       block.NTPEnabled,
+		Warnings:         block.Warnings,
+		CapturedAt:       block.CapturedAt,
+		ClockSkewSeconds: block.ClockSkewSeconds,
 	}, fp, true
 }
 
