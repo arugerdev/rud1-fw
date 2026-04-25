@@ -296,8 +296,9 @@ func New(cfg *config.Config) (*Agent, error) {
 	sysUptimeEvH := handlers.NewSystemUptimeEventsHandler(a.uptimeS)
 	sysUptimeEvExpH := handlers.NewSystemUptimeEventsExportHandler(a.uptimeS)
 	sysUptimeSumH := handlers.NewSystemUptimeSummaryHandler(a.uptimeS)
+	sysTzH := handlers.NewSystemTimezoneHandler()
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH)
 
 	return a, nil
 }
@@ -746,6 +747,19 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		}
 	}
 
+	// Setup nameplate (iter 25): always include the block so the cloud
+	// knows whether the device is still in first-boot mode (Complete=false).
+	// The string fields are emitted only when populated to keep payloads
+	// compact — older firmware that never touched the wizard sends an
+	// all-empty block with Complete=false, which is correct.
+	hbSetup := &cloud.HBSetup{
+		Complete:       a.cfg.Setup.Complete,
+		DeviceName:     a.cfg.Setup.DeviceName,
+		DeviceLocation: a.cfg.Setup.DeviceLocation,
+		Notes:          a.cfg.Setup.Notes,
+		CompletedAt:    a.cfg.Setup.CompletedAt,
+	}
+
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
 		RegistrationPin:  a.identity.RegistrationPin,
@@ -758,6 +772,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		USB:              hbUSB,
 		LAN:              hbLAN,
 		System:           hbSystem,
+		Setup:            hbSetup,
 	}
 
 	resp, err := a.cloud.Heartbeat(ctx, payload)

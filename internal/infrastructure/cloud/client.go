@@ -98,6 +98,25 @@ type HeartbeatPayload struct {
 	// dashboard health page needs. Nil when the snapshot failed or timed
 	// out so the heartbeat stays send-first, metrics-second.
 	System *HBSystem `json:"system,omitempty"`
+	// Setup is the operator-supplied identification entered during the
+	// first-boot wizard. Reported on every heartbeat once the Setup block
+	// has been touched at least once so the cloud can render a nameplate
+	// banner on the device detail page even if the user hasn't renamed
+	// the cloud row yet. `Complete=false` means the device is still in
+	// first-boot mode (AP raised, /api/setup/* open) — the cloud surfaces
+	// that as a dedicated banner with a "Configure now" CTA.
+	Setup *HBSetup `json:"setup,omitempty"`
+}
+
+// HBSetup mirrors `cfg.Setup` over the heartbeat. Only sent when at least
+// one of the operator-supplied fields is populated OR when Complete=false
+// so the cloud always knows when a device is in first-boot mode.
+type HBSetup struct {
+	Complete       bool   `json:"complete"`
+	DeviceName     string `json:"deviceName,omitempty"`
+	DeviceLocation string `json:"deviceLocation,omitempty"`
+	Notes          string `json:"notes,omitempty"`
+	CompletedAt    int64  `json:"completedAt,omitempty"`
 }
 
 // HBSystem is the subset of sysstat.Stats propagated via heartbeats.
