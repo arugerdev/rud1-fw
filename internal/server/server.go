@@ -58,6 +58,7 @@ func New(
 	sysTimeHealthH *handlers.SystemTimeHealthHandler,
 	sysNTPProbeCfgH *handlers.SystemNTPProbeConfigHandler,
 	sysAuditH *handlers.SystemAuditHandler,
+	sysAuditRetH *handlers.SystemAuditRetentionHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -118,6 +119,8 @@ func New(
 		// Persistent audit log of runtime config mutations (timezone,
 		// ntp-probe, setup wizard). See internal/infrastructure/audit/configlog.
 		r.Get("/api/system/audit", sysAuditH.List)
+		// Retention configuration + on-disk inventory for the audit log.
+		r.Get("/api/system/audit/retention", sysAuditRetH.Get)
 		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Get("/api/percentiles/export", sysPctExpH.Export)
 		r.Post("/api/system/reboot", systemH.Reboot)

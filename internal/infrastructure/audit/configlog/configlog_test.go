@@ -384,6 +384,133 @@ func TestSanitiseError(t *testing.T) {
 	}
 }
 
+// TestStatsEmptyDir: a freshly-constructed logger with no entries
+// reports zero counts and no boundary timestamps. lastPruneAt is set
+// because New() runs an opportunistic prune pass on construction.
+func TestStatsEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	fixed := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if got.TotalEntries != 0 {
+		t.Fatalf("TotalEntries=%d, want 0", got.TotalEntries)
+	}
+	if got.TotalBytes != 0 {
+		t.Fatalf("TotalBytes=%d, want 0", got.TotalBytes)
+	}
+	if got.FileCount != 0 {
+		t.Fatalf("FileCount=%d, want 0", got.FileCount)
+	}
+	if !got.OldestEntryAt.IsZero() {
+		t.Fatalf("OldestEntryAt should be zero, got %v", got.OldestEntryAt)
+	}
+	if !got.NewestEntryAt.IsZero() {
+		t.Fatalf("NewestEntryAt should be zero, got %v", got.NewestEntryAt)
+	}
+	// New() runs prune on construction, so lastPruneAt is set.
+	if got.LastPruneAt.IsZero() {
+		t.Fatalf("LastPruneAt should be set after New(): got zero")
+	}
+	if !got.LastPruneAt.Equal(fixed) {
+		t.Fatalf("LastPruneAt=%v, want %v", got.LastPruneAt, fixed)
+	}
+}
+
+// TestStatsPopulatedDir: with entries spanning two days, counts/bytes
+// are accumulated across files and oldest/newest reflect the first and
+// last entry timestamps.
+func TestStatsPopulatedDir(t *testing.T) {
+	dir := t.TempDir()
+	day1 := time.Date(2026, 4, 24, 10, 0, 0, 0, time.UTC)
+	day2 := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := day1
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	for i := 0; i < 3; i++ {
+		now = day1.Add(time.Duration(i) * time.Second)
+		if err := l.Append(context.Background(), Entry{
+			At: now.Unix(), Action: "x", Actor: "operator", OK: true,
+		}); err != nil {
+			t.Fatalf("Append day1: %v", err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		now = day2.Add(time.Duration(i) * time.Second)
+		if err := l.Append(context.Background(), Entry{
+			At: now.Unix(), Action: "y", Actor: "operator", OK: true,
+		}); err != nil {
+			t.Fatalf("Append day2: %v", err)
+		}
+	}
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if got.TotalEntries != 5 {
+		t.Fatalf("TotalEntries=%d, want 5", got.TotalEntries)
+	}
+	if got.FileCount != 2 {
+		t.Fatalf("FileCount=%d, want 2", got.FileCount)
+	}
+	if got.TotalBytes <= 0 {
+		t.Fatalf("TotalBytes=%d, want >0", got.TotalBytes)
+	}
+	wantNewest := day2.Add(time.Second).Unix()
+	wantOldest := day1.Unix()
+	if got.NewestEntryAt.Unix() != wantNewest {
+		t.Fatalf("NewestEntryAt=%d, want %d", got.NewestEntryAt.Unix(), wantNewest)
+	}
+	if got.OldestEntryAt.Unix() != wantOldest {
+		t.Fatalf("OldestEntryAt=%d, want %d", got.OldestEntryAt.Unix(), wantOldest)
+	}
+}
+
+// TestStatsLastPruneAtAdvancesAfterPrune: a manual PruneOld() call
+// updates lastPruneAt to the injected now()'s value.
+func TestStatsLastPruneAtAdvancesAfterPrune(t *testing.T) {
+	dir := t.TempDir()
+	t0 := time.Date(2026, 4, 25, 0, 0, 1, 0, time.UTC)
+	now := t0
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	// Sanity: New() set it to t0.
+	first, _ := l.Stats()
+	if !first.LastPruneAt.Equal(t0) {
+		t.Fatalf("initial LastPruneAt=%v, want %v", first.LastPruneAt, t0)
+	}
+
+	// Advance the clock and re-prune.
+	t1 := t0.Add(2 * time.Hour)
+	now = t1
+	if err := l.PruneOld(); err != nil {
+		t.Fatalf("PruneOld: %v", err)
+	}
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if !got.LastPruneAt.Equal(t1) {
+		t.Fatalf("LastPruneAt=%v, want %v", got.LastPruneAt, t1)
+	}
+}
+
 // TestAppendAutoFillsAt: an entry with At=0 gets stamped with now()'s
 // unix time so callers don't have to remember.
 func TestAppendAutoFillsAt(t *testing.T) {

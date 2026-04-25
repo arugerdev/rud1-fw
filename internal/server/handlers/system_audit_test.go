@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/rud1-es/rud1-fw/internal/config"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 )
 
@@ -224,6 +225,241 @@ func TestSystemAudit_RejectsInvalidQuery(t *testing.T) {
 				t.Fatalf("status=%d, want 400; body=%s", rr.Code, rr.Body.String())
 			}
 		})
+	}
+}
+
+// auditRetentionWire mirrors auditRetentionResponse for tests; using a
+// local copy keeps the production type strictly internal.
+type auditRetentionWire struct {
+	ConfiguredDays int        `json:"configuredDays"`
+	EffectiveDays  int        `json:"effectiveDays"`
+	Default        int        `json:"default"`
+	MinDays        int        `json:"minDays"`
+	MaxDays        int        `json:"maxDays"`
+	TotalEntries   int        `json:"totalEntries"`
+	TotalBytes     int64      `json:"totalBytes"`
+	FileCount      int        `json:"fileCount"`
+	OldestEntryAt  *time.Time `json:"oldestEntryAt,omitempty"`
+	NewestEntryAt  *time.Time `json:"newestEntryAt,omitempty"`
+	LastPruneAt    *time.Time `json:"lastPruneAt,omitempty"`
+}
+
+// newRetentionRouter mounts the retention handler around the supplied
+// cfg + DiskLogger so each test asserts its own scenario in isolation.
+func newRetentionRouter(t *testing.T, cfg *config.Config, l *configlog.DiskLogger) *chi.Mux {
+	t.Helper()
+	h := NewSystemAuditRetentionHandler(cfg, l)
+	r := chi.NewRouter()
+	r.Get("/api/system/audit/retention", h.Get)
+	return r
+}
+
+// TestSystemAuditRetention_NilLoggerReturnsConfigOnly: when the disk
+// logger is nil (e.g. read-only fs at boot), the handler still serves
+// the configured/effective retention numbers and zero stats.
+func TestSystemAuditRetention_NilLoggerReturnsConfigOnly(t *testing.T) {
+	cfg := config.Default()
+	r := newRetentionRouter(t, cfg, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/audit/retention", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type=%q, want application/json", ct)
+	}
+	var got auditRetentionWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Default != config.DefaultAuditRetentionDays {
+		t.Fatalf("default=%d, want %d", got.Default, config.DefaultAuditRetentionDays)
+	}
+	if got.MinDays != config.MinAuditRetentionDays {
+		t.Fatalf("minDays=%d, want %d", got.MinDays, config.MinAuditRetentionDays)
+	}
+	if got.MaxDays != config.MaxAuditRetentionDays {
+		t.Fatalf("maxDays=%d, want %d", got.MaxDays, config.MaxAuditRetentionDays)
+	}
+	if got.TotalEntries != 0 || got.TotalBytes != 0 || got.FileCount != 0 {
+		t.Fatalf("expected zero stats, got %+v", got)
+	}
+	if got.OldestEntryAt != nil || got.NewestEntryAt != nil || got.LastPruneAt != nil {
+		t.Fatalf("expected nil time fields, got %+v", got)
+	}
+}
+
+// TestSystemAuditRetention_EmptyDir: a fresh DiskLogger with no entries
+// reports zero counts and no oldest/newest, but lastPruneAt is set
+// (New() runs an opportunistic prune).
+func TestSystemAuditRetention_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	fixed := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	l, err := configlog.New(dir, configlog.Options{Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatalf("configlog.New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	cfg := config.Default()
+	r := newRetentionRouter(t, cfg, l)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/audit/retention", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rr.Code)
+	}
+	var got auditRetentionWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.TotalEntries != 0 || got.FileCount != 0 || got.TotalBytes != 0 {
+		t.Fatalf("expected zero stats: %+v", got)
+	}
+	if got.OldestEntryAt != nil || got.NewestEntryAt != nil {
+		t.Fatalf("expected nil oldest/newest, got %+v / %+v", got.OldestEntryAt, got.NewestEntryAt)
+	}
+	if got.LastPruneAt == nil {
+		t.Fatalf("LastPruneAt should be set after New(): got nil")
+	}
+}
+
+// TestSystemAuditRetention_PopulatedDir: counts + bytes accumulate and
+// oldest/newest reflect entry timestamps.
+func TestSystemAuditRetention_PopulatedDir(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 4, 25, 10, 0, 0, 0, time.UTC)
+	now := base
+	l, err := configlog.New(dir, configlog.Options{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("configlog.New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	for i := 0; i < 4; i++ {
+		now = base.Add(time.Duration(i) * time.Second)
+		if err := l.Append(context.Background(), configlog.Entry{
+			At: now.Unix(), Action: "system.timezone.set", Actor: "operator", OK: true,
+		}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	cfg := config.Default()
+	r := newRetentionRouter(t, cfg, l)
+	req := httptest.NewRequest(http.MethodGet, "/api/system/audit/retention", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	var got auditRetentionWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.TotalEntries != 4 {
+		t.Fatalf("TotalEntries=%d, want 4", got.TotalEntries)
+	}
+	if got.FileCount != 1 {
+		t.Fatalf("FileCount=%d, want 1", got.FileCount)
+	}
+	if got.TotalBytes <= 0 {
+		t.Fatalf("TotalBytes=%d, want >0", got.TotalBytes)
+	}
+	if got.OldestEntryAt == nil || got.OldestEntryAt.Unix() != base.Unix() {
+		t.Fatalf("OldestEntryAt=%v, want %v", got.OldestEntryAt, base)
+	}
+	wantNewest := base.Add(3 * time.Second)
+	if got.NewestEntryAt == nil || got.NewestEntryAt.Unix() != wantNewest.Unix() {
+		t.Fatalf("NewestEntryAt=%v, want %v", got.NewestEntryAt, wantNewest)
+	}
+}
+
+// TestSystemAuditRetention_ConfiguredAndEffective: a raw configured
+// value of 0 must surface as configuredDays=0 with effectiveDays
+// falling back to the default; oversized configured values clamp to
+// the max for effectiveDays while configured stays raw.
+func TestSystemAuditRetention_ConfiguredAndEffective(t *testing.T) {
+	cases := []struct {
+		name           string
+		configured     int
+		wantEffective  int
+		wantConfigured int
+	}{
+		{"zero falls back to default", 0, config.DefaultAuditRetentionDays, 0},
+		{"explicit value passes through", 30, 30, 30},
+		{"oversized clamps to max", 9999, config.MaxAuditRetentionDays, 9999},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.System.AuditRetentionDays = tc.configured
+			r := newRetentionRouter(t, cfg, nil)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/system/audit/retention", nil)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d, want 200", rr.Code)
+			}
+			var got auditRetentionWire
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.ConfiguredDays != tc.wantConfigured {
+				t.Fatalf("configuredDays=%d, want %d", got.ConfiguredDays, tc.wantConfigured)
+			}
+			if got.EffectiveDays != tc.wantEffective {
+				t.Fatalf("effectiveDays=%d, want %d", got.EffectiveDays, tc.wantEffective)
+			}
+		})
+	}
+}
+
+// TestSystemAuditRetention_LastPruneAtAfterManualPrune: calling
+// PruneOld() at a known clock value advances lastPruneAt visible
+// through the handler.
+func TestSystemAuditRetention_LastPruneAtAfterManualPrune(t *testing.T) {
+	dir := t.TempDir()
+	t0 := time.Date(2026, 4, 25, 0, 0, 1, 0, time.UTC)
+	now := t0
+	l, err := configlog.New(dir, configlog.Options{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("configlog.New: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	t1 := t0.Add(3 * time.Hour)
+	now = t1
+	if err := l.PruneOld(); err != nil {
+		t.Fatalf("PruneOld: %v", err)
+	}
+
+	cfg := config.Default()
+	r := newRetentionRouter(t, cfg, l)
+	req := httptest.NewRequest(http.MethodGet, "/api/system/audit/retention", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rr.Code)
+	}
+	var got auditRetentionWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.LastPruneAt == nil {
+		t.Fatalf("LastPruneAt is nil after PruneOld()")
+	}
+	if !got.LastPruneAt.Equal(t1) {
+		t.Fatalf("LastPruneAt=%v, want %v", got.LastPruneAt, t1)
 	}
 }
 

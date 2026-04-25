@@ -91,6 +91,12 @@ type DiskLogger struct {
 	file    *os.File
 	dateKey string // "2006-01-02" derived via now()
 
+	// lastPruneAt records the wall-clock time of the most recent
+	// successful prune attempt — exposed via Stats so the retention
+	// endpoint can show operators when retention last converged. Zero
+	// value means "no prune has run yet". Mutated under l.mu.
+	lastPruneAt time.Time
+
 	now func() time.Time
 }
 
@@ -375,6 +381,7 @@ func (l *DiskLogger) pruneOldLocked() error {
 	if err != nil {
 		return err
 	}
+	l.lastPruneAt = l.now()
 	if len(names) <= l.maxFiles {
 		return nil
 	}
@@ -386,6 +393,99 @@ func (l *DiskLogger) pruneOldLocked() error {
 		}
 	}
 	return nil
+}
+
+// Stats is the disk-inventory summary surfaced by the retention HTTP
+// endpoint. ByteCount is best-effort — it sums file sizes via os.Stat
+// and skips files we can't read. OldestEntryAt / NewestEntryAt /
+// LastPruneAt are zero-valued when unknown; callers convert zero to a
+// JSON-omitted pointer.
+type Stats struct {
+	TotalEntries  int
+	TotalBytes    int64
+	FileCount     int
+	OldestEntryAt time.Time
+	NewestEntryAt time.Time
+	LastPruneAt   time.Time
+}
+
+// Stats walks the audit dir and returns a snapshot of on-disk usage.
+// The mutex is briefly held to snapshot the file list and lastPruneAt;
+// per-file I/O happens lock-free (same pattern as List).
+func (l *DiskLogger) Stats() (Stats, error) {
+	l.mu.Lock()
+	names, err := l.listFiles()
+	baseDir := l.baseDir
+	lastPrune := l.lastPruneAt
+	l.mu.Unlock()
+	if err != nil {
+		return Stats{}, err
+	}
+
+	out := Stats{LastPruneAt: lastPrune}
+	if len(names) == 0 {
+		return out, nil
+	}
+
+	out.FileCount = len(names)
+	for _, name := range names {
+		path := filepath.Join(baseDir, name)
+		fi, err := os.Stat(path)
+		if err != nil {
+			log.Debug().Err(err).Str("path", path).Msg("configlog: stat failed, skipping in stats")
+			continue
+		}
+		out.TotalBytes += fi.Size()
+		entries, err := readJSONLFile(path)
+		if err != nil {
+			log.Debug().Err(err).Str("path", path).Msg("configlog: read failed, skipping in stats")
+			continue
+		}
+		out.TotalEntries += len(entries)
+	}
+
+	// Filenames are newest-first (reverse-sorted YYYY-MM-DD), so the
+	// last entry of the first file is the global newest and the first
+	// entry of the last file is the global oldest. Falling back to the
+	// file timestamp keeps us defensive if a day-file exists but its
+	// content is unreadable / empty.
+	if newest, ok := boundaryAt(filepath.Join(baseDir, names[0]), true); ok {
+		out.NewestEntryAt = newest
+	}
+	if oldest, ok := boundaryAt(filepath.Join(baseDir, names[len(names)-1]), false); ok {
+		out.OldestEntryAt = oldest
+	}
+	return out, nil
+}
+
+// boundaryAt returns the timestamp of the last (newest) or first
+// (oldest) parseable entry in path. It silently falls back to the
+// filename day key (00:00 UTC of that day) when the file is empty or
+// unreadable so an in-progress / corrupt file doesn't blank out an
+// otherwise valid window.
+func boundaryAt(path string, last bool) (time.Time, bool) {
+	entries, err := readJSONLFile(path)
+	if err == nil && len(entries) > 0 {
+		var pick Entry
+		if last {
+			pick = entries[len(entries)-1]
+		} else {
+			pick = entries[0]
+		}
+		if pick.At > 0 {
+			return time.Unix(pick.At, 0).UTC(), true
+		}
+	}
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, filenamePrefix) || !strings.HasSuffix(base, filenameSuffix) {
+		return time.Time{}, false
+	}
+	key := strings.TrimSuffix(strings.TrimPrefix(base, filenamePrefix), filenameSuffix)
+	t, err := time.ParseInLocation("2006-01-02", key, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // Close flushes and releases the day-file handle. Safe on a nil

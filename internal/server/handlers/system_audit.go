@@ -8,6 +8,7 @@
 // Endpoint (BearerAuth):
 //
 //	GET /api/system/audit?action=&since=&until=&limit=&offset=
+//	GET /api/system/audit/retention
 //
 // Response shape:
 //
@@ -22,7 +23,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/rud1-es/rud1-fw/internal/config"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 )
 
@@ -151,4 +154,74 @@ func (h *SystemAuditHandler) List(w http.ResponseWriter, r *http.Request) {
 		entries = []configlog.Entry{}
 	}
 	writeJSON(w, http.StatusOK, auditListResponse{Entries: entries, Total: total})
+}
+
+// SystemAuditRetentionHandler serves GET /api/system/audit/retention.
+// It exposes the effective retention configuration plus disk-inventory
+// stats so operators can answer "how much history do I really have".
+type SystemAuditRetentionHandler struct {
+	cfg *config.Config
+	log *configlog.DiskLogger
+}
+
+// NewSystemAuditRetentionHandler wires the handler. log may be nil when
+// the agent is running on a read-only fs / the disk logger failed to
+// open; the handler still serves a 200 with the configured/effective
+// retention numbers and zero stats so the UI can render unconditionally.
+func NewSystemAuditRetentionHandler(cfg *config.Config, log *configlog.DiskLogger) *SystemAuditRetentionHandler {
+	return &SystemAuditRetentionHandler{cfg: cfg, log: log}
+}
+
+// auditRetentionResponse is the wire shape for GET /api/system/audit/retention.
+// Pointer time fields are omitted on the wire when zero so the UI can
+// distinguish "no data yet" from "epoch zero".
+type auditRetentionResponse struct {
+	ConfiguredDays int        `json:"configuredDays"`
+	EffectiveDays  int        `json:"effectiveDays"`
+	Default        int        `json:"default"`
+	MinDays        int        `json:"minDays"`
+	MaxDays        int        `json:"maxDays"`
+	TotalEntries   int        `json:"totalEntries"`
+	TotalBytes     int64      `json:"totalBytes"`
+	FileCount      int        `json:"fileCount"`
+	OldestEntryAt  *time.Time `json:"oldestEntryAt,omitempty"`
+	NewestEntryAt  *time.Time `json:"newestEntryAt,omitempty"`
+	LastPruneAt    *time.Time `json:"lastPruneAt,omitempty"`
+}
+
+// Get — GET /api/system/audit/retention. The configured/effective
+// numbers come straight from the config helpers (so the clamp logic
+// has a single source of truth); inventory stats come from the disk
+// logger when available.
+func (h *SystemAuditRetentionHandler) Get(w http.ResponseWriter, _ *http.Request) {
+	resp := auditRetentionResponse{
+		ConfiguredDays: h.cfg.System.AuditRetentionDays,
+		EffectiveDays:  h.cfg.System.AuditRetentionDaysOrDefault(),
+		Default:        config.DefaultAuditRetentionDays,
+		MinDays:        config.MinAuditRetentionDays,
+		MaxDays:        config.MaxAuditRetentionDays,
+	}
+	if h.log != nil {
+		stats, err := h.log.Stats()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "audit stats failed: "+err.Error())
+			return
+		}
+		resp.TotalEntries = stats.TotalEntries
+		resp.TotalBytes = stats.TotalBytes
+		resp.FileCount = stats.FileCount
+		if !stats.OldestEntryAt.IsZero() {
+			t := stats.OldestEntryAt.UTC()
+			resp.OldestEntryAt = &t
+		}
+		if !stats.NewestEntryAt.IsZero() {
+			t := stats.NewestEntryAt.UTC()
+			resp.NewestEntryAt = &t
+		}
+		if !stats.LastPruneAt.IsZero() {
+			t := stats.LastPruneAt.UTC()
+			resp.LastPruneAt = &t
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

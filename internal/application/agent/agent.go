@@ -363,6 +363,7 @@ func New(cfg *config.Config) (*Agent, error) {
 		auditLogIface = a.auditLog
 	}
 	sysAuditH := handlers.NewSystemAuditHandler(auditLogIface)
+	sysAuditRetH := handlers.NewSystemAuditRetentionHandler(cfg, a.auditLog)
 	// Reset the time-health throttle on every PUT so the next heartbeat
 	// re-emits the (potentially changed) timeHealth block immediately,
 	// instead of waiting for the 1h keepalive window.
@@ -373,7 +374,7 @@ func New(cfg *config.Config) (*Agent, error) {
 		a.timeHealthThrottleMu.Unlock()
 	})
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH)
 
 	return a, nil
 }

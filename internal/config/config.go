@@ -85,13 +85,15 @@ func (s SystemConfig) AuditRetentionDaysOrDefault() int {
 	return d
 }
 
-// DefaultAuditRetentionDays / MaxAuditRetentionDays parameterise the
-// audit-log retention window. The default mirrors configlog's own
-// historical default (two weeks); the max is one year — a soft ceiling
-// that keeps disk use bounded for low-traffic devices that may run for
-// years without operator attention.
+// DefaultAuditRetentionDays / MinAuditRetentionDays / MaxAuditRetentionDays
+// parameterise the audit-log retention window. The default mirrors
+// configlog's own historical default (two weeks); the max is one year
+// — a soft ceiling that keeps disk use bounded for low-traffic devices
+// that may run for years without operator attention. The min is one
+// day — anything lower would prune the current day's file mid-write.
 const (
 	DefaultAuditRetentionDays = 14
+	MinAuditRetentionDays     = 1
 	MaxAuditRetentionDays     = 365
 )
 
