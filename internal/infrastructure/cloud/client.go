@@ -224,14 +224,23 @@ type HBConfigSnapshot struct {
 // (no awareness of the field) and iter ≤41 cloud (no consumer) keep
 // round-tripping cleanly: zero on the wire means "unknown" — distinct
 // from a real all-zero log which would also legitimately omit it.
+//
+// CompressionByDay (iter 44) is the per-day {dayKey -> ratio} histogram
+// paired with the EntryBytes/TotalBytes aggregates. The cloud uses it
+// to render outliers (e.g. one huge low-entropy day skewing the
+// fleet-wide average from `computeFleetCompressionRatio`). Marshalled
+// `omitempty` so iter ≤43 cloud schemas keep round-tripping; an empty
+// map is also dropped because a brand-new device with no rotated
+// archives yet has no useful per-day signal to surface.
 type HBAuditRetentionStats struct {
-	TotalEntries  int    `json:"totalEntries"`
-	TotalBytes    int64  `json:"totalBytes"`
-	EntryBytes    int64  `json:"entryBytes,omitempty"`
-	FileCount     int    `json:"fileCount"`
-	OldestEntryAt string `json:"oldestEntryAt,omitempty"` // RFC3339 UTC; "" when unknown
-	NewestEntryAt string `json:"newestEntryAt,omitempty"` // RFC3339 UTC; "" when unknown
-	LastPruneAt   string `json:"lastPruneAt,omitempty"`   // RFC3339 UTC; "" when unknown
+	TotalEntries     int                `json:"totalEntries"`
+	TotalBytes       int64              `json:"totalBytes"`
+	EntryBytes       int64              `json:"entryBytes,omitempty"`
+	FileCount        int                `json:"fileCount"`
+	OldestEntryAt    string             `json:"oldestEntryAt,omitempty"`    // RFC3339 UTC; "" when unknown
+	NewestEntryAt    string             `json:"newestEntryAt,omitempty"`    // RFC3339 UTC; "" when unknown
+	LastPruneAt      string             `json:"lastPruneAt,omitempty"`      // RFC3339 UTC; "" when unknown
+	CompressionByDay map[string]float64 `json:"auditCompressionByDay,omitempty"`
 }
 
 // HBSetup mirrors `cfg.Setup` over the heartbeat. Only sent when at least

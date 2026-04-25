@@ -632,14 +632,28 @@ func (l *DiskLogger) pruneOldLocked() (int, error) {
 //     compression ratio. Best-effort: if a `.gz` file fails to
 //     decompress, that file's contribution is dropped from EntryBytes
 //     but its TotalBytes is still counted.
+//
+// Iter 44 adds CompressionByDay: a per-day {dayKey -> ratio} map
+// (entryBytes/totalBytes) that lets the cloud render outliers — e.g.
+// a single huge low-entropy day skewing the fleet-wide average from
+// `computeFleetCompressionRatio` (rud1-es iter 43). Entries are only
+// emitted for days where real compression happened (entryBytes >
+// totalBytes AND both non-zero), matching the physical-regime gates in
+// the cloud's `formatCompressionRatio`. A plain `.jsonl` file (the
+// active day, or a pre-iter-41 archive) has entryBytes==totalBytes and
+// thus contributes no entry — ratio 1.0 means "no compression" which
+// is not useful signal. A malformed `.gz` whose entries can't be
+// re-marshalled also contributes no entry, mirroring the existing
+// EntryBytes drop behaviour.
 type Stats struct {
-	TotalEntries  int
-	TotalBytes    int64
-	EntryBytes    int64
-	FileCount     int
-	OldestEntryAt time.Time
-	NewestEntryAt time.Time
-	LastPruneAt   time.Time
+	TotalEntries     int
+	TotalBytes       int64
+	EntryBytes       int64
+	FileCount        int
+	OldestEntryAt    time.Time
+	NewestEntryAt    time.Time
+	LastPruneAt      time.Time
+	CompressionByDay map[string]float64
 }
 
 // Stats walks the audit dir and returns a snapshot of on-disk usage.
@@ -681,14 +695,34 @@ func (l *DiskLogger) Stats() (Stats, error) {
 		// occupied pre-gzip. This is approximate (whitespace/escape
 		// differences vs. the original encoder) but stays within ~1%
 		// for the structured shapes audit emits.
+		var fileEntryBytes int64
 		if strings.HasSuffix(name, gzipSuffix) {
 			for i := range entries {
 				if buf, err := json.Marshal(entries[i]); err == nil {
-					out.EntryBytes += int64(len(buf)) + 1 // trailing \n
+					fileEntryBytes += int64(len(buf)) + 1 // trailing \n
 				}
 			}
 		} else {
-			out.EntryBytes += fi.Size()
+			fileEntryBytes = fi.Size()
+		}
+		out.EntryBytes += fileEntryBytes
+
+		// Iter 44: emit a per-day ratio entry only when real
+		// compression happened — entryBytes strictly greater than
+		// totalBytes and both non-zero. This matches the cloud's
+		// `formatCompressionRatio` physical-regime gates and excludes
+		// plain `.jsonl` files (where entryBytes == totalBytes,
+		// ratio==1.0, no useful signal) as well as days where the
+		// re-marshal estimate dropped to zero (malformed gzip whose
+		// entries can't be parsed back into Entry shapes).
+		if fileEntryBytes > 0 && fi.Size() > 0 && fileEntryBytes > fi.Size() {
+			day := dayKeyFromName(name)
+			if day != "" {
+				if out.CompressionByDay == nil {
+					out.CompressionByDay = make(map[string]float64)
+				}
+				out.CompressionByDay[day] = float64(fileEntryBytes) / float64(fi.Size())
+			}
 		}
 	}
 

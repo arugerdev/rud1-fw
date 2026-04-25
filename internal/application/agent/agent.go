@@ -1266,10 +1266,11 @@ func buildHeartbeatConfig(cfg *config.Config, auditLog auditStatsSource) *cloud.
 		return out
 	}
 	hbStats := &cloud.HBAuditRetentionStats{
-		TotalEntries: stats.TotalEntries,
-		TotalBytes:   stats.TotalBytes,
-		EntryBytes:   stats.EntryBytes,
-		FileCount:    stats.FileCount,
+		TotalEntries:     stats.TotalEntries,
+		TotalBytes:       stats.TotalBytes,
+		EntryBytes:       stats.EntryBytes,
+		FileCount:        stats.FileCount,
+		CompressionByDay: stats.CompressionByDay,
 	}
 	if !stats.OldestEntryAt.IsZero() {
 		hbStats.OldestEntryAt = stats.OldestEntryAt.UTC().Format(time.RFC3339)

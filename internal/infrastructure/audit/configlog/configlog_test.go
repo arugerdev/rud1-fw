@@ -1107,3 +1107,174 @@ func TestNewSweepsMultipleOrphans(t *testing.T) {
 		t.Fatalf("non-tmp .jsonl.gz was wrongly removed: %v", err)
 	}
 }
+
+// TestStatsCompressionByDayEmptyDir (iter 44): a freshly-constructed
+// logger with no day-files reports a nil/empty CompressionByDay map.
+// We accept either nil or zero-length so the contract is purely "no
+// entries surfaced" — callers iterate with range either way.
+func TestStatsCompressionByDayEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	fixed := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	l, err := New(dir, Options{MaxFiles: 14, Now: func() time.Time { return fixed }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(got.CompressionByDay) != 0 {
+		t.Fatalf("CompressionByDay=%v, want empty", got.CompressionByDay)
+	}
+}
+
+// TestStatsCompressionByDaySingleGzip (iter 44): a single rotated
+// `.jsonl.gz` archive must surface exactly one entry keyed by the day
+// stamp parsed from the filename, with the ratio = entryBytes /
+// totalBytes (entryBytes derived from the re-marshal estimate, so we
+// assert "ratio is meaningfully > 1" rather than an exact value).
+func TestStatsCompressionByDaySingleGzip(t *testing.T) {
+	dir := t.TempDir()
+	// Highly compressible body — same shape as the iter 41 test so
+	// gzip squashes it down by an order of magnitude.
+	var body strings.Builder
+	for i := 0; i < 40; i++ {
+		body.WriteString(`{"at":1745318400,"action":"compressible.repeat.action","actor":"operator","ok":true}` + "\n")
+	}
+
+	gzPath := filepath.Join(dir, "audit-2026-04-22.jsonl.gz")
+	f, err := os.Create(gzPath)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	gw := gzip.NewWriter(f)
+	if _, err := gw.Write([]byte(body.String())); err != nil {
+		t.Fatalf("gz write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gz close: %v", err)
+	}
+	_ = f.Close()
+
+	l, err := New(dir, Options{MaxFiles: 14})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(got.CompressionByDay) != 1 {
+		t.Fatalf("CompressionByDay len=%d, want 1: %v", len(got.CompressionByDay), got.CompressionByDay)
+	}
+	ratio, ok := got.CompressionByDay["2026-04-22"]
+	if !ok {
+		t.Fatalf("CompressionByDay missing 2026-04-22 key: %v", got.CompressionByDay)
+	}
+	// Repetitive JSONL of this shape compresses well past 2:1, so the
+	// ratio must be substantially > 1. Belt-and-braces sanity bounds.
+	if ratio <= 1.0 {
+		t.Fatalf("ratio=%f, want >1.0 (real compression)", ratio)
+	}
+	if ratio > 1000 {
+		t.Fatalf("ratio=%f, implausible (>1000x)", ratio)
+	}
+}
+
+// TestStatsCompressionByDayMixedPlainAndGzip (iter 44): a directory
+// holding both a plain `.jsonl` (the active day, ratio==1.0) and a
+// `.jsonl.gz` archive surfaces only the gzip day. Ratio==1.0 carries
+// no signal — emitting it would dilute the cloud's outlier histogram.
+func TestStatsCompressionByDayMixedPlainAndGzip(t *testing.T) {
+	dir := t.TempDir()
+
+	// Plain active day — entryBytes == totalBytes, no compression.
+	plainPath := filepath.Join(dir, "audit-2026-04-23.jsonl")
+	plainBody := `{"at":1745404800,"action":"x","actor":"operator","ok":true}` + "\n"
+	if err := os.WriteFile(plainPath, []byte(plainBody), 0o644); err != nil {
+		t.Fatalf("write plain: %v", err)
+	}
+
+	// Compressible rotated day.
+	var body strings.Builder
+	for i := 0; i < 40; i++ {
+		body.WriteString(`{"at":1745318400,"action":"compressible.repeat.action","actor":"operator","ok":true}` + "\n")
+	}
+	gzPath := filepath.Join(dir, "audit-2026-04-22.jsonl.gz")
+	f, err := os.Create(gzPath)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	gw := gzip.NewWriter(f)
+	if _, err := gw.Write([]byte(body.String())); err != nil {
+		t.Fatalf("gz write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gz close: %v", err)
+	}
+	_ = f.Close()
+
+	l, err := New(dir, Options{MaxFiles: 14})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(got.CompressionByDay) != 1 {
+		t.Fatalf("CompressionByDay len=%d, want 1 (plain day excluded): %v",
+			len(got.CompressionByDay), got.CompressionByDay)
+	}
+	if _, ok := got.CompressionByDay["2026-04-22"]; !ok {
+		t.Fatalf("missing gzip day: %v", got.CompressionByDay)
+	}
+	if _, ok := got.CompressionByDay["2026-04-23"]; ok {
+		t.Fatalf("plain day must not appear: %v", got.CompressionByDay)
+	}
+	// Aggregate fields must remain unchanged in the mixed case — the
+	// histogram is purely additive metadata.
+	if got.FileCount != 2 {
+		t.Fatalf("FileCount=%d, want 2", got.FileCount)
+	}
+}
+
+// TestStatsCompressionByDayMalformedGzip (iter 44): a `.jsonl.gz` whose
+// payload can't be decompressed (we write garbage bytes with the .gz
+// suffix) must NOT contribute to the histogram. This mirrors the
+// existing iter 41 EntryBytes drop behaviour — readJSONLFile fails,
+// the file is skipped, and crucially CompressionByDay stays clean
+// rather than emitting a nonsense ratio.
+func TestStatsCompressionByDayMalformedGzip(t *testing.T) {
+	dir := t.TempDir()
+
+	bad := filepath.Join(dir, "audit-2026-04-20.jsonl.gz")
+	if err := os.WriteFile(bad, []byte("this is not gzip data, not even close"), 0o644); err != nil {
+		t.Fatalf("write bad: %v", err)
+	}
+
+	l, err := New(dir, Options{MaxFiles: 14})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+
+	got, err := l.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(got.CompressionByDay) != 0 {
+		t.Fatalf("CompressionByDay should be empty for malformed gzip, got %v", got.CompressionByDay)
+	}
+	// File still counts toward FileCount/TotalBytes — only the
+	// uncompressed-derived fields drop out, same as EntryBytes.
+	if got.FileCount != 1 {
+		t.Fatalf("FileCount=%d, want 1 (malformed .gz still inventoried)", got.FileCount)
+	}
+}
