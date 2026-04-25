@@ -624,9 +624,24 @@ func (h *USBIPHandler) RecentRevocations(limit int) []RevocationEntry {
 const revocationListMaxLimit = 1000
 
 // RevocationsList handles GET /api/usbip/revocations — paginated history of
-// policy revocations. Query params: limit (1..revocationListMaxLimit when a
-// disk logger is wired, otherwise 1..revocationLogSize), offset (>=0).
+// policy revocations. Query params:
+//   - limit (1..revocationListMaxLimit when a disk logger is wired, otherwise
+//     1..revocationLogSize). Default: revocationLogSize for the in-memory
+//     path (return everything in the ring) or 50 with a disk logger (which
+//     can hold thousands of rows). Invalid (non-int, ≤0, >max) → 400.
+//   - offset (>=0). Default 0. Invalid → 400.
+//   - since (unix seconds, inclusive). Optional lower bound on entry.At;
+//     applied BEFORE the limit window so callers polling with `since=lastAt`
+//     always see the latest N entries that postdate their cursor. Invalid
+//     (non-int, <0) → 400.
+//
 // Entries are ordered newest-first so offset=0 gives the most recent page.
+// The wrapper response carries `items`, `total` (count after `since` filter),
+// `limit`, `offset`, plus `returned` (len(items)) and `hasMore`
+// (offset+returned < total) so iter-30+ clients can drive infinite-scroll
+// without a second round-trip to size the next page. Legacy fields stay
+// intact — rud1-app's fetchUsbipRevocations reads `items` first and falls
+// back to `revocations`/`now` for forward compat.
 //
 // When SetRevLogger has been called the handler reads paginated history
 // straight from disk; otherwise it falls back to the in-memory ring buffer.
@@ -644,11 +659,15 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 	h.revMu.Unlock()
 
 	maxLimit := revocationLogSize
+	defaultLimit := revocationLogSize
 	if logger != nil {
 		maxLimit = revocationListMaxLimit
+		// With disk-backed history the buffer can hold thousands of rows;
+		// 50 keeps the default page small enough to render quickly.
+		defaultLimit = 50
 	}
 
-	limit := 50
+	limit := defaultLimit
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		v, err := strconv.Atoi(raw)
 		if err != nil || v < 1 || v > maxLimit {
@@ -666,9 +685,18 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 		}
 		offset = v
 	}
+	var since int64
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "since must be a non-negative unix-seconds integer")
+			return
+		}
+		since = v
+	}
 
 	if logger != nil {
-		items, total, err := logger.List(revlog.ListOptions{Limit: limit, Offset: offset})
+		items, total, err := logger.List(revlog.ListOptions{Limit: limit, Offset: offset, Since: since})
 		if err != nil {
 			// Fall through to the in-memory path so a transient read failure
 			// still returns something useful (the most recent 256 entries).
@@ -692,16 +720,29 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 			// that advertise Accept-Encoding. Matches the pattern used by the
 			// /export endpoint so the whole audit surface is consistent.
 			writeJSONMaybeGzip(w, r, http.StatusOK, map[string]interface{}{
-				"items":  out,
-				"total":  total,
-				"limit":  limit,
-				"offset": offset,
+				"items":    out,
+				"total":    total,
+				"limit":    limit,
+				"offset":   offset,
+				"returned": len(out),
+				"hasMore":  offset+len(out) < total,
 			})
 			return
 		}
 	}
 
 	all := h.Revocations() // chronological (oldest first); total = len(all)
+	// Apply `since` filter first so the limit window is taken from the
+	// post-filter set, matching the disk-logger semantics above.
+	if since > 0 {
+		filtered := all[:0:len(all)]
+		for _, e := range all {
+			if e.At >= since {
+				filtered = append(filtered, e)
+			}
+		}
+		all = filtered
+	}
 	total := len(all)
 	// Reverse to newest-first for pagination.
 	reversed := make([]RevocationEntry, total)
@@ -719,10 +760,12 @@ func (h *USBIPHandler) RevocationsList(w http.ResponseWriter, r *http.Request) {
 	items := reversed[start:end]
 
 	writeJSONMaybeGzip(w, r, http.StatusOK, map[string]interface{}{
-		"items":  items,
-		"total":  total,
-		"limit":  limit,
-		"offset": offset,
+		"items":    items,
+		"total":    total,
+		"limit":    limit,
+		"offset":   offset,
+		"returned": len(items),
+		"hasMore":  offset+len(items) < total,
 	})
 }
 
