@@ -3,6 +3,10 @@ Description=Rud1 Device Agent
 Documentation=https://github.com/arugerdev/rud1-fw
 After=network-online.target
 Wants=network-online.target
+# Restart-rate limiting belongs in [Unit] in systemd >= 230. Anything in
+# [Service] is silently ignored by recent systemd (warning in journal).
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -13,8 +17,6 @@ User=root
 ExecStart=/usr/local/bin/rud1-agent -config /etc/rud1-agent/config.yaml
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
 # Observability
 StandardOutput=journal
@@ -26,6 +28,13 @@ Environment=RUD1_LOG_LEVEL=info
 # access to manage WireGuard, usbip, system metrics and network snapshots.
 NoNewPrivileges=yes
 ProtectSystem=full
+# The boot identity (registrationCode/PIN) is persisted to the FAT partition
+# so it survives an OS reinstall. ProtectSystem=full mounts /boot, /usr and
+# /etc read-only for the unit; carve out the writable paths the agent uses:
+#   - /boot/firmware (and /boot fallback): the FAT identity file.
+#   - /etc/wireguard:                      atomic writes of wg0.conf during
+#                                          peer provisioning by the cloud.
+ReadWritePaths=/boot/firmware /boot /etc/wireguard
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelLogs=yes

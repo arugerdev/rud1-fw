@@ -44,7 +44,23 @@ network:
   ap_password: ""
   ap_cidr: 192.168.50.1/24
   auto_ap: true                 # raise the setup hotspot when offline for too long
-  offline_grace_seconds: 90
+  # offline_grace_seconds is intentionally aggressive (15s) so an installer
+  # SSH'ing into a freshly imaged Pi can rely on the AP coming up quickly.
+  # Combined with the supervisor's 20s boot grace, a device with no uplink
+  # exposes its setup SSID within ~35s of boot. Bump this to 60-120s if
+  # your fleet sits on flaky WiFi and you want extra flap protection.
+  offline_grace_seconds: 15
   preferred_uplink: auto        # auto | wifi | cellular
   cellular_apn: ""
   cellular_data_cap_mb: 0
+
+# setup is filled in automatically by the first-boot wizard via
+# POST /api/setup/general + POST /api/setup/complete. You can pre-seed it
+# here for an automated provisioning flow, but in normal operation just
+# leave it untouched.
+setup:
+  complete: false
+  device_name: ""
+  device_location: ""
+  # notes: ""
+  # completed_at: 0

@@ -272,6 +272,19 @@ const apConnectionName = "rud1-setup-ap"
 
 // APEnable raises the setup hotspot. Idempotent: bringing it up while
 // already active just re-applies the password.
+//
+// PiOS Lite 64-bit gotchas this function defends against:
+//
+//   - rfkill soft-block: PiOS ships WiFi soft-blocked until a regulatory
+//     domain is set. We unblock the radio before bringing the AP up so
+//     `connection up` doesn't fail with the cryptic "Secrets were required"
+//     style error that the kernel emits when the radio is still blocked.
+//   - Missing wireless regulatory domain: NM's hotspot mode silently fails
+//     to broadcast on a `00` (world) regdom. We log a clear warning so an
+//     installer SSH'd in can run `iw reg set <country>` (or set it via
+//     raspi-config / wireless-regdom).
+//   - nmcli noisy errors: if `connection up` fails we surface the raw stderr
+//     at warn level so the failure mode is visible without enabling debug.
 func (b *NMBackend) APEnable(ctx context.Context) error {
 	if !b.Available() {
 		return ErrUnavailable
@@ -280,7 +293,22 @@ func (b *NMBackend) APEnable(ctx context.Context) error {
 		return errors.New("ap password is empty; refusing to start an open hotspot")
 	}
 
+	// Best-effort radio unblock. `rfkill` is in raspberrypi-sys-mods on PiOS
+	// but might be absent on minimal images; we don't fail if the binary or
+	// the command itself errors out — `nmcli radio wifi on` below is a
+	// second line of defence.
+	b.bestEffortUnblockWiFi(ctx)
+	// Make sure NM's own radio toggle is on too. Same idempotent-best-effort
+	// philosophy: if this fails because radio is already on, who cares.
+	_, _ = b.run(ctx, 2*time.Second, "radio", "wifi", "on")
+	// Warn (don't fail) when the kernel has no regulatory domain set —
+	// hotspot mode in 802.11bg requires one to pick legal channels.
+	b.warnIfRegdomUnset(ctx)
+
 	// Delete stale profile so we re-create with current SSID/password.
+	// Note: this only deletes our OWN profile (apConnectionName) — never
+	// foreign profiles, even if they're squatting on wlan0. Removing a
+	// user's saved client SSID would be a hostile surprise.
 	_, _ = b.run(ctx, 2*time.Second, "connection", "delete", apConnectionName)
 
 	args := []string{
@@ -301,9 +329,84 @@ func (b *NMBackend) APEnable(ctx context.Context) error {
 		return fmt.Errorf("ap add: %w", err)
 	}
 	if _, err := b.run(ctx, 20*time.Second, "connection", "up", apConnectionName); err != nil {
+		// The run() helper already logs at debug level — re-emit at warn
+		// so the operator sees the failure without flipping log_level.
+		log.Warn().
+			Err(err).
+			Str("connection", apConnectionName).
+			Str("interface", b.apIface).
+			Msg("nmcli connection up failed for setup AP")
 		return fmt.Errorf("ap up: %w", err)
 	}
 	return nil
+}
+
+// bestEffortUnblockWiFi calls `rfkill unblock wifi` so the radio is usable.
+// PiOS Lite leaves wlan0 soft-blocked on first boot until a regulatory
+// domain is set — if we don't unblock here, `nmcli connection up` returns
+// a generic activation error and the installer is left guessing.
+//
+// Failures are intentionally swallowed: rfkill may not be installed, or
+// the user may have a non-Pi image where the radio is already unblocked.
+// In either case the subsequent `connection up` is the source of truth.
+func (b *NMBackend) bestEffortUnblockWiFi(ctx context.Context) {
+	rfkill, err := exec.LookPath("rfkill")
+	if err != nil {
+		return
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx2, rfkill, "unblock", "wifi")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		log.Debug().
+			Err(err).
+			Str("stderr", strings.TrimSpace(stderr.String())).
+			Msg("rfkill unblock wifi failed (non-fatal)")
+	}
+}
+
+// warnIfRegdomUnset checks `iw reg get` and logs a loud warning if the
+// kernel reports `country 00`. A device with no regdom set will not
+// broadcast on any channel, so the AP will appear "up" in nmcli but be
+// invisible to phones.
+func (b *NMBackend) warnIfRegdomUnset(ctx context.Context) {
+	iw, err := exec.LookPath("iw")
+	if err != nil {
+		// `iw` not installed — common on minimal images. We can't check
+		// but we also can't fix; the AP may still work if NM's defaults
+		// are good enough. Don't spam the log.
+		return
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx2, iw, "reg", "get")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return
+	}
+	out := stdout.String()
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		// `iw reg get` prints lines like: "country 00: DFS-UNSET"
+		// or "country ES: DFS-ETSI". We care about the first one.
+		if !strings.HasPrefix(line, "country ") {
+			continue
+		}
+		// Parse out the 2-letter code between "country " and ":".
+		rest := strings.TrimPrefix(line, "country ")
+		code, _, _ := strings.Cut(rest, ":")
+		code = strings.TrimSpace(code)
+		if code == "00" || code == "" {
+			log.Warn().
+				Str("regdom", code).
+				Msg("wireless regulatory domain is unset — setup AP may not broadcast. " +
+					"Run `sudo iw reg set ES` (or your country code) and `sudo raspi-config nonint do_wifi_country ES`.")
+		}
+		return
+	}
 }
 
 // APDisable tears the hotspot down.

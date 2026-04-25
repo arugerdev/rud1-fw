@@ -171,6 +171,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	vpnPeerH := handlers.NewVPNPeerHandler(cfg.VPN.Interface)
 	vpnPeersSumH := handlers.NewVPNPeersSummaryHandler(cfg.VPN.Interface)
 	vpnPeerDetailH := handlers.NewVPNPeerDetailHandler(cfg.VPN.Interface)
+	vpnThroughputH := handlers.NewVPNThroughputHandler(cfg.VPN.Interface)
 	usbH := handlers.NewUSBHandler()
 	usbipH := handlers.NewUSBIPHandler(cfg)
 	a.usbipH = usbipH
@@ -193,6 +194,19 @@ func New(cfg *config.Config) (*Agent, error) {
 	}
 
 	identityH := handlers.NewIdentityHandler(bootID)
+
+	// Setup wizard — wired here so its health checkers can capture the
+	// live wireguard / cloud / usbip handles. The closures keep the
+	// captured pointers, not snapshots, so a service that comes online
+	// after the handler is constructed (e.g. usbipH after SetRevLogger)
+	// still surfaces correctly.
+	setupH := handlers.NewSetupHandler(cfg, handlers.SetupHandlerDeps{
+		SerialNumber:    func() string { return a.identity.SerialNumber },
+		FirmwareVersion: func() string { return Version },
+		WiFiInterface:   cfg.Network.WiFiInterface,
+		APInterface:     cfg.Network.APInterface,
+		HealthCheckers:  buildSetupHealthCheckers(a, cfg),
+	})
 
 	// LAN routing manager — source subnet is the Pi's own /24 so WG peers
 	// reaching LAN targets get correctly NAT'd out the uplink. We detect
@@ -283,7 +297,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	sysUptimeEvExpH := handlers.NewSystemUptimeEventsExportHandler(a.uptimeS)
 	sysUptimeSumH := handlers.NewSystemUptimeSummaryHandler(a.uptimeS)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH)
 
 	return a, nil
 }

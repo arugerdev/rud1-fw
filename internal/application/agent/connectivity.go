@@ -58,9 +58,15 @@ func buildConnectivityService(cfg *config.Config, machineID string) (cx.Service,
 	if cfg.Network.AutoAP {
 		grace := time.Duration(cfg.Network.OfflineGraceSeconds) * time.Second
 		if grace <= 0 {
-			grace = 90 * time.Second
+			grace = 15 * time.Second
 		}
-		sup = connimpl.NewSupervisor(real, connimpl.SupervisorOptions{OfflineToAP: grace})
+		// Closure over cfg so the wizard's POST /api/setup/complete is
+		// observed on the next supervisor tick (no snapshot copy).
+		isComplete := func() bool { return cfg.Setup.Complete }
+		sup = connimpl.NewSupervisor(real, connimpl.SupervisorOptions{
+			OfflineToAP:     grace,
+			IsSetupComplete: isComplete,
+		})
 	}
 	return real, sup
 }

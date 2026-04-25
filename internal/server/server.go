@@ -38,6 +38,7 @@ func New(
 	vpnPeerH *handlers.VPNPeerHandler,
 	vpnPeersSumH *handlers.VPNPeersSummaryHandler,
 	vpnPeerDetailH *handlers.VPNPeerDetailHandler,
+	vpnThroughputH *handlers.VPNThroughputHandler,
 	usbH *handlers.USBHandler,
 	usbipH *handlers.USBIPHandler,
 	connH *handlers.ConnectivityHandler,
@@ -52,6 +53,7 @@ func New(
 	sysUptimeEvH *handlers.SystemUptimeEventsHandler,
 	sysUptimeEvExpH *handlers.SystemUptimeEventsExportHandler,
 	sysUptimeSumH *handlers.SystemUptimeSummaryHandler,
+	setupH *handlers.SetupHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -80,6 +82,19 @@ func New(
 	// local API to LAN only keeps the blast radius the same as physical
 	// access, which is the intended trust model.
 	r.Get("/api/identity", identityH.Get)
+
+	// Setup wizard — same chicken-and-egg pattern as /api/identity but
+	// with a stricter gate: once cfg.Setup.Complete flips to true,
+	// these endpoints fall back to BearerAuth so a paired device
+	// doesn't leave a mutation surface open on its LAN. /reset is in
+	// the authenticated group below since it's destructive.
+	r.Group(func(r chi.Router) {
+		r.Use(handlers.SetupGate(cfg, cfg.Server.AuthToken))
+		r.Get("/api/setup/state", setupH.State)
+		r.Get("/api/setup/health", setupH.Health)
+		r.Post("/api/setup/general", setupH.General)
+		r.Post("/api/setup/complete", setupH.Complete)
+	})
 
 	// Authenticated API routes.
 	r.Group(func(r chi.Router) {
@@ -143,6 +158,11 @@ func New(
 		// whole list. Pubkey is validated client-side before hitting wg.
 		r.Get("/api/vpn/peers/{pubkey}", vpnPeerDetailH.Detail)
 
+		// Bandwidth tile — returns cumulative + windowed bytesTx/Rx
+		// fleet-wide for the WG iface, plus a top-N peer breakdown
+		// for the trend chart. Strict-parse window={1h,6h,24h,7d}.
+		r.Get("/api/vpn/throughput", vpnThroughputH.Throughput)
+
 		// LAN routing — opt-in exposure of the Pi's LAN subnet(s) over the
 		// WireGuard tunnel. Mutations persist to config.yaml via
 		// config.Config.Save (same mechanism USB policy uses).
@@ -178,6 +198,12 @@ func New(
 		r.Delete("/api/usbip/export", usbipH.Unexport)
 		r.Post("/api/usbip/attach", usbipH.Attach)
 		r.Delete("/api/usbip/attach", usbipH.Detach)
+
+		// /api/setup/reset is destructive (clears the wizard state) so
+		// it ALWAYS requires auth, regardless of cfg.Setup.Complete.
+		// Lives here, inside the BearerAuth group, instead of behind
+		// the SetupGate above.
+		r.Post("/api/setup/reset", setupH.Reset)
 	})
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

@@ -25,6 +25,7 @@ type Config struct {
 	USB      USBConfig     `yaml:"usb"`
 	Network  NetworkConfig `yaml:"network"`
 	LAN      LANConfig     `yaml:"lan"`
+	Setup    SetupConfig   `yaml:"setup"`
 
 	// Path is the filesystem location the config was loaded from. Set by
 	// Load(); used by runtime Save() calls so the agent can persist mutations
@@ -125,6 +126,28 @@ type LANConfig struct {
 	Routes          []string `yaml:"routes,omitempty"`
 }
 
+// SetupConfig captures the first-boot wizard state. It is intentionally
+// short — the wizard collects only the bits that downstream code (cloud
+// heartbeat, panel header, support tooling) needs to identify the device
+// for an operator. The Complete flag gates two behaviours:
+//
+//  1. The supervisor keeps the setup-AP up indefinitely while !Complete so
+//     a freshly imaged Pi is always reachable from an installer's phone.
+//  2. /api/setup/{state,general,complete,health} skip BearerAuth while
+//     !Complete (chicken-and-egg: the installer hasn't agreed a token yet).
+//     Once Complete flips to true those endpoints lock down to require auth
+//     so a paired device doesn't expose mutation surface to its LAN.
+//
+// All fields are filled by POST /api/setup/general from the wizard UI; the
+// agent never writes them on its own.
+type SetupConfig struct {
+	Complete       bool   `yaml:"complete"`
+	DeviceName     string `yaml:"device_name"`
+	DeviceLocation string `yaml:"device_location"`
+	Notes          string `yaml:"notes,omitempty"`
+	CompletedAt    int64  `yaml:"completed_at,omitempty"` // unix seconds
+}
+
 // USBConfig configures the USB-over-IP subsystem.
 type USBConfig struct {
 	BindPort       int      `yaml:"bind_port"`
@@ -183,12 +206,19 @@ func Default() *Config {
 			BindPort: 3240,
 		},
 		Network: NetworkConfig{
-			WiFiInterface:       "wlan0",
-			APInterface:         "wlan0",
-			APCIDR:              "192.168.50.1/24",
-			AutoAP:              true,
-			OfflineGraceSeconds: 90,
+			WiFiInterface: "wlan0",
+			APInterface:   "wlan0",
+			APCIDR:        "192.168.50.1/24",
+			AutoAP:        true,
+			// Aggressively short by design — installer UX trumps the
+			// flap-prevention margin you'd want on a long-lived device.
+			// Once the setup wizard has flipped Setup.Complete=true the
+			// supervisor reverts to its boot-grace-then-threshold logic.
+			OfflineGraceSeconds: 15,
 			PreferredUplink:     "auto",
+		},
+		Setup: SetupConfig{
+			Complete: false,
 		},
 	}
 }

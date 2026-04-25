@@ -71,18 +71,28 @@ func EnsureDir(path string) error {
 }
 
 // BootIdentityPath returns the path where the device's code + PIN identity
-// is persisted. The file is 0400 and lives on /boot (FAT partition) so it
+// is persisted. The file is 0400 and lives on the FAT partition so it
 // survives an OS reinstall as long as the SD card is physically preserved.
 // Manufacturing can also pre-seed this file before shipping the device.
 //
-//   - Linux production:  /boot/rud1-identity.json
-//   - Dev/simulated:     <DataDir>/rud1-identity.json  (easier to clear)
-//   - Override:          $RUD1_IDENTITY_PATH
+//   - Pi OS Bookworm+: /boot/firmware/rud1-identity.json (real FAT mount)
+//   - Older Pi OS:     /boot/rud1-identity.json          (legacy FAT mount)
+//   - Dev/simulated:   <DataDir>/rud1-identity.json      (easier to clear)
+//   - Override:        $RUD1_IDENTITY_PATH
 func BootIdentityPath() string {
 	if env := os.Getenv("RUD1_IDENTITY_PATH"); env != "" {
 		return env
 	}
 	if IsLinux() && !SimulateHardware() {
+		// Pi OS Bookworm (2023+) and Trixie (2025+) mount the FAT at
+		// /boot/firmware/. /boot/ on those images is just the ext4 root —
+		// reinstalling the OS wipes it. Prefer the real FAT mount when
+		// present; if a legacy file already lives at /boot/rud1-identity.json,
+		// migrate by reading it (the caller in bootidentity.EnsureIdentity
+		// just checks the path, so we keep using the FAT path going forward).
+		if st, err := os.Stat("/boot/firmware"); err == nil && st.IsDir() {
+			return "/boot/firmware/rud1-identity.json"
+		}
 		return "/boot/rud1-identity.json"
 	}
 	return filepath.Join(DataDir(), "rud1-identity.json")
