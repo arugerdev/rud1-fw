@@ -25,6 +25,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/rud1-es/rud1-fw/internal/config"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 )
 
 // MaxNTPProbeServers caps the number of servers the operator can wire up
@@ -54,10 +55,11 @@ const (
 // coupling, a PUT followed quickly by a GET on /time-health would still
 // see the pre-PUT config until the handler restarted.
 type SystemNTPProbeConfigHandler struct {
-	mu      sync.Mutex
-	cfg     *config.Config
-	timeH   *SystemTimeHealthHandler
-	onApply func(opts ExternalNTPProbeOptions) // optional hook (heartbeat throttle reset)
+	mu       sync.Mutex
+	cfg      *config.Config
+	timeH    *SystemTimeHealthHandler
+	onApply  func(opts ExternalNTPProbeOptions) // optional hook (heartbeat throttle reset)
+	auditLog auditLogger                        // never nil after construction (LoggerNoop default)
 }
 
 // NewSystemNTPProbeConfigHandler wires the handler with the live config
@@ -65,7 +67,20 @@ type SystemNTPProbeConfigHandler struct {
 // push live options for immediate effect on the next request). Both
 // pointers MUST be non-nil — there's no useful zero-value fallback.
 func NewSystemNTPProbeConfigHandler(cfg *config.Config, timeH *SystemTimeHealthHandler) *SystemNTPProbeConfigHandler {
-	return &SystemNTPProbeConfigHandler{cfg: cfg, timeH: timeH}
+	return &SystemNTPProbeConfigHandler{cfg: cfg, timeH: timeH, auditLog: configlog.LoggerNoop{}}
+}
+
+// SetAuditLogger swaps in a real audit logger after construction. Wired
+// from agent.go where the configlog.DiskLogger is built. Calling with
+// nil reverts to the no-op logger.
+func (h *SystemNTPProbeConfigHandler) SetAuditLogger(l auditLogger) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if l == nil {
+		h.auditLog = configlog.LoggerNoop{}
+		return
+	}
+	h.auditLog = l
 }
 
 // SetOnApply registers an optional callback invoked after a successful
@@ -201,6 +216,7 @@ func (h *SystemNTPProbeConfigHandler) Set(w http.ResponseWriter, r *http.Request
 	prevEnabled := h.cfg.System.ExternalNTPProbeEnabled
 	prevServers := append([]string(nil), h.cfg.System.ExternalNTPServers...)
 	prevTimeout := h.cfg.System.ExternalNTPProbeTimeout
+	prevSnap := ntpProbeAuditSnapshot(prevEnabled, prevServers, prevTimeout)
 
 	if req.Enabled != nil {
 		h.cfg.System.ExternalNTPProbeEnabled = *req.Enabled
@@ -212,12 +228,27 @@ func (h *SystemNTPProbeConfigHandler) Set(w http.ResponseWriter, r *http.Request
 		h.cfg.System.ExternalNTPProbeTimeout = newTimeout
 	}
 
+	auditL := h.auditLog
 	if saveErr := h.cfg.Save(); saveErr != nil {
 		h.cfg.System.ExternalNTPProbeEnabled = prevEnabled
 		h.cfg.System.ExternalNTPServers = prevServers
 		h.cfg.System.ExternalNTPProbeTimeout = prevTimeout
 		h.mu.Unlock()
 		log.Error().Err(saveErr).Msg("ntp-probe-config: failed to persist update")
+		// Audit the failed update so the operator can correlate the
+		// 500 with whatever they tried to push.
+		if auditL != nil {
+			if err := auditL.Append(r.Context(), configlog.Entry{
+				Action:   "system.ntpProbe.update",
+				Actor:    "operator",
+				Previous: prevSnap,
+				Next:     nil,
+				OK:       false,
+				Error:    "save: " + saveErr.Error(),
+			}); err != nil {
+				log.Warn().Err(err).Msg("audit append failed (non-fatal)")
+			}
+		}
 		writeError(w, http.StatusInternalServerError, "failed to persist config: "+saveErr.Error())
 		return
 	}
@@ -228,8 +259,21 @@ func (h *SystemNTPProbeConfigHandler) Set(w http.ResponseWriter, r *http.Request
 		Servers:   append([]string(nil), h.cfg.System.ExternalNTPServers...),
 		PerServer: h.cfg.System.ExternalNTPProbeTimeout,
 	}
+	nextSnap := ntpProbeAuditSnapshot(applied.Enabled, applied.Servers, applied.PerServer)
 	onApply := h.onApply
 	h.mu.Unlock()
+
+	if auditL != nil {
+		if err := auditL.Append(r.Context(), configlog.Entry{
+			Action:   "system.ntpProbe.update",
+			Actor:    "operator",
+			Previous: prevSnap,
+			Next:     nextSnap,
+			OK:       true,
+		}); err != nil {
+			log.Warn().Err(err).Msg("audit append failed (non-fatal)")
+		}
+	}
 
 	if h.timeH != nil {
 		h.timeH.SetProbeOptions(applied)
@@ -257,4 +301,23 @@ func (h *SystemNTPProbeConfigHandler) Set(w http.ResponseWriter, r *http.Request
 		Servers:        servers,
 		TimeoutSeconds: timeoutSec,
 	})
+}
+
+// ntpProbeAuditSnapshot returns a JSON-serialisable view of the probe
+// fields that the audit log records before/after a mutation. Servers
+// is cloned so the caller can safely mutate cfg without poisoning the
+// snapshot. The wire shape mirrors ntpProbeConfigResponse so a future
+// reader can diff side-by-side without translating field names.
+func ntpProbeAuditSnapshot(enabled bool, servers []string, perServer time.Duration) map[string]any {
+	out := make([]string, len(servers))
+	copy(out, servers)
+	timeoutSec := int(perServer / time.Second)
+	if timeoutSec <= 0 {
+		timeoutSec = 2
+	}
+	return map[string]any{
+		"enabled":        enabled,
+		"servers":        out,
+		"timeoutSeconds": timeoutSec,
+	}
 }

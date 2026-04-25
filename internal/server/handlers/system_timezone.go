@@ -26,20 +26,41 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 	"github.com/rud1-es/rud1-fw/internal/platform"
 )
 
 // SystemTimezoneHandler serves the timezone endpoints. Read-only operations
 // don't touch state on the handler; the mutex guards the Set path so two
 // concurrent POSTs can't race timedatectl invocations.
+//
+// auditLog is optional: nil falls back to configlog.LoggerNoop so tests and
+// dev mode (no writable audit dir) keep working without the caller having to
+// thread a logger through every constructor.
 type SystemTimezoneHandler struct {
-	mu sync.Mutex
+	mu       sync.Mutex
+	auditLog auditLogger
 }
 
 // NewSystemTimezoneHandler — zero-config; the caller wires it into the
-// authenticated /api/system/* group in server.go.
+// authenticated /api/system/* group in server.go. auditLog may be nil to
+// disable the persistent audit trail (tests use this).
 func NewSystemTimezoneHandler() *SystemTimezoneHandler {
-	return &SystemTimezoneHandler{}
+	return &SystemTimezoneHandler{auditLog: configlog.LoggerNoop{}}
+}
+
+// SetAuditLogger swaps in a real audit logger after construction. Wired
+// from agent.go where the configlog.DiskLogger is built. Calling with
+// nil reverts to the no-op logger so handlers never panic on a missing
+// dependency.
+func (h *SystemTimezoneHandler) SetAuditLogger(l auditLogger) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if l == nil {
+		h.auditLog = configlog.LoggerNoop{}
+		return
+	}
+	h.auditLog = l
 }
 
 type systemTimezoneResponse struct {
@@ -103,6 +124,10 @@ type setTimezoneRequest struct {
 // then invokes `timedatectl set-timezone <tz>`. On simulated hardware the
 // invocation is skipped — the validation still applies so dev callers see
 // the same error shape they'd see in prod.
+//
+// Every successful or failed mutation is appended to the persistent audit
+// log. Audit failures are warn-logged and never propagate to the caller —
+// the originating request always wins.
 func (h *SystemTimezoneHandler) Set(w http.ResponseWriter, r *http.Request) {
 	var req setTimezoneRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -116,17 +141,22 @@ func (h *SystemTimezoneHandler) Set(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isValidTimezone(tz) {
 		writeError(w, http.StatusBadRequest, "unknown timezone")
+		// Log validation failure so a flood of bad requests is visible.
+		h.audit(r, tz, "", false, "unknown timezone")
 		return
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	prev, _ := readCurrentTimezone()
+
 	if !platform.SimulateHardware() {
 		ctx := r.Context()
 		cmd := exec.CommandContext(ctx, "timedatectl", "set-timezone", tz)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			log.Warn().Err(err).Str("tz", tz).Str("out", strings.TrimSpace(string(out))).Msg("timedatectl set-timezone failed")
+			h.audit(r, tz, prev, false, "timedatectl: "+err.Error())
 			writeError(w, http.StatusInternalServerError, "failed to set timezone")
 			return
 		}
@@ -134,6 +164,7 @@ func (h *SystemTimezoneHandler) Set(w http.ResponseWriter, r *http.Request) {
 
 	current, source := readCurrentTimezone()
 	log.Info().Str("tz", tz).Str("applied", current).Str("source", source).Msg("timezone updated")
+	h.audit(r, tz, prev, true, "")
 	_, offset := time.Now().Zone()
 	writeJSON(w, http.StatusOK, systemTimezoneResponse{
 		Current:   current,
@@ -141,6 +172,29 @@ func (h *SystemTimezoneHandler) Set(w http.ResponseWriter, r *http.Request) {
 		UTCOffset: offset,
 		Suggested: suggestedTimezones(),
 	})
+}
+
+// audit appends one configlog.Entry for a timezone mutation. Failures
+// are best-effort: a warn log + return, never a 500 to the caller.
+func (h *SystemTimezoneHandler) audit(r *http.Request, requested, previous string, ok bool, errMsg string) {
+	if h.auditLog == nil {
+		return
+	}
+	var next any
+	if ok {
+		next = map[string]any{"timezone": requested}
+	}
+	entry := configlog.Entry{
+		Action:   "system.timezone.set",
+		Actor:    "operator",
+		Previous: map[string]any{"timezone": previous},
+		Next:     next,
+		OK:       ok,
+		Error:    errMsg,
+	}
+	if err := h.auditLog.Append(r.Context(), entry); err != nil {
+		log.Warn().Err(err).Str("action", entry.Action).Msg("audit append failed (non-fatal)")
+	}
 }
 
 // readCurrentTimezone returns (name, source) using the most authoritative

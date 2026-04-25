@@ -32,6 +32,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/rud1-es/rud1-fw/internal/config"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 	"github.com/rud1-es/rud1-fw/internal/server/middleware"
 )
 
@@ -76,9 +77,10 @@ type SetupHandlerDeps struct {
 // interleave config writes — Save() is itself atomic but we want the
 // in-memory state to match what we just persisted.
 type SetupHandler struct {
-	cfg  *config.Config
-	deps SetupHandlerDeps
-	mu   sync.Mutex
+	cfg      *config.Config
+	deps     SetupHandlerDeps
+	mu       sync.Mutex
+	auditLog auditLogger // never nil after construction (LoggerNoop default)
 }
 
 // NewSetupHandler wires a SetupHandler around the live config + deps.
@@ -89,7 +91,58 @@ func NewSetupHandler(cfg *config.Config, deps SetupHandlerDeps) *SetupHandler {
 	if deps.FirmwareVersion == nil {
 		deps.FirmwareVersion = func() string { return "" }
 	}
-	return &SetupHandler{cfg: cfg, deps: deps}
+	return &SetupHandler{cfg: cfg, deps: deps, auditLog: configlog.LoggerNoop{}}
+}
+
+// SetAuditLogger swaps in a real audit logger after construction. Wired
+// from agent.go where the configlog.DiskLogger is built. Calling with
+// nil reverts to the no-op logger.
+func (h *SetupHandler) SetAuditLogger(l auditLogger) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if l == nil {
+		h.auditLog = configlog.LoggerNoop{}
+		return
+	}
+	h.auditLog = l
+}
+
+// setupAuditSnapshot returns a JSON-serialisable copy of cfg.Setup with
+// the free-form Notes field passed through Redact() in case it ever
+// contains a key we want to keep out of the audit trail. Notes is
+// operator-supplied free text; the rest of the block is short metadata.
+func setupAuditSnapshot(s config.SetupConfig) map[string]any {
+	notesField := configlog.Redact(map[string]any{"notes": s.Notes})
+	return map[string]any{
+		"complete":       s.Complete,
+		"deviceName":     s.DeviceName,
+		"deviceLocation": s.DeviceLocation,
+		"notes":          notesField["notes"],
+		"completedAt":    s.CompletedAt,
+	}
+}
+
+// auditSetup is the shared back-end for the three setup mutations. It
+// never returns an error: a failed audit write is warn-logged and
+// dropped so the originating request always wins.
+func (h *SetupHandler) auditSetup(ctx context.Context, action string, prev, next config.SetupConfig, ok bool, errMsg string) {
+	if h.auditLog == nil {
+		return
+	}
+	var nextSnap any
+	if ok {
+		nextSnap = setupAuditSnapshot(next)
+	}
+	if err := h.auditLog.Append(ctx, configlog.Entry{
+		Action:   action,
+		Actor:    "operator",
+		Previous: setupAuditSnapshot(prev),
+		Next:     nextSnap,
+		OK:       ok,
+		Error:    errMsg,
+	}); err != nil {
+		log.Warn().Err(err).Str("action", action).Msg("audit append failed (non-fatal)")
+	}
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -174,19 +227,26 @@ func (h *SetupHandler) General(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.Lock()
+	prev := h.cfg.Setup
 	h.cfg.Setup.DeviceName = name
 	h.cfg.Setup.DeviceLocation = location
 	h.cfg.Setup.Notes = notes
 	saveErr := h.cfg.Save()
+	if saveErr != nil {
+		// Roll back the in-memory mutation so the audit `previous`
+		// (and any subsequent reader) reflects the on-disk truth.
+		h.cfg.Setup = prev
+	}
+	next := h.cfg.Setup
 	h.mu.Unlock()
 	if saveErr != nil {
-		// Save() also re-validates the config; if Path is unset (test
-		// harness), we still surface the error so callers know.
 		log.Warn().Err(saveErr).Msg("setup: save general failed")
+		h.auditSetup(r.Context(), "setup.general.set", prev, prev, false, "save: "+saveErr.Error())
 		writeError(w, http.StatusInternalServerError, "failed to persist setup")
 		return
 	}
 
+	h.auditSetup(r.Context(), "setup.general.set", prev, next, true, "")
 	writeJSON(w, http.StatusOK, h.snapshot())
 }
 
@@ -196,19 +256,26 @@ func (h *SetupHandler) General(w http.ResponseWriter, r *http.Request) {
 // CompletedAt. After this call the supervisor's IsSetupComplete getter
 // flips on the next tick and the AP is dropped (assuming uplink is up).
 // Empty body — no fields to validate beyond what /general already saved.
-func (h *SetupHandler) Complete(w http.ResponseWriter, _ *http.Request) {
+func (h *SetupHandler) Complete(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
+	prev := h.cfg.Setup
 	if strings.TrimSpace(h.cfg.Setup.DeviceName) == "" {
 		h.mu.Unlock()
+		h.auditSetup(r.Context(), "setup.complete", prev, prev, false, "deviceName must be set before completing setup")
 		writeError(w, http.StatusBadRequest, "deviceName must be set before completing setup (POST /api/setup/general first)")
 		return
 	}
 	h.cfg.Setup.Complete = true
 	h.cfg.Setup.CompletedAt = time.Now().Unix()
 	saveErr := h.cfg.Save()
+	if saveErr != nil {
+		h.cfg.Setup = prev
+	}
+	next := h.cfg.Setup
 	h.mu.Unlock()
 	if saveErr != nil {
 		log.Warn().Err(saveErr).Msg("setup: save complete failed")
+		h.auditSetup(r.Context(), "setup.complete", prev, prev, false, "save: "+saveErr.Error())
 		writeError(w, http.StatusInternalServerError, "failed to persist setup completion")
 		return
 	}
@@ -216,6 +283,7 @@ func (h *SetupHandler) Complete(w http.ResponseWriter, _ *http.Request) {
 		Str("device_name", h.cfg.Setup.DeviceName).
 		Str("device_location", h.cfg.Setup.DeviceLocation).
 		Msg("setup wizard completed")
+	h.auditSetup(r.Context(), "setup.complete", prev, next, true, "")
 	writeJSON(w, http.StatusOK, h.snapshot())
 }
 
@@ -224,21 +292,28 @@ func (h *SetupHandler) Complete(w http.ResponseWriter, _ *http.Request) {
 // Reset — POST /api/setup/reset. Always requires BearerAuth (wired in
 // server.go outside the SetupGate group). Clears the general fields and
 // flips Complete=false so the wizard re-runs on the next reload.
-func (h *SetupHandler) Reset(w http.ResponseWriter, _ *http.Request) {
+func (h *SetupHandler) Reset(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
+	prev := h.cfg.Setup
 	h.cfg.Setup.Complete = false
 	h.cfg.Setup.DeviceName = ""
 	h.cfg.Setup.DeviceLocation = ""
 	h.cfg.Setup.Notes = ""
 	h.cfg.Setup.CompletedAt = 0
 	saveErr := h.cfg.Save()
+	if saveErr != nil {
+		h.cfg.Setup = prev
+	}
+	next := h.cfg.Setup
 	h.mu.Unlock()
 	if saveErr != nil {
 		log.Warn().Err(saveErr).Msg("setup: save reset failed")
+		h.auditSetup(r.Context(), "setup.reset", prev, prev, false, "save: "+saveErr.Error())
 		writeError(w, http.StatusInternalServerError, "failed to persist setup reset")
 		return
 	}
 	log.Warn().Msg("setup wizard state reset (will re-run on next AP raise)")
+	h.auditSetup(r.Context(), "setup.reset", prev, next, true, "")
 	writeJSON(w, http.StatusOK, h.snapshot())
 }
 

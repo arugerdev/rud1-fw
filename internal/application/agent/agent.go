@@ -24,6 +24,7 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/config"
 	"github.com/rud1-es/rud1-fw/internal/domain/device"
 	domainnet "github.com/rud1-es/rud1-fw/internal/domain/network"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/bootidentity"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/cloud"
 	connimpl "github.com/rud1-es/rud1-fw/internal/infrastructure/connectivity"
@@ -55,6 +56,7 @@ type Agent struct {
 	srv      *server.Server
 	usbipH   *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
 	revLog   *revlog.Logger         // nil when /var/lib/rud1/revocations isn't writable
+	auditLog *configlog.DiskLogger  // nil when /var/lib/rud1/audit isn't writable
 	lanMgr   *lan.Manager           // owns the LAN-routing iptables rules
 	connSup  *connimpl.Supervisor   // nil when auto-AP disabled or in simulated mode
 	sysstats *sysstat.Collector     // shared between HTTP handler + heartbeat loop
@@ -203,6 +205,23 @@ func New(cfg *config.Config) (*Agent, error) {
 		log.Info().Str("dir", revocationsDir).Msg("usbip: disk-backed revocation log enabled")
 	}
 
+	// Disk-backed config-mutation audit log: 14 days of daily-rotated
+	// JSONL under /var/lib/rud1/audit (or $TMPDIR/rud1-audit on
+	// simulated hardware so Windows dev exercises the same code
+	// path). Mirrors the revlog construction strategy: a failure to
+	// open is non-fatal, the agent boots and the handlers fall back
+	// to configlog.LoggerNoop via their default constructor.
+	auditDir := "/var/lib/rud1/audit"
+	if platform.SimulateHardware() {
+		auditDir = filepath.Join(os.TempDir(), "rud1-audit")
+	}
+	if al, err := configlog.New(auditDir, configlog.Options{}); err != nil {
+		log.Warn().Err(err).Str("dir", auditDir).Msg("audit disk log unavailable, audit endpoints will be empty")
+	} else {
+		a.auditLog = al
+		log.Info().Str("dir", auditDir).Msg("audit: disk-backed config audit log enabled")
+	}
+
 	identityH := handlers.NewIdentityHandler(bootID)
 
 	// Setup wizard — wired here so its health checkers can capture the
@@ -313,6 +332,21 @@ func New(cfg *config.Config) (*Agent, error) {
 		PerServer: cfg.System.ExternalNTPProbeTimeout,
 	})
 	sysNTPProbeCfgH := handlers.NewSystemNTPProbeConfigHandler(cfg, sysTimeHealthH)
+
+	// Audit hook-up: every config-mutating handler gets the same
+	// disk logger (or LoggerNoop when the dir isn't writable). The
+	// SetAuditLogger wiring is post-construction so handlers retain
+	// their zero-config NewXxx() constructors for tests.
+	if a.auditLog != nil {
+		sysTzH.SetAuditLogger(a.auditLog)
+		sysNTPProbeCfgH.SetAuditLogger(a.auditLog)
+		setupH.SetAuditLogger(a.auditLog)
+	}
+	var auditLogIface configlog.Logger = configlog.LoggerNoop{}
+	if a.auditLog != nil {
+		auditLogIface = a.auditLog
+	}
+	sysAuditH := handlers.NewSystemAuditHandler(auditLogIface)
 	// Reset the time-health throttle on every PUT so the next heartbeat
 	// re-emits the (potentially changed) timeHealth block immediately,
 	// instead of waiting for the 1h keepalive window.
@@ -323,7 +357,7 @@ func New(cfg *config.Config) (*Agent, error) {
 		a.timeHealthThrottleMu.Unlock()
 	})
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH)
 
 	return a, nil
 }
@@ -424,6 +458,11 @@ func (a *Agent) Run(ctx context.Context) error {
 				log.Warn().Err(closeErr).Msg("revocation log close failed")
 			}
 		}
+		if a.auditLog != nil {
+			if closeErr := a.auditLog.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("audit log close failed")
+			}
+		}
 		return fmt.Errorf("server: %w", err)
 	case <-ctx.Done():
 		log.Info().Msg("agent context cancelled — shutting down")
@@ -438,6 +477,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		if a.revLog != nil {
 			if closeErr := a.revLog.Close(); closeErr != nil {
 				log.Warn().Err(closeErr).Msg("revocation log close failed")
+			}
+		}
+		if a.auditLog != nil {
+			if closeErr := a.auditLog.Close(); closeErr != nil {
+				log.Warn().Err(closeErr).Msg("audit log close failed")
 			}
 		}
 		return nil
