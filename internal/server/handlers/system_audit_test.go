@@ -1,11 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -438,7 +444,7 @@ func TestSystemAuditRetention_LastPruneAtAfterManualPrune(t *testing.T) {
 
 	t1 := t0.Add(3 * time.Hour)
 	now = t1
-	if err := l.PruneOld(); err != nil {
+	if _, err := l.PruneOld(); err != nil {
 		t.Fatalf("PruneOld: %v", err)
 	}
 
@@ -487,5 +493,289 @@ func TestSystemAudit_DefaultLimitAppliedWhenMissing(t *testing.T) {
 	}
 	if len(got.Entries) != auditDefaultLimit {
 		t.Fatalf("entries=%d, want %d", len(got.Entries), auditDefaultLimit)
+	}
+}
+
+// fakePruner is a test double for the retentionPruner contract used by
+// the Set handler. It records every SetMaxFiles + PruneOld invocation
+// (with their arguments) so tests can assert call counts, ordering,
+// and the exact retention bound passed in. Optionally returns a fixed
+// error from PruneOld to exercise the prune-fails-but-persist-wins
+// branch. Safe for concurrent use.
+type fakePruner struct {
+	mu             sync.Mutex
+	setMaxCalls    []int
+	pruneCalls     atomic.Int32
+	prunedPerCall  int
+	pruneErr       error
+	currentMaxFile int
+}
+
+func (f *fakePruner) SetMaxFiles(n int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prev := f.currentMaxFile
+	f.currentMaxFile = n
+	f.setMaxCalls = append(f.setMaxCalls, n)
+	return prev
+}
+
+func (f *fakePruner) PruneOld() (int, error) {
+	f.pruneCalls.Add(1)
+	return f.prunedPerCall, f.pruneErr
+}
+
+func (f *fakePruner) lastSetMax() (int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.setMaxCalls) == 0 {
+		return 0, false
+	}
+	return f.setMaxCalls[len(f.setMaxCalls)-1], true
+}
+
+// retentionTestEnv wraps the on-disk pieces a Set test needs: a config
+// loaded from a writable temp YAML so cfg.Save() round-trips, plus a
+// stubbable pruner the test can interrogate.
+type retentionTestEnv struct {
+	cfg    *config.Config
+	pruner *fakePruner
+	h      *SystemAuditRetentionHandler
+	router *chi.Mux
+}
+
+func newRetentionSetEnv(t *testing.T, initialDays int) *retentionTestEnv {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	body := fmt.Sprintf(`
+server:
+  host: "127.0.0.1"
+  port: 8080
+  auth_token: "t"
+system:
+  audit_retention_days: %d
+`, initialDays)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	pruner := &fakePruner{currentMaxFile: cfg.System.AuditRetentionDaysOrDefault()}
+	h := NewSystemAuditRetentionHandler(cfg, nil)
+	h.setPrunerForTest(pruner)
+	r := chi.NewRouter()
+	r.Get("/api/system/audit/retention", h.Get)
+	r.Put("/api/system/audit/retention", h.Set)
+	return &retentionTestEnv{cfg: cfg, pruner: pruner, h: h, router: r}
+}
+
+func putRetention(t *testing.T, r *chi.Mux, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "/api/system/audit/retention", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	return rr
+}
+
+// TestSystemAuditRetention_Set_Shrink_TriggersImmediatePrune covers the
+// happy path: 14 → 3 must persist, reconfigure the live retention
+// bound, AND fire one PruneOld so out-of-window day-files vanish.
+func TestSystemAuditRetention_Set_Shrink_TriggersImmediatePrune(t *testing.T) {
+	env := newRetentionSetEnv(t, 14)
+	env.pruner.prunedPerCall = 11
+
+	rr := putRetention(t, env.router, `{"days":3}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := env.cfg.System.AuditRetentionDays; got != 3 {
+		t.Fatalf("persisted days=%d, want 3", got)
+	}
+	if env.pruner.pruneCalls.Load() != 1 {
+		t.Fatalf("PruneOld calls=%d, want 1", env.pruner.pruneCalls.Load())
+	}
+	last, ok := env.pruner.lastSetMax()
+	if !ok || last != 3 {
+		t.Fatalf("SetMaxFiles last=%d ok=%v, want 3 true", last, ok)
+	}
+}
+
+// TestSystemAuditRetention_Set_Grow_NoPrune covers 3 → 14: nothing on
+// disk falls outside the new (wider) window, so PruneOld must NOT run.
+// SetMaxFiles still runs so future appends honour the new bound — but
+// the iter-39 contract is specifically about prune-on-shrink.
+func TestSystemAuditRetention_Set_Grow_NoPrune(t *testing.T) {
+	env := newRetentionSetEnv(t, 3)
+
+	rr := putRetention(t, env.router, `{"days":14}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := env.cfg.System.AuditRetentionDays; got != 14 {
+		t.Fatalf("persisted days=%d, want 14", got)
+	}
+	if env.pruner.pruneCalls.Load() != 0 {
+		t.Fatalf("PruneOld calls=%d, want 0 on grow", env.pruner.pruneCalls.Load())
+	}
+}
+
+// TestSystemAuditRetention_Set_Unchanged_NoPrune covers the
+// no-op-mutation path: same value in, same value out, no prune.
+func TestSystemAuditRetention_Set_Unchanged_NoPrune(t *testing.T) {
+	env := newRetentionSetEnv(t, 7)
+
+	rr := putRetention(t, env.router, `{"days":7}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if env.pruner.pruneCalls.Load() != 0 {
+		t.Fatalf("PruneOld calls=%d, want 0 on unchanged", env.pruner.pruneCalls.Load())
+	}
+}
+
+// TestSystemAuditRetention_Set_PruneError_Returns200 mirrors the
+// timezone handler's "audit append failure never propagates" pattern:
+// when the persistence wins but the prune sweep fails, the operator
+// still gets a 200 (their config did land) and the agent logs the
+// prune error. A 500 would falsely tell the cloud "retention change
+// rejected" when in fact it succeeded.
+func TestSystemAuditRetention_Set_PruneError_Returns200(t *testing.T) {
+	env := newRetentionSetEnv(t, 14)
+	env.pruner.pruneErr = errors.New("forced prune failure")
+
+	rr := putRetention(t, env.router, `{"days":3}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (prune failure must not propagate); body=%s", rr.Code, rr.Body.String())
+	}
+	if got := env.cfg.System.AuditRetentionDays; got != 3 {
+		t.Fatalf("persisted days=%d, want 3 (persist must win even when prune errors)", got)
+	}
+	if env.pruner.pruneCalls.Load() != 1 {
+		t.Fatalf("PruneOld calls=%d, want 1", env.pruner.pruneCalls.Load())
+	}
+}
+
+// TestSystemAuditRetention_Set_RejectsOutOfRange covers the validator:
+// values below MinAuditRetentionDays or above MaxAuditRetentionDays
+// must yield 400 + a stable error message AND must not mutate the
+// persisted retention or trigger a prune.
+func TestSystemAuditRetention_Set_RejectsOutOfRange(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"zero rejected", `{"days":0}`},
+		{"negative rejected", `{"days":-1}`},
+		{"over max rejected", fmt.Sprintf(`{"days":%d}`, config.MaxAuditRetentionDays+1)},
+		{"missing field rejected", `{}`},
+		{"unknown field rejected", `{"days":3,"extra":"x"}`},
+		{"invalid json rejected", `not-json`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newRetentionSetEnv(t, 14)
+			rr := putRetention(t, env.router, tc.body)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400; body=%s", rr.Code, rr.Body.String())
+			}
+			if got := env.cfg.System.AuditRetentionDays; got != 14 {
+				t.Fatalf("persisted days=%d, want 14 (must not mutate on bad request)", got)
+			}
+			if env.pruner.pruneCalls.Load() != 0 {
+				t.Fatalf("PruneOld calls=%d, want 0 on bad request", env.pruner.pruneCalls.Load())
+			}
+		})
+	}
+}
+
+// TestSystemAuditRetention_Set_ConcurrentNoDoublePrune fires two
+// concurrent shrink PUTs and asserts the handler's mutex serialises
+// them so the prune count matches the number of successful shrinks
+// (one per call). Without the mutex two concurrent shrinks could
+// race the SetMaxFiles → PruneOld pair and either skip a prune or
+// double-fire one against an inconsistent maxFiles snapshot.
+func TestSystemAuditRetention_Set_ConcurrentNoDoublePrune(t *testing.T) {
+	env := newRetentionSetEnv(t, 14)
+
+	const N = 8
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(i int) {
+			defer wg.Done()
+			// Mix of shrinks; same target value so the second-onwards
+			// PUTs are unchanged-no-ops and must NOT prune.
+			rr := putRetention(t, env.router, `{"days":3}`)
+			if rr.Code != http.StatusOK {
+				t.Errorf("[%d] status=%d, want 200; body=%s", i, rr.Code, rr.Body.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Exactly ONE shrink (14→3) must have triggered a prune; the rest
+	// see a no-change (3→3) and skip the prune entirely. Anything else
+	// means the mutex didn't serialise the persist-then-prune block.
+	if got := env.pruner.pruneCalls.Load(); got != 1 {
+		t.Fatalf("PruneOld total calls=%d, want exactly 1 across %d concurrent PUTs", got, N)
+	}
+	if got := env.cfg.System.AuditRetentionDays; got != 3 {
+		t.Fatalf("persisted days=%d, want 3", got)
+	}
+}
+
+// TestSystemAuditRetention_Set_RejectsBadMethod ensures a stray POST
+// to the same path falls through to chi's MethodNotAllowed instead of
+// silently invoking Set. Belt-and-braces against future router
+// refactors that might broaden the route's method match.
+func TestSystemAuditRetention_Set_RejectsBadMethod(t *testing.T) {
+	env := newRetentionSetEnv(t, 14)
+	req := httptest.NewRequest(http.MethodPost, "/api/system/audit/retention", bytes.NewBufferString(`{"days":3}`))
+	rr := httptest.NewRecorder()
+	env.router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status=%d, want 405", rr.Code)
+	}
+	if env.pruner.pruneCalls.Load() != 0 {
+		t.Fatalf("PruneOld calls=%d, want 0 on bad method", env.pruner.pruneCalls.Load())
+	}
+}
+
+// TestSystemAuditRetention_Set_NilPrunerSkipsCleanly: when the disk
+// logger is unavailable (read-only fs at boot) the handler keeps the
+// persistence path honest and just skips the prune step — no panic,
+// still a 200. Mirrors the Get handler's nil-logger tolerance.
+func TestSystemAuditRetention_Set_NilPrunerSkipsCleanly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	body := `
+server:
+  host: "127.0.0.1"
+  port: 8080
+  auth_token: "t"
+system:
+  audit_retention_days: 14
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	h := NewSystemAuditRetentionHandler(cfg, nil)
+	r := chi.NewRouter()
+	r.Put("/api/system/audit/retention", h.Set)
+
+	rr := putRetention(t, r, `{"days":3}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if got := cfg.System.AuditRetentionDays; got != 3 {
+		t.Fatalf("persisted days=%d, want 3", got)
 	}
 }

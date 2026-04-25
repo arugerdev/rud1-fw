@@ -126,7 +126,11 @@ func New(
 		// ntp-probe, setup wizard). See internal/infrastructure/audit/configlog.
 		r.Get("/api/system/audit", sysAuditH.List)
 		// Retention configuration + on-disk inventory for the audit log.
+		// PUT mutates the retention window at runtime; iter 39 wired an
+		// immediate prune-on-shrink so a freshly-tightened window is
+		// reflected on disk without waiting for the next rotation.
 		r.Get("/api/system/audit/retention", sysAuditRetH.Get)
+		r.Put("/api/system/audit/retention", sysAuditRetH.Set)
 		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Get("/api/percentiles/export", sysPctExpH.Export)
 		r.Post("/api/system/reboot", systemH.Reboot)

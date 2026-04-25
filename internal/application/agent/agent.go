@@ -423,6 +423,9 @@ func New(cfg *config.Config) (*Agent, error) {
 	}
 	sysAuditH := handlers.NewSystemAuditHandler(auditLogIface)
 	sysAuditRetH := handlers.NewSystemAuditRetentionHandler(cfg, a.auditLog)
+	if a.auditLog != nil {
+		sysAuditRetH.SetAuditLogger(a.auditLog)
+	}
 	// Reset the time-health throttle on every PUT so the next heartbeat
 	// re-emits the (potentially changed) timeHealth block immediately,
 	// instead of waiting for the 1h keepalive window.

@@ -116,7 +116,7 @@ func TestPruneOldKeepsNewest(t *testing.T) {
 			t.Fatalf("seed %s: %v", p, err)
 		}
 	}
-	if err := l.PruneOld(); err != nil {
+	if _, err := l.PruneOld(); err != nil {
 		t.Fatalf("PruneOld: %v", err)
 	}
 	entries, err := os.ReadDir(dir)
@@ -158,7 +158,7 @@ func TestPruneRespectsCustomMaxFiles(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer l.Close()
-	if err := l.PruneOld(); err != nil {
+	if _, err := l.PruneOld(); err != nil {
 		t.Fatalf("PruneOld: %v", err)
 	}
 	entries, err := os.ReadDir(dir)
@@ -200,7 +200,7 @@ func TestPruneDefaultMaxFilesIs14(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	defer l.Close()
-	if err := l.PruneOld(); err != nil {
+	if _, err := l.PruneOld(); err != nil {
 		t.Fatalf("PruneOld: %v", err)
 	}
 	entries, err := os.ReadDir(dir)
@@ -499,7 +499,7 @@ func TestStatsLastPruneAtAdvancesAfterPrune(t *testing.T) {
 	// Advance the clock and re-prune.
 	t1 := t0.Add(2 * time.Hour)
 	now = t1
-	if err := l.PruneOld(); err != nil {
+	if _, err := l.PruneOld(); err != nil {
 		t.Fatalf("PruneOld: %v", err)
 	}
 	got, err := l.Stats()

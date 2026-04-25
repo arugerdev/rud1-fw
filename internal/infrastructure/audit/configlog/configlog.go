@@ -155,7 +155,7 @@ func New(baseDir string, opts Options) (*DiskLogger, error) {
 		maxFiles: maxFiles,
 		now:      now,
 	}
-	if err := l.pruneOldLocked(); err != nil {
+	if _, err := l.pruneOldLocked(); err != nil {
 		// Non-fatal: the very next rotation will retry. Callers should
 		// not have to handle a startup-only retention error.
 		log.Debug().Err(err).Str("dir", cleaned).Msg("configlog: initial prune failed (non-fatal)")
@@ -188,7 +188,7 @@ func (l *DiskLogger) ensureOpenLocked(now time.Time) error {
 	}
 	l.file = f
 	l.dateKey = key
-	if err := l.pruneOldLocked(); err != nil {
+	if _, err := l.pruneOldLocked(); err != nil {
 		log.Debug().Err(err).Msg("configlog: post-rotation prune failed (non-fatal)")
 	}
 	return nil
@@ -369,30 +369,60 @@ func readJSONLFile(path string) ([]Entry, error) {
 }
 
 // PruneOld is exposed so tests can assert retention directly. The
-// regular path runs after every rotation.
-func (l *DiskLogger) PruneOld() error {
+// regular path runs after every rotation. The returned count is the
+// number of day-files actually removed; zero means the on-disk set
+// already fit within the active retention window.
+func (l *DiskLogger) PruneOld() (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.pruneOldLocked()
 }
 
-func (l *DiskLogger) pruneOldLocked() error {
+// SetMaxFiles reconfigures the retention window in-place and returns
+// the previous bound. Values <= 0 are coerced to the package default
+// (mirrors New's behaviour) so callers can pass through a raw operator
+// setting without their own clamp. Does NOT trigger a prune by itself —
+// the caller decides whether shrinking warrants an immediate sweep.
+func (l *DiskLogger) SetMaxFiles(n int) int {
+	if n <= 0 {
+		n = defaultMaxFiles
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	prev := l.maxFiles
+	l.maxFiles = n
+	return prev
+}
+
+// MaxFiles returns the active retention bound. Used by handlers that
+// need to compare a proposed retention against the live value before
+// deciding whether to prune.
+func (l *DiskLogger) MaxFiles() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.maxFiles
+}
+
+func (l *DiskLogger) pruneOldLocked() (int, error) {
 	names, err := l.listFiles()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	l.lastPruneAt = l.now()
 	if len(names) <= l.maxFiles {
-		return nil
+		return 0, nil
 	}
 	toRemove := names[l.maxFiles:]
+	removed := 0
 	for _, n := range toRemove {
 		p := filepath.Join(l.baseDir, n)
 		if err := os.Remove(p); err != nil {
 			log.Debug().Err(err).Str("path", p).Msg("configlog: prune remove failed")
+			continue
 		}
+		removed++
 	}
-	return nil
+	return removed, nil
 }
 
 // Stats is the disk-inventory summary surfaced by the retention HTTP
