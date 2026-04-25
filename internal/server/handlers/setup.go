@@ -81,6 +81,12 @@ type SetupHandler struct {
 	deps     SetupHandlerDeps
 	mu       sync.Mutex
 	auditLog auditLogger // never nil after construction (LoggerNoop default)
+	// NTP wizard hooks — set post-construction by the agent's wiring once
+	// the time-health handler exists. Both may be nil in tests / dev:
+	// NTPApply still validates and persists, just without the live push
+	// or the immediate probe round-trip. See setup_ntp.go.
+	ntpApply SetupNTPProbeApplier
+	ntpProbe SetupNTPProber
 }
 
 // NewSetupHandler wires a SetupHandler around the live config + deps.

@@ -33,6 +33,7 @@ import (
 	netscanner "github.com/rud1-es/rud1-fw/internal/infrastructure/network"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/storage"
 	sysinfo "github.com/rud1-es/rud1-fw/internal/infrastructure/system"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/system/ntpprobe"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat/uptime"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
@@ -358,6 +359,19 @@ func New(cfg *config.Config) (*Agent, error) {
 		sysNTPProbeCfgH.SetAuditLogger(a.auditLog)
 		setupH.SetAuditLogger(a.auditLog)
 	}
+	// Wizard NTP step (iter 35) — connect the just-created
+	// time-health handler so POST /api/setup/ntp pushes its
+	// validated options live without a restart, and wire the
+	// SNTP prober so the wizard can show an immediate "✓ drift
+	// X.Ys" before the operator advances. Both hooks are
+	// post-construction (the time-health handler isn't built
+	// yet when NewSetupHandler runs).
+	setupH.SetSetupNTPHooks(
+		sysTimeHealthH.SetProbeOptions,
+		func(ctx context.Context, servers []string, perServer time.Duration) (*ntpprobe.Result, error) {
+			return ntpprobe.Query(ctx, servers, perServer, nil)
+		},
+	)
 	var auditLogIface configlog.Logger = configlog.LoggerNoop{}
 	if a.auditLog != nil {
 		auditLogIface = a.auditLog
@@ -867,7 +881,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// cloud needs to reflect or alert on. Currently just the effective
 	// audit-log retention so the cloud can warn when a device drops
 	// below an org-wide compliance default. Tiny payload, no throttling.
-	hbConfig := buildHeartbeatConfig(a.cfg)
+	hbConfig := buildHeartbeatConfig(a.cfg, a.auditLog)
 
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
@@ -1072,16 +1086,57 @@ func (a *Agent) buildHeartbeatAudit() (*cloud.HBAudit, string) {
 	return &cloud.HBAudit{Entries: entries, LastAt: newestAt}, newestFp
 }
 
+// auditStatsSource is the minimal interface buildHeartbeatConfig needs
+// from the on-disk audit logger to ship the iter-35 inventory stats.
+// Defined here (not in configlog) so the test can pass a fake without
+// touching the disk and the agent doesn't grow a circular dependency.
+type auditStatsSource interface {
+	Stats() (configlog.Stats, error)
+}
+
 // buildHeartbeatConfig captures the operator-tunable system config snapshot
 // the cloud needs on every heartbeat. Never returns nil — the cloud expects
 // at least the audit-retention floor so it can flag drift, and the
 // snapshot stays trivially small even as more fields are added in future
 // iterations. Uses the *Default accessor so the value reported is the
 // effective post-clamp window operators actually get at runtime.
-func buildHeartbeatConfig(cfg *config.Config) *cloud.HBConfigSnapshot {
-	return &cloud.HBConfigSnapshot{
+//
+// `auditLog` may be nil (dev hardware without a writable /var/lib/rud1/audit)
+// or may return an error mid-call (sudden permission flip); both cases
+// degrade gracefully — the retention-days field is still shipped, and
+// AuditRetentionStats stays nil so the cloud suppresses the coverage
+// chip rather than surface a misleading "0 entries" state.
+func buildHeartbeatConfig(cfg *config.Config, auditLog auditStatsSource) *cloud.HBConfigSnapshot {
+	out := &cloud.HBConfigSnapshot{
 		AuditRetentionDays: cfg.System.AuditRetentionDaysOrDefault(),
 	}
+	if auditLog == nil {
+		return out
+	}
+	stats, err := auditLog.Stats()
+	if err != nil {
+		// Don't fail the whole heartbeat over a transient stat error;
+		// just omit the inventory block. The cloud will keep its last
+		// known values (or render the missing-data chip on first ever
+		// heartbeat).
+		return out
+	}
+	hbStats := &cloud.HBAuditRetentionStats{
+		TotalEntries: stats.TotalEntries,
+		TotalBytes:   stats.TotalBytes,
+		FileCount:    stats.FileCount,
+	}
+	if !stats.OldestEntryAt.IsZero() {
+		hbStats.OldestEntryAt = stats.OldestEntryAt.UTC().Format(time.RFC3339)
+	}
+	if !stats.NewestEntryAt.IsZero() {
+		hbStats.NewestEntryAt = stats.NewestEntryAt.UTC().Format(time.RFC3339)
+	}
+	if !stats.LastPruneAt.IsZero() {
+		hbStats.LastPruneAt = stats.LastPruneAt.UTC().Format(time.RFC3339)
+	}
+	out.AuditRetentionStats = hbStats
+	return out
 }
 
 // applyClientPeers converges the live WireGuard server state toward the

@@ -99,6 +99,12 @@ func New(
 		r.Get("/api/setup/health", setupH.Health)
 		r.Post("/api/setup/general", setupH.General)
 		r.Post("/api/setup/complete", setupH.Complete)
+		// Wizard NTP probe step (iter 35). Curated defaults +
+		// validate/persist/probe one-shot — same gate semantics as the
+		// rest of the wizard: open before Setup.Complete=true, bearer
+		// after.
+		r.Get("/api/setup/ntp/defaults", setupH.NTPDefaults)
+		r.Post("/api/setup/ntp", setupH.NTPApply)
 	})
 
 	// Authenticated API routes.

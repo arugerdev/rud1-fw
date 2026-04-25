@@ -202,6 +202,27 @@ type HBConfigSnapshot struct {
 	// `cfg.System.AuditRetentionDaysOrDefault()`. The cloud uses it to
 	// flag drift against an org default on the per-device audit page.
 	AuditRetentionDays int `json:"auditRetentionDays,omitempty"`
+	// AuditRetentionStats (iter 35) is the disk-side inventory mirrored
+	// from `GET /api/system/audit/retention`. Omitted (`nil`) when the
+	// audit logger is unavailable (no /var/lib/rud1/audit, dev hardware)
+	// so older cloud schemas still round-trip cleanly. Cloud renders an
+	// "actual coverage" chip from these fields — useful when a Pi has
+	// been offline and the on-disk window is shorter than the configured
+	// retention.
+	AuditRetentionStats *HBAuditRetentionStats `json:"auditRetentionStats,omitempty"`
+}
+
+// HBAuditRetentionStats mirrors `audit/configlog.Stats` over the wire.
+// Time fields use RFC3339 (UTC) so the cloud can parse them with the
+// same Date constructor used elsewhere; nil means "unknown" — distinct
+// from "epoch zero" which would be a misconfiguration.
+type HBAuditRetentionStats struct {
+	TotalEntries  int    `json:"totalEntries"`
+	TotalBytes    int64  `json:"totalBytes"`
+	FileCount     int    `json:"fileCount"`
+	OldestEntryAt string `json:"oldestEntryAt,omitempty"` // RFC3339 UTC; "" when unknown
+	NewestEntryAt string `json:"newestEntryAt,omitempty"` // RFC3339 UTC; "" when unknown
+	LastPruneAt   string `json:"lastPruneAt,omitempty"`   // RFC3339 UTC; "" when unknown
 }
 
 // HBSetup mirrors `cfg.Setup` over the heartbeat. Only sent when at least
