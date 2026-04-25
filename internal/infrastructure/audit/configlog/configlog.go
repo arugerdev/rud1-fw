@@ -22,9 +22,11 @@ package configlog
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -106,6 +108,14 @@ type DiskLogger struct {
 const (
 	filenamePrefix = "audit-"
 	filenameSuffix = ".jsonl"
+	// gzipSuffix is appended to a rotated day-file's full filename
+	// (e.g. `audit-2026-04-23.jsonl.gz`). Iter 41 introduced
+	// transparent gzip compression of rotated archives so a long-lived
+	// box with 14-day retention does not balloon disk usage holding
+	// uncompressed JSONL — historical audit entries compress 8-15x
+	// because they are repetitive structured text. The active day-file
+	// (today's writer) stays uncompressed; rotation is the trigger.
+	gzipSuffix = ".gz"
 
 	// defaultMaxFiles keeps two weeks of history on disk by default.
 	// Audit entries are tiny (a few hundred bytes) so 14 days is well
@@ -173,14 +183,27 @@ func (l *DiskLogger) pathFor(key string) string {
 
 // ensureOpenLocked opens (or rotates to) the file for `now`'s date.
 // Must be called with l.mu held.
+//
+// Iter 41: when this rotates from one day to the next (i.e. an existing
+// open file is closed because the date key changed), the previous
+// day-file is gzip-compressed in place. Compression is best-effort —
+// failures (disk full, EPERM) leave the original `.jsonl` intact so the
+// next rotation can retry. The active writer never compresses; only
+// archived day-files do.
 func (l *DiskLogger) ensureOpenLocked(now time.Time) error {
 	key := dayKey(now)
 	if l.file != nil && l.dateKey == key {
 		return nil
 	}
+	// Capture the day key of the file we're about to close so we can
+	// archive it after the close. This is only set when we actually
+	// had an open file (i.e. an in-process rotation, not the first
+	// open since New()).
+	var prevKey string
 	if l.file != nil {
 		_ = l.file.Close()
 		l.file = nil
+		prevKey = l.dateKey
 	}
 	f, err := os.OpenFile(l.pathFor(key), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -188,8 +211,91 @@ func (l *DiskLogger) ensureOpenLocked(now time.Time) error {
 	}
 	l.file = f
 	l.dateKey = key
+	if prevKey != "" && prevKey != key {
+		// Best-effort: a gzip failure must not fail the rotation. The
+		// new active file is already open; the worst case is one extra
+		// uncompressed day-file on disk until the next rotation.
+		if err := compressArchivedFile(l.pathFor(prevKey)); err != nil {
+			log.Warn().Err(err).Str("path", l.pathFor(prevKey)).Msg("configlog: gzip of rotated day-file failed; leaving original intact")
+		}
+	}
 	if _, err := l.pruneOldLocked(); err != nil {
 		log.Debug().Err(err).Msg("configlog: post-rotation prune failed (non-fatal)")
+	}
+	return nil
+}
+
+// compressArchivedFile gzips `src` to `src.gz` atomically (write to
+// `src.gz.tmp` then rename) and removes the original on success. If any
+// step fails, the original `src` is left untouched and any partial
+// `src.gz.tmp` is best-effort cleaned. A pre-existing `src.gz` is
+// overwritten by the rename — this is safe because the source content
+// is what we just produced; a leftover `.gz.tmp` from a prior crash is
+// also overwritten (truncate on open).
+//
+// If `src` does not exist (e.g. a same-day "rotation" with no entries
+// yet, or a previous rotation already archived it), returns nil so
+// the caller can stay naive.
+func compressArchivedFile(src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open source: %w", err)
+	}
+	// We close `in` explicitly (not via defer) before os.Remove(src) so
+	// Windows — which refuses to delete an open handle — can drop the
+	// inode. Posix wouldn't mind either way; the explicit close costs
+	// nothing.
+
+	dst := src + gzipSuffix
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		_ = in.Close()
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	gz := gzip.NewWriter(out)
+	if _, err := io.Copy(gz, in); err != nil {
+		_ = gz.Close()
+		_ = out.Close()
+		_ = in.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("gzip copy: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		_ = out.Close()
+		_ = in.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("gzip close: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = in.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("fsync tmp: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		_ = in.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := in.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close source: %w", err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename: %w", err)
+	}
+	// At this point `dst` is durable. Removing the source is what makes
+	// the archival "in place"; if the remove fails (e.g. EPERM after a
+	// container remount), the on-disk state is still correct — the next
+	// PruneOld will see two filenames for the same day and take care of
+	// it eventually. Log so an operator can notice repeated misses.
+	if err := os.Remove(src); err != nil {
+		log.Warn().Err(err).Str("path", src).Msg("configlog: gzip succeeded but source removal failed; both files now on disk")
 	}
 	return nil
 }
@@ -224,9 +330,13 @@ func (l *DiskLogger) Append(_ context.Context, e Entry) error {
 	return nil
 }
 
-// listFiles returns the per-day filenames newest-first. Lexicographic
-// ordering on YYYY-MM-DD is also chronological so a reverse string
-// sort yields newest-first without parsing.
+// listFiles returns the per-day filenames newest-first. Iter 41
+// includes both `.jsonl` (today's active file plus any pre-iter-41
+// archive that hasn't been re-rotated yet) and `.jsonl.gz` (compressed
+// archives produced on rotation). Sorting is by the embedded YYYY-MM-DD
+// day key — both `.jsonl` and `.jsonl.gz` for the same day collapse to
+// identical day keys, but in normal operation only one variant exists
+// per day so the lexical reverse sort is still chronological.
 func (l *DiskLogger) listFiles() ([]string, error) {
 	entries, err := os.ReadDir(l.baseDir)
 	if err != nil {
@@ -238,13 +348,41 @@ func (l *DiskLogger) listFiles() ([]string, error) {
 			continue
 		}
 		n := e.Name()
-		if !strings.HasPrefix(n, filenamePrefix) || !strings.HasSuffix(n, filenameSuffix) {
+		if !isAuditFile(n) {
 			continue
 		}
 		names = append(names, n)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	// Sort by day key descending so newest comes first. We can't rely
+	// on plain reverse-string sort across mixed suffixes because
+	// `audit-2026-04-23.jsonl` < `audit-2026-04-23.jsonl.gz`
+	// lexically; collapsing both to the same day key keeps cross-file
+	// ordering correct in the (rare) overlap case.
+	sort.Slice(names, func(i, j int) bool {
+		return dayKeyFromName(names[i]) > dayKeyFromName(names[j])
+	})
 	return names, nil
+}
+
+// isAuditFile reports whether `name` is one of the configlog day-file
+// variants: `audit-YYYY-MM-DD.jsonl` (active or pre-iter-41 archive)
+// or `audit-YYYY-MM-DD.jsonl.gz` (post-iter-41 compressed archive).
+func isAuditFile(name string) bool {
+	if !strings.HasPrefix(name, filenamePrefix) {
+		return false
+	}
+	return strings.HasSuffix(name, filenameSuffix) ||
+		strings.HasSuffix(name, filenameSuffix+gzipSuffix)
+}
+
+// dayKeyFromName extracts the YYYY-MM-DD portion of an audit filename.
+// Returns "" for inputs that don't match the expected pattern; callers
+// should pre-filter via isAuditFile.
+func dayKeyFromName(name string) string {
+	trimmed := strings.TrimPrefix(name, filenamePrefix)
+	trimmed = strings.TrimSuffix(trimmed, gzipSuffix)
+	trimmed = strings.TrimSuffix(trimmed, filenameSuffix)
+	return trimmed
 }
 
 // List walks the on-disk JSONL files newest-first, applies the filter
@@ -339,6 +477,10 @@ func (l *DiskLogger) Total(opts ListOptions) (int, error) {
 // readJSONLFile decodes one JSONL file. Each line is parsed
 // independently; malformed lines are skipped with a debug log so one
 // bad entry doesn't discard the rest of the file.
+//
+// Iter 41: paths ending in `.gz` are transparently decompressed via
+// `compress/gzip`. The wrapper is created lazily so the stat/open cost
+// for plain `.jsonl` files is unchanged.
 func readJSONLFile(path string) ([]Entry, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -346,7 +488,17 @@ func readJSONLFile(path string) ([]Entry, error) {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	var r io.Reader = f
+	if strings.HasSuffix(path, gzipSuffix) {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, fmt.Errorf("configlog: gzip reader %q: %w", path, err)
+		}
+		defer gz.Close()
+		r = gz
+	}
+
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxScanLineSize)
 
 	var out []Entry
@@ -430,9 +582,21 @@ func (l *DiskLogger) pruneOldLocked() (int, error) {
 // and skips files we can't read. OldestEntryAt / NewestEntryAt /
 // LastPruneAt are zero-valued when unknown; callers convert zero to a
 // JSON-omitted pointer.
+//
+// Iter 41 split the byte accounting in two:
+//   - TotalBytes is the on-disk footprint (gzip-compressed bytes for
+//     archived day-files, raw bytes for the still-active file). This
+//     is what operators see in `du` and what the cloud heartbeat
+//     reports as `auditTotalBytes`.
+//   - EntryBytes is the sum of raw (uncompressed) JSONL bytes — useful
+//     for sizing the export endpoint and for showing operators the
+//     compression ratio. Best-effort: if a `.gz` file fails to
+//     decompress, that file's contribution is dropped from EntryBytes
+//     but its TotalBytes is still counted.
 type Stats struct {
 	TotalEntries  int
 	TotalBytes    int64
+	EntryBytes    int64
 	FileCount     int
 	OldestEntryAt time.Time
 	NewestEntryAt time.Time
@@ -472,6 +636,21 @@ func (l *DiskLogger) Stats() (Stats, error) {
 			continue
 		}
 		out.TotalEntries += len(entries)
+		// EntryBytes is the uncompressed JSONL footprint. For a plain
+		// `.jsonl` file that's just the on-disk size; for a `.jsonl.gz`
+		// archive we re-marshal each entry to estimate what the line
+		// occupied pre-gzip. This is approximate (whitespace/escape
+		// differences vs. the original encoder) but stays within ~1%
+		// for the structured shapes audit emits.
+		if strings.HasSuffix(name, gzipSuffix) {
+			for i := range entries {
+				if buf, err := json.Marshal(entries[i]); err == nil {
+					out.EntryBytes += int64(len(buf)) + 1 // trailing \n
+				}
+			}
+		} else {
+			out.EntryBytes += fi.Size()
+		}
 	}
 
 	// Filenames are newest-first (reverse-sorted YYYY-MM-DD), so the
@@ -507,10 +686,10 @@ func boundaryAt(path string, last bool) (time.Time, bool) {
 		}
 	}
 	base := filepath.Base(path)
-	if !strings.HasPrefix(base, filenamePrefix) || !strings.HasSuffix(base, filenameSuffix) {
+	if !isAuditFile(base) {
 		return time.Time{}, false
 	}
-	key := strings.TrimSuffix(strings.TrimPrefix(base, filenamePrefix), filenameSuffix)
+	key := dayKeyFromName(base)
 	t, err := time.ParseInLocation("2006-01-02", key, time.UTC)
 	if err != nil {
 		return time.Time{}, false
