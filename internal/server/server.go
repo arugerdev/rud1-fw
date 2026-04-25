@@ -56,6 +56,7 @@ func New(
 	setupH *handlers.SetupHandler,
 	sysTzH *handlers.SystemTimezoneHandler,
 	sysTimeHealthH *handlers.SystemTimeHealthHandler,
+	sysNTPProbeCfgH *handlers.SystemNTPProbeConfigHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -111,6 +112,8 @@ func New(
 		r.Get("/api/system/timezone", sysTzH.Get)
 		r.Post("/api/system/timezone", sysTzH.Set)
 		r.Get("/api/system/time-health", sysTimeHealthH.TimeHealth)
+		r.Get("/api/system/ntp-probe-config", sysNTPProbeCfgH.Get)
+		r.Put("/api/system/ntp-probe-config", sysNTPProbeCfgH.Set)
 		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Get("/api/percentiles/export", sysPctExpH.Export)
 		r.Post("/api/system/reboot", systemH.Reboot)

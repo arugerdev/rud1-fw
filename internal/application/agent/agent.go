@@ -75,7 +75,10 @@ type Agent struct {
 	// timeHealth throttling: the snapshot is small but a clean device with
 	// no warnings repeats the same payload every heartbeat. We send on any
 	// state change (rising/falling warnings, NTP sync flip, TZ source flip)
-	// and at most once per hour as a keepalive otherwise.
+	// and at most once per hour as a keepalive otherwise. The mutex
+	// serialises throttle resets (issued by the runtime NTP-probe-config
+	// PUT handler) against the heartbeat read/update path.
+	timeHealthThrottleMu      sync.Mutex
 	lastTimeHealthSent        time.Time
 	lastTimeHealthFingerprint string
 }
@@ -309,8 +312,18 @@ func New(cfg *config.Config) (*Agent, error) {
 		Servers:   cfg.System.ExternalNTPServers,
 		PerServer: cfg.System.ExternalNTPProbeTimeout,
 	})
+	sysNTPProbeCfgH := handlers.NewSystemNTPProbeConfigHandler(cfg, sysTimeHealthH)
+	// Reset the time-health throttle on every PUT so the next heartbeat
+	// re-emits the (potentially changed) timeHealth block immediately,
+	// instead of waiting for the 1h keepalive window.
+	sysNTPProbeCfgH.SetOnApply(func(_ handlers.ExternalNTPProbeOptions) {
+		a.timeHealthThrottleMu.Lock()
+		a.lastTimeHealthSent = time.Time{}
+		a.lastTimeHealthFingerprint = ""
+		a.timeHealthThrottleMu.Unlock()
+	})
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH)
 
 	return a, nil
 }
@@ -806,8 +819,10 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// the previous (lastSent, lastFp) untouched, so the next tick still
 	// fires the rising-edge or keepalive condition.
 	if hbTimeHealthEmit {
+		a.timeHealthThrottleMu.Lock()
 		a.lastTimeHealthSent = time.Now()
 		a.lastTimeHealthFingerprint = hbTimeHealthFp
+		a.timeHealthThrottleMu.Unlock()
 	}
 
 	// Two response variants: "unclaimed" (no Device yet — waiting for the
@@ -881,7 +896,11 @@ func (a *Agent) buildHeartbeatTimeHealth(ctx context.Context, now time.Time) (*c
 		return nil, "", false
 	}
 
-	block, fp, emit := buildTimeHealthBlock(snap, now, now, a.lastTimeHealthSent, a.lastTimeHealthFingerprint)
+	a.timeHealthThrottleMu.Lock()
+	lastSent := a.lastTimeHealthSent
+	lastFp := a.lastTimeHealthFingerprint
+	a.timeHealthThrottleMu.Unlock()
+	block, fp, emit := buildTimeHealthBlock(snap, now, now, lastSent, lastFp)
 	if !emit {
 		return nil, fp, false
 	}

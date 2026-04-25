@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -56,7 +57,13 @@ type ExternalNTPProbeOptions struct {
 // settings. The zero-value (empty options) keeps the legacy behaviour:
 // the handler returns the same response shape, simply without the
 // `clockSkewSeconds` field populated.
+//
+// Probe options are stored under a small mutex so the runtime config
+// endpoint (PUT /api/system/ntp-probe-config, iter 29) can mutate them
+// without restarting the agent. Reads happen on every request so the
+// new state propagates immediately to the next snapshot.
 type SystemTimeHealthHandler struct {
+	mu    sync.RWMutex
 	probe ExternalNTPProbeOptions
 }
 
@@ -81,6 +88,37 @@ func NewSystemTimeHealthHandlerWithProbe(opts ExternalNTPProbeOptions) *SystemTi
 		opts.PerServer = 2 * time.Second
 	}
 	return &SystemTimeHealthHandler{probe: opts}
+}
+
+// ProbeOptions returns a snapshot of the currently active probe
+// options. Used by the NTP probe config GET endpoint to surface the
+// live state, which may differ from cfg.System if a PUT happened
+// after startup.
+func (h *SystemTimeHealthHandler) ProbeOptions() ExternalNTPProbeOptions {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := h.probe
+	if out.Servers != nil {
+		out.Servers = append([]string(nil), out.Servers...)
+	}
+	return out
+}
+
+// SetProbeOptions atomically replaces the live probe configuration.
+// Called by the NTP probe config PUT endpoint after the new options
+// have been validated and persisted to config.yaml. ProbeNow is
+// preserved across mutations so test injections survive a config
+// change.
+func (h *SystemTimeHealthHandler) SetProbeOptions(opts ExternalNTPProbeOptions) {
+	if opts.PerServer <= 0 {
+		opts.PerServer = 2 * time.Second
+	}
+	h.mu.Lock()
+	if opts.ProbeNow == nil {
+		opts.ProbeNow = h.probe.ProbeNow
+	}
+	h.probe = opts
+	h.mu.Unlock()
 }
 
 // timesyncdState is the parsed verdict for systemd-timesyncd. We expose the
@@ -126,7 +164,10 @@ func (h *SystemTimeHealthHandler) TimeHealth(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
-	resp := snapshotTimeHealth(ctx, h.probe)
+	h.mu.RLock()
+	probe := h.probe
+	h.mu.RUnlock()
+	resp := snapshotTimeHealth(ctx, probe)
 	writeJSON(w, http.StatusOK, resp)
 }
 
