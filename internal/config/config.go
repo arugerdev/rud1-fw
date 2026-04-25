@@ -56,7 +56,44 @@ type SystemConfig struct {
 	// ExternalNTPProbeTimeout caps each per-server attempt. 2s is the
 	// default and matches the heartbeat's 1s budget headroom.
 	ExternalNTPProbeTimeout time.Duration `yaml:"external_ntp_probe_timeout"`
+	// AuditRetentionDays caps how many daily-rotated config-mutation
+	// audit log files the agent keeps on disk. 0 (the default) maps to
+	// 14 days — two weeks is enough for most operators to triage
+	// recent changes. Deployments with stricter compliance windows can
+	// crank this up; the value is clamped to [1, 365] in Validate so a
+	// stray edit can't disable retention or balloon disk use. Operators
+	// set it in config.yaml and restart the agent — there is no runtime
+	// HTTP toggle by design.
+	AuditRetentionDays int `yaml:"audit_retention_days"`
 }
+
+// AuditRetentionDaysOrDefault returns the effective retention window in
+// days, applying the same default + clamp the validator would. It is
+// intended for the agent boot path where a config-set-but-Validate-not-
+// yet-called code path could otherwise smuggle a 0 into configlog.New
+// (which would itself default to 14 — the goal here is to keep the
+// fallback in one place so future tweaks land in both validation and
+// runtime wiring).
+func (s SystemConfig) AuditRetentionDaysOrDefault() int {
+	d := s.AuditRetentionDays
+	if d <= 0 {
+		return DefaultAuditRetentionDays
+	}
+	if d > MaxAuditRetentionDays {
+		return MaxAuditRetentionDays
+	}
+	return d
+}
+
+// DefaultAuditRetentionDays / MaxAuditRetentionDays parameterise the
+// audit-log retention window. The default mirrors configlog's own
+// historical default (two weeks); the max is one year — a soft ceiling
+// that keeps disk use bounded for low-traffic devices that may run for
+// years without operator attention.
+const (
+	DefaultAuditRetentionDays = 14
+	MaxAuditRetentionDays     = 365
+)
 
 // NetworkConfig controls the WiFi / cellular / setup-AP subsystem.
 //
@@ -248,6 +285,7 @@ func Default() *Config {
 			ExternalNTPProbeEnabled: false,
 			ExternalNTPServers:      nil,
 			ExternalNTPProbeTimeout: 2 * time.Second,
+			AuditRetentionDays:      DefaultAuditRetentionDays,
 		},
 	}
 }
@@ -298,6 +336,15 @@ func (c *Config) Validate() error {
 		if c.Cloud.APISecret == "" {
 			return fmt.Errorf("cloud.api_secret is required when cloud is enabled")
 		}
+	}
+	// Audit retention: clamp into [1, 365] with 0 / negative meaning
+	// "use the default". We clamp rather than reject so a typo in
+	// config.yaml never prevents the agent from booting — operator
+	// surface (the audit log) is best-effort, not safety-critical.
+	if c.System.AuditRetentionDays <= 0 {
+		c.System.AuditRetentionDays = DefaultAuditRetentionDays
+	} else if c.System.AuditRetentionDays > MaxAuditRetentionDays {
+		c.System.AuditRetentionDays = MaxAuditRetentionDays
 	}
 	return nil
 }

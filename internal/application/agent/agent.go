@@ -217,21 +217,25 @@ func New(cfg *config.Config) (*Agent, error) {
 		log.Info().Str("dir", revocationsDir).Msg("usbip: disk-backed revocation log enabled")
 	}
 
-	// Disk-backed config-mutation audit log: 14 days of daily-rotated
-	// JSONL under /var/lib/rud1/audit (or $TMPDIR/rud1-audit on
-	// simulated hardware so Windows dev exercises the same code
-	// path). Mirrors the revlog construction strategy: a failure to
-	// open is non-fatal, the agent boots and the handlers fall back
-	// to configlog.LoggerNoop via their default constructor.
+	// Disk-backed config-mutation audit log: daily-rotated JSONL under
+	// /var/lib/rud1/audit (or $TMPDIR/rud1-audit on simulated hardware
+	// so Windows dev exercises the same code path). Retention defaults
+	// to 14 days but is configurable via cfg.System.AuditRetentionDays
+	// for deployments that need longer history (compliance audits,
+	// post-incident forensics). Mirrors the revlog construction
+	// strategy: a failure to open is non-fatal, the agent boots and
+	// the handlers fall back to configlog.LoggerNoop via their default
+	// constructor.
 	auditDir := "/var/lib/rud1/audit"
 	if platform.SimulateHardware() {
 		auditDir = filepath.Join(os.TempDir(), "rud1-audit")
 	}
-	if al, err := configlog.New(auditDir, configlog.Options{}); err != nil {
+	auditRetention := cfg.System.AuditRetentionDaysOrDefault()
+	if al, err := configlog.New(auditDir, configlog.Options{MaxFiles: auditRetention}); err != nil {
 		log.Warn().Err(err).Str("dir", auditDir).Msg("audit disk log unavailable, audit endpoints will be empty")
 	} else {
 		a.auditLog = al
-		log.Info().Str("dir", auditDir).Msg("audit: disk-backed config audit log enabled")
+		log.Info().Str("dir", auditDir).Int("retention_days", auditRetention).Msg("audit: disk-backed config audit log enabled")
 	}
 
 	identityH := handlers.NewIdentityHandler(bootID)

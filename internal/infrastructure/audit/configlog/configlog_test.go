@@ -133,6 +133,85 @@ func TestPruneOldKeepsNewest(t *testing.T) {
 	}
 }
 
+// TestPruneRespectsCustomMaxFiles seeds twenty dated files and asserts
+// the pruner honours a caller-supplied MaxFiles=7. This is the new
+// path exercised by config.System.AuditRetentionDays — without it, an
+// operator-set retention window would silently revert to the package
+// default at the first rotation.
+func TestPruneRespectsCustomMaxFiles(t *testing.T) {
+	dir := t.TempDir()
+	// 20 daily files, oldest first.
+	dates := []string{
+		"2026-04-01", "2026-04-02", "2026-04-03", "2026-04-04", "2026-04-05",
+		"2026-04-06", "2026-04-07", "2026-04-08", "2026-04-09", "2026-04-10",
+		"2026-04-11", "2026-04-12", "2026-04-13", "2026-04-14", "2026-04-15",
+		"2026-04-16", "2026-04-17", "2026-04-18", "2026-04-19", "2026-04-20",
+	}
+	for _, d := range dates {
+		p := filepath.Join(dir, "audit-"+d+".jsonl")
+		if err := os.WriteFile(p, []byte(`{"at":0,"action":"x","actor":"operator","ok":true}`+"\n"), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+	}
+	l, err := New(dir, Options{MaxFiles: 7})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+	if err := l.PruneOld(); err != nil {
+		t.Fatalf("PruneOld: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 7 {
+		t.Fatalf("after prune got %d files, want 7", len(entries))
+	}
+	// The 7 newest are 2026-04-14 .. 2026-04-20; nothing older may
+	// survive.
+	for _, e := range entries {
+		if e.Name() < "audit-2026-04-14.jsonl" {
+			t.Fatalf("retained file older than window: %s", e.Name())
+		}
+	}
+}
+
+// TestPruneDefaultMaxFilesIs14: Options{} (zero MaxFiles) must fall
+// back to defaultMaxFiles=14, mirroring the documented contract that
+// config.System.AuditRetentionDaysOrDefault relies on.
+func TestPruneDefaultMaxFilesIs14(t *testing.T) {
+	dir := t.TempDir()
+	// 20 dated files; default retention should keep the newest 14.
+	dates := []string{
+		"2026-04-01", "2026-04-02", "2026-04-03", "2026-04-04", "2026-04-05",
+		"2026-04-06", "2026-04-07", "2026-04-08", "2026-04-09", "2026-04-10",
+		"2026-04-11", "2026-04-12", "2026-04-13", "2026-04-14", "2026-04-15",
+		"2026-04-16", "2026-04-17", "2026-04-18", "2026-04-19", "2026-04-20",
+	}
+	for _, d := range dates {
+		p := filepath.Join(dir, "audit-"+d+".jsonl")
+		if err := os.WriteFile(p, []byte(`{"at":0,"action":"x","actor":"operator","ok":true}`+"\n"), 0o644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	l, err := New(dir, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer l.Close()
+	if err := l.PruneOld(); err != nil {
+		t.Fatalf("PruneOld: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != defaultMaxFiles {
+		t.Fatalf("default-retention prune got %d files, want %d", len(entries), defaultMaxFiles)
+	}
+}
+
 // TestSkipsMalformedLines: a corrupt line interleaved with valid ones
 // must NOT cause List to error or drop the surrounding good records.
 func TestSkipsMalformedLines(t *testing.T) {
