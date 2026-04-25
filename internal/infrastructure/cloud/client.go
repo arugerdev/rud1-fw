@@ -115,6 +115,16 @@ type HeartbeatPayload struct {
 	// remains the source of truth for the richer fields (Now, Timesyncd,
 	// UTCOffset, Simulated).
 	TimeHealth *HBTimeHealth `json:"timeHealth,omitempty"`
+	// Audit is a rolling snapshot of the most recent config-mutation
+	// audit entries (iter 30 disk-backed JSONL log). The agent forwards
+	// up to MaxHBAuditEntries newest-first per heartbeat and the cloud
+	// dedups by (deviceId, at, action, actor) so retransmissions are
+	// idempotent. Omitted entirely when the audit log is unavailable
+	// (LoggerNoop fallback) or when the most recent entries already
+	// match the cursor the cloud last persisted (tracked locally in
+	// `lastForwardedAuditAt`). Operators see the trail under
+	// /dashboard/devices/[id]/audit without having to SSH into the Pi.
+	Audit *HBAudit `json:"audit,omitempty"`
 }
 
 // HBTimeHealth is the compact subset of the time-health response that the
@@ -136,6 +146,40 @@ type HBTimeHealth struct {
 	// configured server failed — the cloud distinguishes "no probe data"
 	// from "probe says drift is exactly zero". See iter 28 design notes.
 	ClockSkewSeconds *float64 `json:"clockSkewSeconds,omitempty"`
+}
+
+// MaxHBAuditEntries caps the number of audit entries the agent forwards
+// per heartbeat. The audit log is intentionally low-traffic (operator
+// edits to TZ / NTP / setup happen a handful of times per day at most),
+// so a 16-entry rolling window comfortably covers a typical incident
+// response without ballooning heartbeat size. The cloud dedups by
+// (deviceId, at, action, actor) so retransmissions are idempotent.
+const MaxHBAuditEntries = 16
+
+// HBAuditEntry is one config-mutation audit row forwarded over the
+// heartbeat. Field-for-field mirror of `configlog.Entry` (sans the
+// internal Error→Error truncation logic) so the cloud schema can stay
+// stable even if the firmware extends the on-disk format. Previous and
+// Next are arbitrary JSON values per the configlog contract.
+type HBAuditEntry struct {
+	At         int64  `json:"at"`
+	Action     string `json:"action"`
+	Actor      string `json:"actor,omitempty"`
+	ResourceID string `json:"resourceId,omitempty"`
+	Previous   any    `json:"previous,omitempty"`
+	Next       any    `json:"next,omitempty"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+}
+
+// HBAudit wraps the rolling audit-entry batch the agent ships per
+// heartbeat. `Entries` is newest-first and capped at MaxHBAuditEntries.
+// `LastAt` echoes the largest `at` in the batch so the cloud can compute
+// "newest forwarded" without scanning the slice — useful for the audit
+// page's freshness chip.
+type HBAudit struct {
+	Entries []HBAuditEntry `json:"entries"`
+	LastAt  int64          `json:"lastAt,omitempty"`
 }
 
 // HBSetup mirrors `cfg.Setup` over the heartbeat. Only sent when at least

@@ -83,6 +83,18 @@ type Agent struct {
 	timeHealthThrottleMu      sync.Mutex
 	lastTimeHealthSent        time.Time
 	lastTimeHealthFingerprint string
+
+	// Audit forwarding fingerprint (iter 31). Stores the joined "at|action"
+	// of the newest entry shipped in the previous heartbeat so we can
+	// skip emitting the Audit block when nothing has changed (typical
+	// steady-state — operators flip TZ/NTP a handful of times per day).
+	// Cloud also dedups by `(deviceId, at, action, actor)` so a missed
+	// heartbeat replaying the same window is idempotent. Reset to ""
+	// on agent restart — the next heartbeat re-ships the rolling
+	// window unconditionally, which is exactly what we want for a
+	// quick fast-forward of the cloud-side trail.
+	auditMu               sync.Mutex
+	lastForwardedAuditFp  string
 }
 
 // New creates an Agent from the given Config.
@@ -836,6 +848,15 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// throttle state so the next tick retries with a fresh budget.
 	hbTimeHealth, hbTimeHealthFp, hbTimeHealthEmit := a.buildHeartbeatTimeHealth(ctx, time.Now())
 
+	// ── Audit (iter 31, rolling snapshot) ────────────────────────────────
+	// Newest-first window of up to MaxHBAuditEntries config-mutation
+	// entries from the local JSONL log. The agent ships the block only
+	// when the newest entry's fingerprint changed since the last
+	// successful heartbeat — steady-state heartbeats omit the field.
+	// Cloud dedups by (deviceId, at, action, actor) so a missed heartbeat
+	// replaying the same window is idempotent.
+	hbAudit, hbAuditFp := a.buildHeartbeatAudit()
+
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
 		RegistrationPin:  a.identity.RegistrationPin,
@@ -850,6 +871,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		System:           hbSystem,
 		Setup:            hbSetup,
 		TimeHealth:       hbTimeHealth,
+		Audit:            hbAudit,
 	}
 
 	resp, err := a.cloud.Heartbeat(ctx, payload)
@@ -867,6 +889,15 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		a.lastTimeHealthSent = time.Now()
 		a.lastTimeHealthFingerprint = hbTimeHealthFp
 		a.timeHealthThrottleMu.Unlock()
+	}
+
+	// Audit fingerprint advance (iter 31). Only commit on success so a
+	// transport failure replays the same window next tick. `hbAuditFp`
+	// is empty when we shipped no entries (already caught up).
+	if hbAudit != nil && hbAuditFp != "" {
+		a.auditMu.Lock()
+		a.lastForwardedAuditFp = hbAuditFp
+		a.auditMu.Unlock()
 	}
 
 	// Two response variants: "unclaimed" (no Device yet — waiting for the
@@ -958,6 +989,74 @@ func (a *Agent) buildHeartbeatTimeHealth(ctx context.Context, now time.Time) (*c
 		CapturedAt:       block.CapturedAt,
 		ClockSkewSeconds: block.ClockSkewSeconds,
 	}, fp, true
+}
+
+// auditEntryFingerprint is a stable per-entry signature used to decide
+// whether the heartbeat needs to ship the audit block at all. Cloud
+// dedup is done on (deviceId, at, action, actor), so any change to those
+// fields counts as "new content"; we deliberately exclude Previous/Next
+// from the fingerprint so a benign re-emission of an in-progress
+// mutation doesn't trigger a redundant ship.
+func auditEntryFingerprint(e configlog.Entry) string {
+	return fmt.Sprintf("%d|%s|%s|%s", e.At, e.Action, e.Actor, e.ResourceID)
+}
+
+// buildHeartbeatAudit returns the rolling-window audit batch to forward
+// in this heartbeat tick plus the fingerprint the caller must commit on
+// a successful send. Returns (nil, "") when the audit log is unavailable,
+// the log is empty, or the newest entry's fingerprint matches the
+// previously-forwarded one (steady state — no need to retransmit).
+//
+// We always ship the *latest* MaxHBAuditEntries entries (newest-first)
+// instead of cursor-deltas: the audit log is intentionally low-traffic,
+// the cloud dedups by (deviceId, at, action, actor), and a rolling
+// snapshot gives us a clean self-healing path on agent restart (the
+// fingerprint resets to "" so the next heartbeat re-ships the window
+// and the cloud's createMany skipDuplicates absorbs any overlap).
+func (a *Agent) buildHeartbeatAudit() (*cloud.HBAudit, string) {
+	if a.auditLog == nil {
+		return nil, ""
+	}
+	rows, err := a.auditLog.List(configlog.ListOptions{
+		Limit: cloud.MaxHBAuditEntries,
+	})
+	if err != nil {
+		log.Debug().Err(err).Msg("heartbeat: audit list failed — omitting audit block")
+		return nil, ""
+	}
+	if len(rows) == 0 {
+		return nil, ""
+	}
+
+	a.auditMu.Lock()
+	prevFp := a.lastForwardedAuditFp
+	a.auditMu.Unlock()
+
+	// Newest entry's fingerprint matches the last successful ship ⇒
+	// steady state, omit the block entirely.
+	newestFp := auditEntryFingerprint(rows[0])
+	if newestFp == prevFp {
+		return nil, ""
+	}
+
+	entries := make([]cloud.HBAuditEntry, 0, len(rows))
+	var newestAt int64
+	for _, e := range rows {
+		entries = append(entries, cloud.HBAuditEntry{
+			At:         e.At,
+			Action:     e.Action,
+			Actor:      e.Actor,
+			ResourceID: e.ResourceID,
+			Previous:   e.Previous,
+			Next:       e.Next,
+			OK:         e.OK,
+			Error:      e.Error,
+		})
+		if e.At > newestAt {
+			newestAt = e.At
+		}
+	}
+	return &cloud.HBAudit{Entries: entries, LastAt: newestAt}, newestFp
 }
 
 // applyClientPeers converges the live WireGuard server state toward the
