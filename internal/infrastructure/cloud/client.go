@@ -106,6 +106,30 @@ type HeartbeatPayload struct {
 	// first-boot mode (AP raised, /api/setup/* open) — the cloud surfaces
 	// that as a dedicated banner with a "Configure now" CTA.
 	Setup *HBSetup `json:"setup,omitempty"`
+	// TimeHealth is a compact snapshot of TZ + NTP state, populated only
+	// when the agent's throttle says it's worth shipping (rising/falling
+	// edge of any warning, NTP sync flip, TZ source flip — or once an
+	// hour as a keepalive). Otherwise omitted to keep heartbeats small.
+	// The cloud uses it to render a dedicated banner on the device
+	// detail page; the operator-facing /api/system/time-health endpoint
+	// remains the source of truth for the richer fields (Now, Timesyncd,
+	// UTCOffset, Simulated).
+	TimeHealth *HBTimeHealth `json:"timeHealth,omitempty"`
+}
+
+// HBTimeHealth is the compact subset of the time-health response that the
+// cloud needs to render its banner. The HTTP-only fields (Now, Timesyncd,
+// UTCOffsetSeconds, Simulated) are deliberately omitted: the cloud
+// already knows the heartbeat's wall-clock arrival time, and the deeper
+// systemd-timesyncd verdict is a debugging aid, not a banner input.
+type HBTimeHealth struct {
+	Timezone        string   `json:"timezone"`
+	TimezoneSource  string   `json:"timezoneSource"`
+	IsUTC           bool     `json:"isUTC"`
+	NTPSynchronized bool     `json:"ntpSynchronized"`
+	NTPEnabled      bool     `json:"ntpEnabled"`
+	Warnings        []string `json:"warnings,omitempty"`
+	CapturedAt      string   `json:"capturedAt"` // RFC3339, agent local clock
 }
 
 // HBSetup mirrors `cfg.Setup` over the heartbeat. Only sent when at least

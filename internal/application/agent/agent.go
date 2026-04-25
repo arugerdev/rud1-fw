@@ -71,6 +71,13 @@ type Agent struct {
 	natState nat.Discovery
 
 	lastAppliedSubnet string // cache: which subnet we last materialised in wg0.conf
+
+	// timeHealth throttling: the snapshot is small but a clean device with
+	// no warnings repeats the same payload every heartbeat. We send on any
+	// state change (rising/falling warnings, NTP sync flip, TZ source flip)
+	// and at most once per hour as a keepalive otherwise.
+	lastTimeHealthSent        time.Time
+	lastTimeHealthFingerprint string
 }
 
 // New creates an Agent from the given Config.
@@ -761,6 +768,13 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		CompletedAt:    a.cfg.Setup.CompletedAt,
 	}
 
+	// ── TimeHealth (iter 27, throttled) ───────────────────────────────────
+	// Pulls a compact snapshot from the same source as /api/system/time-health
+	// but ships it only on a state edge or once per hour as a keepalive.
+	// On snapshot timeout we leave the field nil and DO NOT touch the
+	// throttle state so the next tick retries with a fresh budget.
+	hbTimeHealth, hbTimeHealthFp, hbTimeHealthEmit := a.buildHeartbeatTimeHealth(ctx, time.Now())
+
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
 		RegistrationPin:  a.identity.RegistrationPin,
@@ -774,12 +788,22 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		LAN:              hbLAN,
 		System:           hbSystem,
 		Setup:            hbSetup,
+		TimeHealth:       hbTimeHealth,
 	}
 
 	resp, err := a.cloud.Heartbeat(ctx, payload)
 	if err != nil {
 		log.Warn().Err(err).Msg("heartbeat send failed")
 		return
+	}
+
+	// Throttle bookkeeping: only commit the new fingerprint + timestamp
+	// once we know the cloud accepted the heartbeat. A failed send leaves
+	// the previous (lastSent, lastFp) untouched, so the next tick still
+	// fires the rising-edge or keepalive condition.
+	if hbTimeHealthEmit {
+		a.lastTimeHealthSent = time.Now()
+		a.lastTimeHealthFingerprint = hbTimeHealthFp
 	}
 
 	// Two response variants: "unclaimed" (no Device yet — waiting for the
@@ -817,6 +841,49 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	if resp.ClientPeers != nil {
 		a.applyClientPeers(resp.ClientPeers)
 	}
+}
+
+// buildHeartbeatTimeHealth captures a fresh time-health snapshot under a
+// tight 1s budget and applies the throttle decision. It returns the
+// `cloud.HBTimeHealth` to embed (or nil to omit), the new fingerprint,
+// and a flag telling the caller whether to commit the throttle state
+// after a successful send.
+//
+// The snapshot itself runs in the calling goroutine via captureTimeHealth
+// — which spawns a watcher goroutine bounded by the 1s context. On
+// timeout / snapshot error we return (nil, "", false) so sendHeartbeat
+// drops the field AND skips the throttle update, ensuring the next tick
+// retries with a fresh budget.
+func (a *Agent) buildHeartbeatTimeHealth(ctx context.Context, now time.Time) (*cloud.HBTimeHealth, string, bool) {
+	snap, ok := captureTimeHealth(ctx, func(c context.Context) timeHealthSnapshot {
+		full := handlers.TimeHealthSnapshot(c)
+		return timeHealthSnapshot{
+			Timezone:        full.Timezone,
+			TimezoneSource:  full.TimezoneSource,
+			IsUTC:           full.IsUTC,
+			NTPSynchronized: full.NTPSynchronized,
+			NTPEnabled:      full.NTPEnabled,
+			Warnings:        full.Warnings,
+		}
+	})
+	if !ok {
+		log.Debug().Msg("heartbeat: time-health snapshot timed out — omitting timeHealth block")
+		return nil, "", false
+	}
+
+	block, fp, emit := buildTimeHealthBlock(snap, now, now, a.lastTimeHealthSent, a.lastTimeHealthFingerprint)
+	if !emit {
+		return nil, fp, false
+	}
+	return &cloud.HBTimeHealth{
+		Timezone:        block.Timezone,
+		TimezoneSource:  block.TimezoneSource,
+		IsUTC:           block.IsUTC,
+		NTPSynchronized: block.NTPSynchronized,
+		NTPEnabled:      block.NTPEnabled,
+		Warnings:        block.Warnings,
+		CapturedAt:      block.CapturedAt,
+	}, fp, true
 }
 
 // applyClientPeers converges the live WireGuard server state toward the

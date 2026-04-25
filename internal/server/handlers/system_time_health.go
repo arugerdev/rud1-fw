@@ -73,6 +73,17 @@ func (h *SystemTimeHealthHandler) TimeHealth(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 
+	resp := snapshotTimeHealth(ctx)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// snapshotTimeHealth assembles the same response object the HTTP handler
+// returns, but as a pure call so other in-process subsystems (notably the
+// heartbeat builder in the agent package) can reuse it without dialing
+// localhost. The caller is responsible for picking an appropriate context
+// timeout — this function does not impose one of its own so a tight 1s
+// heartbeat budget can coexist with the 3s HTTP budget.
+func snapshotTimeHealth(ctx context.Context) systemTimeHealthResponse {
 	current, source := readCurrentTimezone()
 	_, offset := time.Now().Zone()
 
@@ -116,8 +127,27 @@ func (h *SystemTimeHealthHandler) TimeHealth(w http.ResponseWriter, r *http.Requ
 			"systemd-timesyncd is "+resp.Timesyncd.ActiveState+" ("+resp.Timesyncd.SubState+")")
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	return resp
 }
+
+// TimeHealthSnapshot is the public, in-process entry point for the
+// time-health response. It mirrors the GET /api/system/time-health handler
+// but returns a structured value instead of writing JSON. The agent uses
+// this to populate the heartbeat's `timeHealth` block without going
+// through HTTP.
+//
+// The returned value is the same shape as the JSON response — including
+// the `simulated` / `now` / `utcOffsetSeconds` fields the agent
+// deliberately drops on the wire. Callers should project to the smaller
+// `cloud.HBTimeHealth` shape themselves.
+func TimeHealthSnapshot(ctx context.Context) TimeHealthResponse {
+	return snapshotTimeHealth(ctx)
+}
+
+// TimeHealthResponse is the exported alias of the wire response struct,
+// exposed so other packages can read fields without re-parsing JSON.
+// Field semantics are documented on systemTimeHealthResponse.
+type TimeHealthResponse = systemTimeHealthResponse
 
 // isEffectivelyUTC returns true when the resolved timezone is UTC or one of
 // the "I haven't been configured" placeholders. Catches `Etc/UTC` on Debian
