@@ -447,6 +447,14 @@ type HeartbeatResponse struct {
 	// missing field) means "no opinion — keep current peers" (legacy
 	// response). An empty slice `[]` means "drop all client peers".
 	ClientPeers []ClientPeer `json:"clientPeers,omitempty"`
+	// AuditAckAt (iter 38): the cloud's explicit ack timestamp covering
+	// only the audit entries it actually persisted. The agent caps its
+	// local cursor advance to min(intendedCursor, *AuditAckAt) so a cloud
+	// pipeline failure AFTER the HTTP-200 (e.g. db rollback, dedup error)
+	// doesn't lose entries from the fw cursor's perspective. When nil the
+	// agent falls back to the iter-37 behavior (advance to local intended
+	// cursor — the max `at` of the batch we shipped this tick).
+	AuditAckAt *time.Time `json:"auditAckAt,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.

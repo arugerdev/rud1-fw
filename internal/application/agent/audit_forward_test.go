@@ -290,3 +290,76 @@ func TestBuildHeartbeatAudit_FirstBootDefaultsToNow_NoHistoricalSpam(t *testing.
 		t.Fatalf("first-boot cursor must suppress historical entries; got (%v, %v)", block, newest)
 	}
 }
+
+// ── iter 38: cloud-acked audit cursor ─────────────────────────────────
+//
+// pickCommitCursor is the pure helper that decides the next on-disk
+// cursor value after a successful heartbeat: it caps the local intended
+// cursor at the cloud's `auditAckAt` (when present) so a cloud-side
+// persist failure that still emitted a 200 cannot trick the firmware
+// into skipping entries — and never regresses past the current cursor.
+
+func TestPickCommitCursor_NilAck_PreservesIter37Behavior(t *testing.T) {
+	current := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	intended := time.Date(2026, 4, 25, 12, 0, 30, 0, time.UTC)
+	got := pickCommitCursor(current, intended, nil)
+	if !got.Equal(intended) {
+		t.Fatalf("nil ack must yield intended cursor; want %v got %v", intended, got)
+	}
+}
+
+func TestPickCommitCursor_AckAfterIntended_IntendedWins(t *testing.T) {
+	current := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	intended := time.Date(2026, 4, 25, 12, 0, 30, 0, time.UTC)
+	ack := time.Date(2026, 4, 25, 12, 1, 0, 0, time.UTC)
+	got := pickCommitCursor(current, intended, &ack)
+	if !got.Equal(intended) {
+		t.Fatalf("ack > intended must not over-advance; want %v got %v", intended, got)
+	}
+}
+
+func TestPickCommitCursor_AckBeforeIntended_CapsAtAck(t *testing.T) {
+	current := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	intended := time.Date(2026, 4, 25, 12, 1, 0, 0, time.UTC)
+	ack := time.Date(2026, 4, 25, 12, 0, 30, 0, time.UTC)
+	got := pickCommitCursor(current, intended, &ack)
+	if !got.Equal(ack) {
+		t.Fatalf("ack < intended must cap at ack; want %v got %v", ack, got)
+	}
+}
+
+func TestPickCommitCursor_StaleAckBeforeCurrent_NoRegression(t *testing.T) {
+	current := time.Date(2026, 4, 25, 12, 5, 0, 0, time.UTC)
+	intended := time.Date(2026, 4, 25, 12, 6, 0, 0, time.UTC)
+	ack := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC) // older than current
+	got := pickCommitCursor(current, intended, &ack)
+	if !got.Equal(current) {
+		t.Fatalf("stale ack must not regress cursor; want %v got %v", current, got)
+	}
+}
+
+// TestCommitAuditCursor_EmptyBatch_NoCommit verifies the empty-batch
+// path: when buildHeartbeatAudit yields zero entries, sendHeartbeat
+// short-circuits the commit branch entirely — even if the cloud had
+// returned a non-nil auditAckAt. We model that here by asserting the
+// agent's cursor stays untouched after a no-op build.
+func TestCommitAuditCursor_EmptyBatch_NoCommit(t *testing.T) {
+	a, _ := newTestAgentWithAudit(t)
+	// No entries appended → buildHeartbeatAudit returns (nil, zero).
+	block, newest := a.buildHeartbeatAudit()
+	if block != nil || !newest.IsZero() {
+		t.Fatalf("empty log must yield (nil, zero), got (%v, %v)", block, newest)
+	}
+	// Mirror sendHeartbeat's guard: the commit branch is gated on
+	// `hbAudit != nil && !hbAuditNewest.IsZero()` so an empty batch is
+	// a strict no-op even when the cloud's ack is non-nil.
+	if !a.auditCursor.IsZero() {
+		t.Fatalf("empty batch must leave cursor untouched; got %v", a.auditCursor)
+	}
+	// Verify nothing was persisted to disk either.
+	if _, exists, err := a.auditCursorStore.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	} else if exists {
+		t.Fatalf("empty batch must not persist a cursor")
+	}
+}

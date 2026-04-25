@@ -964,11 +964,24 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		a.timeHealthThrottleMu.Unlock()
 	}
 
-	// Audit cursor advance (iter 37). Only commit on success so a
-	// transport failure replays the same window next tick. `hbAuditNewest`
-	// is the zero time when we shipped no entries (already caught up).
+	// Audit cursor advance (iter 37 + iter 38). Only commit on success so
+	// a transport failure replays the same window next tick. `hbAuditNewest`
+	// is the zero time when we shipped no entries (already caught up). When
+	// the cloud returns an explicit `auditAckAt` (iter 38) we cap the
+	// commit at min(intended, ack) so a cloud-side persist failure that
+	// still produced a 200 doesn't silently lose entries.
 	if hbAudit != nil && !hbAuditNewest.IsZero() {
-		a.commitAuditCursor(hbAuditNewest)
+		a.auditMu.Lock()
+		current := a.auditCursor
+		a.auditMu.Unlock()
+		commit := pickCommitCursor(current, hbAuditNewest, resp.AuditAckAt)
+		if commit.Before(hbAuditNewest) {
+			log.Debug().
+				Time("intended", hbAuditNewest).
+				Time("commit", commit).
+				Msg("audit cursor capped by cloud ack")
+		}
+		a.commitAuditCursor(commit)
 	}
 
 	// Two response variants: "unclaimed" (no Device yet — waiting for the
@@ -1170,6 +1183,28 @@ func (a *Agent) commitAuditCursor(at time.Time) {
 	if err := a.auditCursorStore.Commit(at); err != nil {
 		log.Warn().Err(err).Time("at", at).Msg("audit cursor: persist failed")
 	}
+}
+
+// pickCommitCursor decides which timestamp to persist as the new audit
+// cursor after a successful heartbeat. Pure for unit-testability.
+//
+//   - When `ackAt` is nil the cloud has not opted into the iter-38
+//     handshake — preserve iter-37 behavior and return the local
+//     intended cursor.
+//   - When `ackAt` is non-nil cap the commit at min(intended, *ackAt)
+//     so a cloud-side persist failure (db rollback, dedup error) that
+//     still emitted a 200 doesn't trick the fw into skipping entries.
+//   - Never regress: if the resulting cap would move the cursor
+//     backward (stale ack), keep the existing cursor.
+func pickCommitCursor(currentCursor, intendedCursor time.Time, ackAt *time.Time) time.Time {
+	commit := intendedCursor
+	if ackAt != nil && ackAt.Before(intendedCursor) {
+		commit = *ackAt
+	}
+	if commit.Before(currentCursor) {
+		return currentCursor
+	}
+	return commit
 }
 
 // auditStatsSource is the minimal interface buildHeartbeatConfig needs
