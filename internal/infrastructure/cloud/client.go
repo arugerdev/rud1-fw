@@ -473,6 +473,40 @@ type HeartbeatResponse struct {
 	// agent falls back to the iter-37 behavior (advance to local intended
 	// cursor — the max `at` of the batch we shipped this tick).
 	AuditAckAt *time.Time `json:"auditAckAt,omitempty"`
+	// DesiredConfig (iter 48) is the cloud→agent config-patch ingestion
+	// channel. Until iter 48 the cloud client was outbound-only —
+	// `HBConfigSnapshot` reported the agent's effective config but an
+	// operator changing e.g. `auditRetentionDays` from rud1-es had no
+	// transport to reach the device. The cloud now piggy-backs the
+	// patch on the heartbeat response: when non-nil the agent validates
+	// each field through the existing config helpers, persists via the
+	// atomic `cfg.Save()` path, and re-arms whatever runtime trigger
+	// the changed field is wired to (e.g. the iter-39 prune-on-shrink).
+	// Fields are pointer-typed so absent vs. explicit-zero stay
+	// distinguishable; unknown fields are silently ignored (forward-
+	// compat — DisallowUnknownFields is intentionally NOT set).
+	DesiredConfig *DesiredConfigPatch `json:"desiredConfig,omitempty"`
+}
+
+// DesiredConfigPatch carries the operator-tunable fields the cloud
+// wants applied locally. Pointer-typed fields are required so the
+// agent can distinguish "field omitted" from "explicit value 0". A
+// nil patch (or every field nil) is a no-op — the agent does NOT
+// rewrite config to disk in that case.
+//
+// Forward-compatibility: new fields land here as additional pointer
+// members. The agent decoder uses stdlib defaults (no
+// DisallowUnknownFields) so a cloud running ahead of the agent can
+// add fields without breaking older firmware.
+type DesiredConfigPatch struct {
+	// AuditRetentionDays mirrors `cfg.System.AuditRetentionDays`. The
+	// agent validates against `[MinAuditRetentionDays,
+	// MaxAuditRetentionDays]` (same window the local PUT handler
+	// enforces) before persisting. A change triggers an immediate
+	// SetMaxFiles + PruneOld on the live disk logger when the new
+	// value is strictly smaller than the previous effective window —
+	// matching the iter-39 prune-on-shrink contract.
+	AuditRetentionDays *int `json:"auditRetentionDays,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.

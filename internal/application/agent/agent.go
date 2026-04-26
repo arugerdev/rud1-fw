@@ -109,6 +109,15 @@ type Agent struct {
 	auditMu          sync.Mutex
 	auditCursor      time.Time
 	auditCursorStore *auditcursor.Store
+
+	// desiredConfig (iter 48) ingests cloud→agent config patches piggy-
+	// backed on the heartbeat response. Built once at boot with a live
+	// cfg pointer + the disk audit logger as pruner (or nil when the
+	// logger failed to open). Each `sendHeartbeat` tick passes the
+	// `resp.DesiredConfig` block straight through; the applier handles
+	// validate / no-op-detect / atomic save / re-arm internally so
+	// sendHeartbeat stays a thin orchestrator.
+	desiredConfig *desiredConfigApplier
 }
 
 // New creates an Agent from the given Config.
@@ -442,6 +451,19 @@ func New(cfg *config.Config) (*Agent, error) {
 	})
 
 	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH, sysAuditFwdH)
+
+	// Cloud→agent desired-config applier (iter 48). The pruner is the
+	// disk audit logger when available — same handle the local PUT
+	// retention handler uses, so a cloud-pushed shrink fires the exact
+	// same SetMaxFiles + PruneOld sequence as a `PUT
+	// /api/system/audit/retention` would. nil pruner ⇒ degraded path
+	// (cfg still saves, runtime SetMaxFiles is skipped) — matches the
+	// no-disk-logger branch of NewSystemAuditRetentionHandler.
+	var desiredPruner retentionPruner
+	if a.auditLog != nil {
+		desiredPruner = a.auditLog
+	}
+	a.desiredConfig = newDesiredConfigApplier(cfg, desiredPruner)
 
 	return a, nil
 }
@@ -1026,6 +1048,21 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// failure to wg-set one peer doesn't abort the others.
 	if resp.ClientPeers != nil {
 		a.applyClientPeers(resp.ClientPeers)
+	}
+
+	// DesiredConfig (iter 48): cloud→agent config-patch ingestion. The
+	// applier handles validation, no-op detection, atomic save, and
+	// per-field re-arm internally; we just hand off and log the outcome.
+	// A nil patch (steady state — cloud has no edits to push) is the
+	// no-op path and never touches disk. Failures are warn-logged
+	// rather than propagated because a bad cloud push must not abort
+	// the rest of the heartbeat-side bookkeeping (peers, audit cursor).
+	if a.desiredConfig != nil && resp.DesiredConfig != nil {
+		if changed, err := a.desiredConfig.Apply(resp.DesiredConfig); err != nil {
+			log.Warn().Err(err).Msg("heartbeat: desired config apply failed")
+		} else if changed {
+			log.Info().Msg("heartbeat: desired config applied from cloud")
+		}
 	}
 }
 
