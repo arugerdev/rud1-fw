@@ -60,6 +60,7 @@ func New(
 	sysAuditH *handlers.SystemAuditHandler,
 	sysAuditRetH *handlers.SystemAuditRetentionHandler,
 	sysAuditFwdH *handlers.SystemAuditForwardStatusHandler,
+	sysDesiredCfgH *handlers.SystemDesiredConfigHandler,
 ) *Server {
 
 	r := chi.NewRouter()
@@ -137,6 +138,12 @@ func New(
 		// would ship so operators can diagnose a stuck cloud-forward
 		// without reading the agent log.
 		r.Get("/api/system/audit/forward-status", sysAuditFwdH.Status)
+		// Iter 52: cloud→agent convergence chip. Returns the wall-clock
+		// time + the canonical field-name list of the most recent
+		// successful desired-config Apply, so the local panel can show
+		// "last cloud push converged at … (fields: …)" without round-
+		// tripping through rud1-es.
+		r.Get("/api/system/desired-config/last-applied", sysDesiredCfgH.LastApplied)
 		r.Get("/api/percentiles/history", sysPctHistH.History)
 		r.Get("/api/percentiles/export", sysPctExpH.Export)
 		r.Post("/api/system/reboot", systemH.Reboot)

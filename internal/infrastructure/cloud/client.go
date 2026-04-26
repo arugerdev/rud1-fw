@@ -219,6 +219,16 @@ type HBConfigSnapshot struct {
 	// RFC3339 UTC over the wire so the cloud parses with the same
 	// constructor used by the audit-stats timestamps above.
 	LastDesiredConfigAppliedAt *time.Time `json:"lastDesiredConfigAppliedAt,omitempty"`
+	// LastDesiredConfigAppliedFields (iter 52) is the canonical
+	// wire-name list of fields that mutated in the same Apply that
+	// stamped LastDesiredConfigAppliedAt. Names match the JSON tags on
+	// `DesiredConfigPatch` (e.g. ["auditRetentionDays","externalNTPServers"]).
+	// Lets the cloud render a "last cloud push converged at HH:MM:SS
+	// (fields: …)" chip on the device-detail page WITHOUT replaying the
+	// desired-config emission queue to figure out which row converged.
+	// Omitted when nil — older cloud schemas still parse cleanly because
+	// the field is absent on iter ≤51 firmware.
+	LastDesiredConfigAppliedFields []string `json:"lastDesiredConfigAppliedFields,omitempty"`
 }
 
 // HBAuditRetentionStats mirrors `audit/configlog.Stats` over the wire.

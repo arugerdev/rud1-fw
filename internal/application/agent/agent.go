@@ -450,8 +450,6 @@ func New(cfg *config.Config) (*Agent, error) {
 		a.timeHealthThrottleMu.Unlock()
 	})
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH, sysAuditFwdH)
-
 	// Cloud→agent desired-config applier (iter 48). The pruner is the
 	// disk audit logger when available — same handle the local PUT
 	// retention handler uses, so a cloud-pushed shrink fires the exact
@@ -459,6 +457,14 @@ func New(cfg *config.Config) (*Agent, error) {
 	// /api/system/audit/retention` would. nil pruner ⇒ degraded path
 	// (cfg still saves, runtime SetMaxFiles is skipped) — matches the
 	// no-disk-logger branch of NewSystemAuditRetentionHandler.
+	//
+	// Iter 52: applier construction hoisted ABOVE server.New so the
+	// new `GET /api/system/desired-config/last-applied` handler can
+	// take a non-nil source through the constructor. Re-arm hooks
+	// (NTP / LAN) still wire post-server.New because they capture the
+	// time-health handler + lan.Manager refs; the applier itself just
+	// stores nil callbacks until then, matching the iter-50/51
+	// "wired post-construction" comment on each Set*Hook method.
 	var desiredPruner retentionPruner
 	var desiredAuditLog auditAppender
 	if a.auditLog != nil {
@@ -471,6 +477,9 @@ func New(cfg *config.Config) (*Agent, error) {
 		desiredAuditLog = a.auditLog
 	}
 	a.desiredConfig = newDesiredConfigApplier(cfg, desiredPruner, desiredAuditLog)
+	sysDesiredCfgH := handlers.NewSystemDesiredConfigHandler(a.desiredConfig)
+
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH, sysAuditFwdH, sysDesiredCfgH)
 	// Iter 50: wire the NTP-probe re-arm hook so a cloud-pushed
 	// `externalNTPProbeEnabled`/`externalNTPServers` mutation is observ-
 	// ationally identical to a local PUT. The hook fires after a
@@ -1328,8 +1337,15 @@ type auditStatsSource interface {
 // `LastDesiredConfigAppliedAt` field. Defined as an interface so the
 // snapshot test can pass a stub without standing up a full applier
 // (which would in turn require a config + saver + pruner triad).
+//
+// Iter 52: extended with LastAppliedFields() so the heartbeat snapshot
+// can also carry the canonical wire-name list of fields that mutated
+// in the most recent Apply. The cloud uses this to render a
+// "last cloud push converged at … (fields: …)" chip without
+// replaying the desired-config emission queue.
 type desiredConfigStateSource interface {
 	LastAppliedAt() *time.Time
+	LastAppliedFields() []string
 }
 
 // buildHeartbeatConfig captures the operator-tunable system config snapshot
@@ -1357,6 +1373,13 @@ func buildHeartbeatConfig(cfg *config.Config, auditLog auditStatsSource, desired
 		if t := desired.LastAppliedAt(); t != nil {
 			utc := t.UTC()
 			out.LastDesiredConfigAppliedAt = &utc
+		}
+		// Iter 52: piggy-back the canonical field-name list. Skipped when
+		// nil (no cloud apply has ever run) so older cloud schemas still
+		// see an absent field rather than an empty array — semantically
+		// distinct on the wire.
+		if fields := desired.LastAppliedFields(); len(fields) > 0 {
+			out.LastDesiredConfigAppliedFields = fields
 		}
 	}
 	if auditLog == nil {

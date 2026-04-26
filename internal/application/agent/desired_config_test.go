@@ -890,12 +890,18 @@ func TestBuildHeartbeatConfig_LastDesiredConfigAppliedAt_OmittedWhenNil(t *testi
 
 // stubDesiredState is the `desiredConfigStateSource` minimal stub for
 // the buildHeartbeatConfig iter-49 tests. Avoids spinning up a full
-// applier (which would in turn require config + saver + pruner).
+// applier (which would in turn require config + saver + pruner). Iter
+// 52 grew the interface with LastAppliedFields(); the existing iter-49
+// tests pass nil/zero so their assertions stay byte-for-byte identical
+// (the stub's zero-value `fields` ⇒ `len()==0` ⇒ field omitted from
+// the snapshot, matching the iter-49 wire contract).
 type stubDesiredState struct {
-	at *time.Time
+	at     *time.Time
+	fields []string
 }
 
-func (s stubDesiredState) LastAppliedAt() *time.Time { return s.at }
+func (s stubDesiredState) LastAppliedAt() *time.Time   { return s.at }
+func (s stubDesiredState) LastAppliedFields() []string { return s.fields }
 
 // ── iter 50: multi-field desired-config (externalNTP fields) ───────────
 
@@ -1815,4 +1821,193 @@ func TestNormalizeLANRoutes_Direct(t *testing.T) {
 			t.Fatalf("validator error must propagate")
 		}
 	})
+}
+
+// ── iter 52: LastAppliedFields convergence-chip surface ─────────────────
+
+// TestLastAppliedFields_NilBeforeAnyApply pins the freshly-booted
+// device contract: a device that has never received a cloud push must
+// report nil (not an empty slice) so the handler can render a clear
+// "no cloud convergence yet" state rather than an ambiguous "0 fields".
+func TestLastAppliedFields_NilBeforeAnyApply(t *testing.T) {
+	cfg := config.Default()
+	a := newApplierForTest(cfg, &fakePruner{}, &fakeSaver{})
+	if got := a.LastAppliedFields(); got != nil {
+		t.Fatalf("fresh applier LastAppliedFields=%v, want nil", got)
+	}
+}
+
+// TestLastAppliedFields_PopulatedOnSingleFieldApply: a single-field push
+// must record exactly that one wire-name. Names match the JSON tags on
+// `cloud.DesiredConfigPatch` so a single normalisation contract spans
+// firmware ↔ cloud.
+func TestLastAppliedFields_PopulatedOnSingleFieldApply(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(7)}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	got := a.LastAppliedFields()
+	if len(got) != 1 || got[0] != "auditRetentionDays" {
+		t.Fatalf("LastAppliedFields=%v, want [auditRetentionDays]", got)
+	}
+}
+
+// TestLastAppliedFields_PopulatedOnMultiFieldApply: a multi-field patch
+// must record every changed field in the canonical order
+// (audit→ntpEnabled→ntpServers→lanRoutes), matching the order the Apply
+// method walks the plan. Pinning the order keeps the configlog page +
+// the local panel in sync if the UI ever sorts on this slice.
+func TestLastAppliedFields_PopulatedOnMultiFieldApply(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	cfg.System.ExternalNTPProbeEnabled = false
+	cfg.System.ExternalNTPServers = []string{"a.pool"}
+	cfg.LAN.Routes = []string{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+
+	enabled := true
+	patch := &cloud.DesiredConfigPatch{
+		AuditRetentionDays:      intPtr(21),
+		ExternalNTPProbeEnabled: &enabled,
+		ExternalNTPServers:      &[]string{"b.pool"},
+		LANRoutes:               &[]string{"192.168.1.0/24"},
+	}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	got := a.LastAppliedFields()
+	want := []string{"auditRetentionDays", "externalNTPProbeEnabled", "externalNTPServers", "lanRoutes"}
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("LastAppliedFields=%v, want %v", got, want)
+	}
+}
+
+// TestLastAppliedFields_NoOpApplyDoesNotClear: a no-op tick (patch all
+// matches current state) MUST NOT erase the prior tick's field list.
+// The chip on the local panel reads "the LAST cloud push that
+// converged" — a steady-state heartbeat shouldn't blank it.
+func TestLastAppliedFields_NoOpApplyDoesNotClear(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+
+	// First apply: real change.
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(7)}); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	// Second apply: same value ⇒ no-op.
+	if changed, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(7)}); err != nil || changed {
+		t.Fatalf("second apply must be no-op: changed=%v err=%v", changed, err)
+	}
+	got := a.LastAppliedFields()
+	if len(got) != 1 || got[0] != "auditRetentionDays" {
+		t.Fatalf("after no-op LastAppliedFields=%v, want [auditRetentionDays]", got)
+	}
+}
+
+// TestLastAppliedFields_OverwrittenOnSubsequentApply: a later push that
+// touches a different field set must REPLACE the slice, not merge with
+// the prior one. Otherwise the chip would accrue stale entries forever.
+func TestLastAppliedFields_OverwrittenOnSubsequentApply(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	cfg.System.ExternalNTPProbeEnabled = false
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(21)}); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	enabled := true
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{ExternalNTPProbeEnabled: &enabled}); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	got := a.LastAppliedFields()
+	if len(got) != 1 || got[0] != "externalNTPProbeEnabled" {
+		t.Fatalf("LastAppliedFields=%v, want [externalNTPProbeEnabled]", got)
+	}
+}
+
+// TestLastAppliedFields_NotMutatedOnSaveError: a save-failure path must
+// NOT advance the field list — symmetric with the iter-49
+// LastAppliedAt-not-advanced contract. Otherwise the chip would lie:
+// "we converged at T (fields: …)" when the YAML never updated.
+func TestLastAppliedFields_NotMutatedOnSaveError(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	saver := &fakeSaver{err: errors.New("disk full")}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	_, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(21)})
+	if err == nil {
+		t.Fatalf("save error must propagate")
+	}
+	if got := a.LastAppliedFields(); got != nil {
+		t.Fatalf("save error must not populate LastAppliedFields: got %v", got)
+	}
+}
+
+// TestBuildHeartbeatConfig_LastDesiredConfigAppliedFields_RoundTrips:
+// the iter-52 wire-shape extension — the canonical field-name list on
+// the applier must land verbatim on the heartbeat snapshot so the
+// cloud can render the convergence chip without re-deriving from the
+// emission queue.
+func TestBuildHeartbeatConfig_LastDesiredConfigAppliedFields_RoundTrips(t *testing.T) {
+	cfg := config.Default()
+	pinned := time.Date(2026, 4, 26, 13, 0, 0, 0, time.UTC)
+	want := []string{"auditRetentionDays", "lanRoutes"}
+	src := stubDesiredState{at: &pinned, fields: want}
+	got := buildHeartbeatConfig(cfg, nil, src)
+	if !stringSlicesEqual(got.LastDesiredConfigAppliedFields, want) {
+		t.Fatalf("LastDesiredConfigAppliedFields=%v, want %v",
+			got.LastDesiredConfigAppliedFields, want)
+	}
+}
+
+// TestBuildHeartbeatConfig_LastDesiredConfigAppliedFields_OmittedWhenNil:
+// fresh device or iter-49-only state ⇒ the applier reports nil/empty
+// fields ⇒ the snapshot must NOT include the JSON key, so iter ≤51
+// cloud schemas still parse cleanly. An empty `[]` over the wire would
+// be ambiguous (legacy fw vs explicit empty) — `omitempty` keeps the
+// distinction crisp.
+func TestBuildHeartbeatConfig_LastDesiredConfigAppliedFields_OmittedWhenNil(t *testing.T) {
+	cfg := config.Default()
+	pinned := time.Date(2026, 4, 26, 13, 0, 0, 0, time.UTC)
+	src := stubDesiredState{at: &pinned, fields: nil}
+	got := buildHeartbeatConfig(cfg, nil, src)
+	if got.LastDesiredConfigAppliedFields != nil {
+		t.Fatalf("expected nil, got %v", got.LastDesiredConfigAppliedFields)
+	}
+	buf, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(buf), "lastDesiredConfigAppliedFields") {
+		t.Fatalf("nil fields leaked to wire: %s", buf)
+	}
+}
+
+// TestLastAppliedFields_ReturnsCopy guards against the caller-mutates-
+// internal-state gotcha (mirrors the iter-49 LastAppliedAt copy
+// contract). A handler that sorts the returned slice in place must NOT
+// disturb the applier's bookkeeping.
+func TestLastAppliedFields_ReturnsCopy(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(21)}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	first := a.LastAppliedFields()
+	if len(first) != 1 {
+		t.Fatalf("len=%d", len(first))
+	}
+	first[0] = "MUTATED"
+	second := a.LastAppliedFields()
+	if len(second) != 1 || second[0] != "auditRetentionDays" {
+		t.Fatalf("returned slice aliased internal state: %v", second)
+	}
 }

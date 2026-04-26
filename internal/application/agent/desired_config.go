@@ -166,8 +166,17 @@ type desiredConfigApplier struct {
 	// confirm convergence without inferring from drift. Guarded by mu
 	// because the heartbeat goroutine reads it from a different code
 	// path (buildHeartbeatConfig) than the applier writes it.
-	mu            sync.Mutex
-	lastAppliedAt *time.Time
+	//
+	// lastAppliedFields is the iter-52 sibling: the canonical wire-name
+	// list of every field that actually changed in the most recent
+	// successful Apply (e.g. ["auditRetentionDays","externalNTPServers"]).
+	// Reset to a fresh slice on every successful Apply (so a cloud push
+	// touching only NTP doesn't keep an audit-retention entry from a
+	// prior tick). Guarded by mu — read by the new
+	// `GET /api/system/desired-config/last-applied` handler.
+	mu                sync.Mutex
+	lastAppliedAt     *time.Time
+	lastAppliedFields []string
 }
 
 // newDesiredConfigApplier wires the applier. Callers from agent.New
@@ -237,6 +246,25 @@ func (a *desiredConfigApplier) LastAppliedAt() *time.Time {
 	}
 	t := *a.lastAppliedAt
 	return &t
+}
+
+// LastAppliedFields returns a fresh copy of the canonical wire-name
+// list of fields that mutated in the most recent successful Apply, or
+// nil when no cloud apply has ever touched disk on this device.
+// Returned by copy so the caller can append/sort without aliasing the
+// applier's internal slice. Used by the iter-52 `GET
+// /api/system/desired-config/last-applied` handler so the local panel
+// can surface a "last cloud push converged at … (N fields)" chip on
+// the device-detail page WITHOUT round-tripping through rud1-es.
+func (a *desiredConfigApplier) LastAppliedFields() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lastAppliedFields == nil {
+		return nil
+	}
+	out := make([]string, len(a.lastAppliedFields))
+	copy(out, a.lastAppliedFields)
+	return out
 }
 
 // normalizeLANRoutes is the iter-51 sibling of normalizeNTPServers
@@ -482,9 +510,33 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	// confirm convergence to the cloud. Done BEFORE the prune / hook
 	// side effects because lastAppliedAt is about "did the cloud's
 	// edit reach disk", not "did the side-effects run cleanly".
+	//
+	// Iter 52: also snapshot the canonical wire-name list of fields
+	// that mutated this tick so the local panel can render a
+	// "last cloud push converged at … (fields: auditRetentionDays,
+	// externalNTPServers)" chip without re-deriving the diff from
+	// the configlog stream. The list is cleared-and-rebuilt each
+	// tick so a NTP-only push doesn't carry forward a prior
+	// audit-retention field name. Names match the `cloud.DesiredConfigPatch`
+	// JSON tags so a single normalisation contract spans firmware ↔
+	// cloud.
 	now := a.now()
+	fields := make([]string, 0, 4)
+	if plan.auditRetentionDays != nil {
+		fields = append(fields, "auditRetentionDays")
+	}
+	if plan.ntpProbeEnabled != nil {
+		fields = append(fields, "externalNTPProbeEnabled")
+	}
+	if plan.ntpServers != nil {
+		fields = append(fields, "externalNTPServers")
+	}
+	if plan.lanRoutes != nil {
+		fields = append(fields, "lanRoutes")
+	}
 	a.mu.Lock()
 	a.lastAppliedAt = &now
+	a.lastAppliedFields = fields
 	a.mu.Unlock()
 
 	// ── Stage 3: per-field audit-log entries ────────────────────────────
