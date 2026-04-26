@@ -66,6 +66,13 @@ type Manager struct {
 	// the operator tail journalctl. Cleared on every Apply, so a transient
 	// failure that recovers next iteration disappears from the UI.
 	lastApplyError string
+
+	// Iter 59: count of consecutive Apply() invocations that finished with
+	// at least one per-rule error. Reset to 0 on the first clean apply.
+	// Mirrors the cloud-side streak counter so the local rud1-app panel
+	// can show "failing × N" without waiting for the cloud round-trip
+	// (and so a Pi without internet can still see the flapping signal).
+	applyErrorStreak int
 }
 
 // NewManager creates a manager. The first Configure() call binds it to the
@@ -199,8 +206,10 @@ func (m *Manager) Apply(targets []string) ([]Route, []error) {
 	// stuck on an old failure once the operator fixed it.
 	if len(errs) > 0 {
 		m.lastApplyError = errs[0].Error()
+		m.applyErrorStreak++
 	} else {
 		m.lastApplyError = ""
+		m.applyErrorStreak = 0
 	}
 	return applied, errs
 }
@@ -225,6 +234,16 @@ func (m *Manager) LastApplyError() string {
 	return m.lastApplyError
 }
 
+// ApplyErrorStreak returns the number of consecutive Apply() invocations
+// that finished with at least one per-rule error. Reset to 0 on the next
+// clean apply. Iter 59: surfaced via HealthSnapshot() so the local panel
+// can render "failing × N" matching the cloud's aggregate alert.
+func (m *Manager) ApplyErrorStreak() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.applyErrorStreak
+}
+
 // Health is the structured snapshot the local panel + heartbeat ship to
 // operators. Bundles the converged state (live route list) with the
 // out-of-band system signals (ip_forward, source/uplink) needed to debug
@@ -237,6 +256,11 @@ type Health struct {
 	Routes         []Route   `json:"routes"`
 	LastAppliedAt  time.Time `json:"lastAppliedAt"`
 	LastApplyError string    `json:"lastApplyError,omitempty"`
+	// Iter 59: consecutive-failure counter. Mirrors the cloud's
+	// VpnConfig.lanApplyErrorStreak so the local panel can paint the
+	// same "failing × N" badge without depending on cloud round-trips.
+	// Always present; 0 when the last apply was clean.
+	ApplyErrorStreak int `json:"applyErrorStreak"`
 }
 
 // HealthSnapshot returns the current LAN-routing health bundle. Callers (the
@@ -250,13 +274,14 @@ func (m *Manager) HealthSnapshot() Health {
 		routes = append(routes, r)
 	}
 	return Health{
-		Source:         m.source,
-		Uplink:         m.uplink,
-		IPForward:      IPForwardEnabled(),
-		Simulated:      m.forced,
-		Routes:         routes,
-		LastAppliedAt:  m.lastAppliedAt,
-		LastApplyError: m.lastApplyError,
+		Source:           m.source,
+		Uplink:           m.uplink,
+		IPForward:        IPForwardEnabled(),
+		Simulated:        m.forced,
+		Routes:           routes,
+		LastAppliedAt:    m.lastAppliedAt,
+		LastApplyError:   m.lastApplyError,
+		ApplyErrorStreak: m.applyErrorStreak,
 	}
 }
 

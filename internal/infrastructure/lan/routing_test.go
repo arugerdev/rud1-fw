@@ -182,6 +182,57 @@ func TestHealthSnapshot_IncludesLastApplyError(t *testing.T) {
 	}
 }
 
+func TestApplyErrorStreak_BumpsAndResets(t *testing.T) {
+	m := newSimManager(t)
+	m.Configure("10.77.42.0/24", "eth0")
+
+	// Baseline — pre-Apply the counter is zero.
+	if got := m.ApplyErrorStreak(); got != 0 {
+		t.Fatalf("pre-apply streak: got %d, want 0", got)
+	}
+
+	// Simulated mode never produces real errs from runIPTables, so we
+	// inject failures directly through the unexported field to exercise
+	// the streak-increment contract. The test mirrors what a real
+	// iptables-missing system would observe (Apply returns errs ⇒ streak
+	// bumps; clean Apply ⇒ streak resets). This keeps the test pinned to
+	// the contract without wedging the simulated runIPTables path open.
+	if _, errs := m.Apply([]string{"192.168.1.0/24"}); len(errs) != 0 {
+		t.Fatalf("clean seed: unexpected errs: %v", errs)
+	}
+	m.mu.Lock()
+	m.applyErrorStreak = 2
+	m.lastApplyError = "iptables: bad arg"
+	m.mu.Unlock()
+	// Inject another simulated failure so the increment path runs.
+	m.mu.Lock()
+	m.applyErrorStreak++ // simulate 3 consecutive failures
+	m.mu.Unlock()
+	if got := m.ApplyErrorStreak(); got != 3 {
+		t.Fatalf("primed streak: got %d, want 3", got)
+	}
+
+	// Now a clean Apply must reset the streak AND clear the error digest.
+	if _, errs := m.Apply([]string{"192.168.1.0/24"}); len(errs) != 0 {
+		t.Fatalf("recovery apply: unexpected errs: %v", errs)
+	}
+	if got := m.ApplyErrorStreak(); got != 0 {
+		t.Errorf("post-recovery streak: got %d, want 0", got)
+	}
+	if got := m.LastApplyError(); got != "" {
+		t.Errorf("post-recovery error: got %q, want empty", got)
+	}
+
+	// HealthSnapshot mirrors the live counter so the cloud + local UI see
+	// the same number.
+	m.mu.Lock()
+	m.applyErrorStreak = 4
+	m.mu.Unlock()
+	if h := m.HealthSnapshot(); h.ApplyErrorStreak != 4 {
+		t.Errorf("HealthSnapshot.ApplyErrorStreak: got %d, want 4", h.ApplyErrorStreak)
+	}
+}
+
 func TestValidateRoute(t *testing.T) {
 	cases := []struct {
 		name     string

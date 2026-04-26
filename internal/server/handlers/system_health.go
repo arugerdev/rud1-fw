@@ -82,6 +82,15 @@ type healthLAN struct {
 	Simulated     bool             `json:"simulated"`
 	Routes        []healthLANRoute `json:"routes"`
 	LastAppliedAt *time.Time       `json:"lastAppliedAt,omitempty"`
+	// Iter 59: same shape the cloud surfaces — count of consecutive
+	// failed Apply() calls. Always emitted (0 in steady state) so the
+	// rud1-app local panel can render "failing × N" without depending on
+	// cloud round-trips.
+	ApplyErrorStreak int `json:"applyErrorStreak"`
+	// Iter 59: digest of the first per-rule error from the most recent
+	// Apply (omitted when last apply was clean). Mirrors the heartbeat
+	// HBLAN.lastApplyError field.
+	LastApplyError string `json:"lastApplyError,omitempty"`
 }
 
 // healthUSBIP is the nested USB/IP block: daemon flag, counts derived
@@ -191,12 +200,14 @@ func (h *SystemHealthHandler) Health(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 			block := &healthLAN{
-				Enabled:   len(live) > 0,
-				Uplink:    h.lanMgr.Uplink(),
-				Source:    h.lanMgr.Source(),
-				IPForward: lan.IPForwardEnabled(),
-				Simulated: h.lanMgr.Simulated(),
-				Routes:    routes,
+				Enabled:          len(live) > 0,
+				Uplink:           h.lanMgr.Uplink(),
+				Source:           h.lanMgr.Source(),
+				IPForward:        lan.IPForwardEnabled(),
+				Simulated:        h.lanMgr.Simulated(),
+				Routes:           routes,
+				ApplyErrorStreak: h.lanMgr.ApplyErrorStreak(),
+				LastApplyError:   h.lanMgr.LastApplyError(),
 			}
 			if applied := h.lanMgr.LastAppliedAt(); !applied.IsZero() {
 				ts := applied

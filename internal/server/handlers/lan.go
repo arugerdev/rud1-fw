@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -53,6 +54,18 @@ type lanResponse struct {
 	IPForward  bool           `json:"ipForward"`
 	Simulated  bool           `json:"simulated"`
 	Routes     []lanRouteView `json:"routes"`
+	// Iter 59: paired health signals so the rud1-app panel doesn't have
+	// to call /api/system/health separately to render the "Última sync"
+	// chip + apply-error banner. RFC3339 UTC; omitted when Apply has
+	// never run this boot.
+	LastAppliedAt string `json:"lastAppliedAt,omitempty"`
+	// Digest of the first per-rule error from the most recent Apply
+	// (omitted when last apply was clean).
+	LastApplyError string `json:"lastApplyError,omitempty"`
+	// Consecutive-failure counter — 0 in steady state, ≥1 when the last
+	// N Applies in a row failed. Always emitted so the panel can choose
+	// to show "failing × N".
+	ApplyErrorStreak int `json:"applyErrorStreak"`
 }
 
 func (h *LANHandler) current() lanResponse {
@@ -82,14 +95,27 @@ func (h *LANHandler) current() lanResponse {
 		routes = append(routes, r)
 	}
 
-	return lanResponse{
-		Enabled:   h.full.LAN.Enabled,
-		Uplink:    h.mgr.Uplink(),
-		Source:    h.mgr.Source(),
-		IPForward: lan.IPForwardEnabled(),
-		Simulated: h.mgr.Simulated(),
-		Routes:    routes,
+	return h.assembleResponse(routes)
+}
+
+// assembleResponse fills the iter-59 health fields onto a lanResponse so
+// both `current()` and `currentLocked()` stay in lockstep — caller-owned
+// `routes` keep the per-call rendering of the live view.
+func (h *LANHandler) assembleResponse(routes []lanRouteView) lanResponse {
+	resp := lanResponse{
+		Enabled:          h.full.LAN.Enabled,
+		Uplink:           h.mgr.Uplink(),
+		Source:           h.mgr.Source(),
+		IPForward:        lan.IPForwardEnabled(),
+		Simulated:        h.mgr.Simulated(),
+		Routes:           routes,
+		LastApplyError:   h.mgr.LastApplyError(),
+		ApplyErrorStreak: h.mgr.ApplyErrorStreak(),
 	}
+	if applied := h.mgr.LastAppliedAt(); !applied.IsZero() {
+		resp.LastAppliedAt = applied.UTC().Format(time.RFC3339)
+	}
+	return resp
 }
 
 // Get handles GET /api/lan/routes.
@@ -268,12 +294,5 @@ func (h *LANHandler) currentLocked() lanResponse {
 		}
 		routes = append(routes, r)
 	}
-	return lanResponse{
-		Enabled:   h.full.LAN.Enabled,
-		Uplink:    h.mgr.Uplink(),
-		Source:    h.mgr.Source(),
-		IPForward: lan.IPForwardEnabled(),
-		Simulated: h.mgr.Simulated(),
-		Routes:    routes,
-	}
+	return h.assembleResponse(routes)
 }
