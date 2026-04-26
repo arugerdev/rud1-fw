@@ -2011,3 +2011,275 @@ func TestLastAppliedFields_ReturnsCopy(t *testing.T) {
 		t.Fatalf("returned slice aliased internal state: %v", second)
 	}
 }
+
+// ── Iter 53: externalNTPProbeTimeoutSeconds desired-config field ────────
+
+// TestHeartbeatResponse_DecodesNTPProbeTimeoutSeconds pins the iter-53
+// wire shape: the cloud can push `externalNTPProbeTimeoutSeconds`
+// inside `desiredConfig`. Decoder must surface the integer-seconds
+// pointer field without disturbing the iter-50/51 fields.
+func TestHeartbeatResponse_DecodesNTPProbeTimeoutSeconds(t *testing.T) {
+	body := `{
+		"ok": true,
+		"desiredConfig": {
+			"externalNTPProbeEnabled": true,
+			"externalNTPProbeTimeoutSeconds": 5,
+			"lanRoutes": ["192.168.1.0/24"]
+		}
+	}`
+	var resp cloud.HeartbeatResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DesiredConfig == nil {
+		t.Fatalf("DesiredConfig nil")
+	}
+	if resp.DesiredConfig.ExternalNTPProbeTimeoutSeconds == nil ||
+		*resp.DesiredConfig.ExternalNTPProbeTimeoutSeconds != 5 {
+		t.Fatalf("ExternalNTPProbeTimeoutSeconds: %+v",
+			resp.DesiredConfig.ExternalNTPProbeTimeoutSeconds)
+	}
+	if resp.DesiredConfig.ExternalNTPProbeEnabled == nil ||
+		*resp.DesiredConfig.ExternalNTPProbeEnabled != true {
+		t.Fatalf("enabled disturbed: %+v",
+			resp.DesiredConfig.ExternalNTPProbeEnabled)
+	}
+	if resp.DesiredConfig.LANRoutes == nil ||
+		len(*resp.DesiredConfig.LANRoutes) != 1 {
+		t.Fatalf("LANRoutes disturbed: %+v", resp.DesiredConfig.LANRoutes)
+	}
+}
+
+// TestApply_NTPProbeTimeout_PersistsAndFiresHook is the iter-53 happy
+// path: a cloud push of `externalNTPProbeTimeoutSeconds` must mutate
+// cfg.System.ExternalNTPProbeTimeout (Duration), Save once, fire the
+// NTP apply hook with the new per-server timeout, and emit one grouped
+// `system.ntpProbe.update` audit entry that includes timeoutSeconds in
+// both Previous and Next.
+func TestApply_NTPProbeTimeout_PersistsAndFiresHook(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeTimeout = 2 * time.Second
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	v := 7
+	patch := &cloud.DesiredConfigPatch{ExternalNTPProbeTimeoutSeconds: &v}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false, want true")
+	}
+	if cfg.System.ExternalNTPProbeTimeout != 7*time.Second {
+		t.Fatalf("cfg.ExternalNTPProbeTimeout=%v, want 7s",
+			cfg.System.ExternalNTPProbeTimeout)
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1", saver.calls.Load())
+	}
+	calls, _, _, gotPerSrv := hook.snapshot()
+	if calls != 1 {
+		t.Fatalf("hook calls=%d, want 1", calls)
+	}
+	if gotPerSrv != 7*time.Second {
+		t.Fatalf("hook saw perServer=%v, want 7s (post-apply)", gotPerSrv)
+	}
+	entries := appender.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries=%d, want 1 grouped", len(entries))
+	}
+	if entries[0].Action != "system.ntpProbe.update" {
+		t.Fatalf("Action=%q, want system.ntpProbe.update", entries[0].Action)
+	}
+	prev, ok := entries[0].Previous.(map[string]any)
+	if !ok {
+		t.Fatalf("Previous not a map: %T", entries[0].Previous)
+	}
+	if prev["timeoutSeconds"] != 2 {
+		t.Fatalf("Previous.timeoutSeconds=%v, want 2", prev["timeoutSeconds"])
+	}
+	next, ok := entries[0].Next.(map[string]any)
+	if !ok {
+		t.Fatalf("Next not a map: %T", entries[0].Next)
+	}
+	if next["timeoutSeconds"] != 7 {
+		t.Fatalf("Next.timeoutSeconds=%v, want 7", next["timeoutSeconds"])
+	}
+}
+
+// TestApply_NTPProbeTimeout_BelowMinRejected pins the iter-53 lower-
+// bound. 0 (and any negative) must reject the whole patch, leak no
+// state, and never Save.
+func TestApply_NTPProbeTimeout_BelowMinRejected(t *testing.T) {
+	cfg := config.Default()
+	prevDur := 4 * time.Second
+	cfg.System.ExternalNTPProbeTimeout = prevDur
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	for _, v := range []int{0, -1, -100} {
+		bad := v
+		_, err := a.Apply(&cloud.DesiredConfigPatch{ExternalNTPProbeTimeoutSeconds: &bad})
+		if err == nil {
+			t.Fatalf("v=%d: expected rejection, got nil err", bad)
+		}
+	}
+	if cfg.System.ExternalNTPProbeTimeout != prevDur {
+		t.Fatalf("cfg mutated despite rejection: %v", cfg.System.ExternalNTPProbeTimeout)
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("rejected patch must not Save, got %d", saver.calls.Load())
+	}
+}
+
+// TestApply_NTPProbeTimeout_AboveMaxRejected pins the iter-53 upper-
+// bound (30s). One past the cap must reject — never silently clamp.
+func TestApply_NTPProbeTimeout_AboveMaxRejected(t *testing.T) {
+	cfg := config.Default()
+	prevDur := 4 * time.Second
+	cfg.System.ExternalNTPProbeTimeout = prevDur
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	bad := MaxDesiredNTPProbeTimeoutSeconds + 1
+	_, err := a.Apply(&cloud.DesiredConfigPatch{ExternalNTPProbeTimeoutSeconds: &bad})
+	if err == nil {
+		t.Fatalf("over-cap timeout must error")
+	}
+	if cfg.System.ExternalNTPProbeTimeout != prevDur {
+		t.Fatalf("cfg mutated despite rejection: %v", cfg.System.ExternalNTPProbeTimeout)
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("rejected patch must not Save, got %d", saver.calls.Load())
+	}
+}
+
+// TestApply_NTPProbeTimeout_NoOpWhenUnchanged: a cloud push carrying
+// the current per-server timeout must NOT Save, must NOT fire the
+// hook, must NOT advance LastAppliedAt — same flash-saver contract
+// the iter-50 fields uphold.
+func TestApply_NTPProbeTimeout_NoOpWhenUnchanged(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeTimeout = 5 * time.Second
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	v := 5
+	changed, err := a.Apply(&cloud.DesiredConfigPatch{ExternalNTPProbeTimeoutSeconds: &v})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if changed {
+		t.Fatalf("changed=true, want false on identity push")
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("Save must not run on no-op, got %d", saver.calls.Load())
+	}
+	calls, _, _, _ := hook.snapshot()
+	if calls != 0 {
+		t.Fatalf("hook must not fire on no-op, got %d", calls)
+	}
+	if a.LastAppliedAt() != nil {
+		t.Fatalf("LastAppliedAt must not advance on no-op")
+	}
+	if len(appender.snapshot()) != 0 {
+		t.Fatalf("no audit entries expected on no-op")
+	}
+}
+
+// TestApply_NTPProbeTimeout_RollbackOnSaveError: if the saver errors
+// after the in-memory mutation, cfg.System.ExternalNTPProbeTimeout
+// must restore to its prior value — partial-applied state would leave
+// the runtime racing the on-disk YAML.
+func TestApply_NTPProbeTimeout_RollbackOnSaveError(t *testing.T) {
+	cfg := config.Default()
+	prev := 3 * time.Second
+	cfg.System.ExternalNTPProbeTimeout = prev
+	saver := &fakeSaver{err: fmt.Errorf("disk full")}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	v := 9
+	_, err := a.Apply(&cloud.DesiredConfigPatch{ExternalNTPProbeTimeoutSeconds: &v})
+	if err == nil {
+		t.Fatalf("expected save-error to propagate")
+	}
+	if cfg.System.ExternalNTPProbeTimeout != prev {
+		t.Fatalf("rollback failed: cfg.ExternalNTPProbeTimeout=%v, want %v",
+			cfg.System.ExternalNTPProbeTimeout, prev)
+	}
+	if a.LastAppliedAt() != nil {
+		t.Fatalf("LastAppliedAt must not advance on save error")
+	}
+}
+
+// TestApply_LastAppliedFields_IncludesNTPTimeout: a cloud push that
+// changes only the per-server timeout must surface
+// "externalNTPProbeTimeoutSeconds" in `LastAppliedFields()` so the
+// iter-52 chip + the cloud convergence panel both render the new
+// field name. Field-name list must NOT include sibling NTP names
+// when only the timeout changed.
+func TestApply_LastAppliedFields_IncludesNTPTimeout(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeEnabled = true
+	cfg.System.ExternalNTPProbeTimeout = 2 * time.Second
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+
+	v := 6
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{ExternalNTPProbeTimeoutSeconds: &v}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	got := a.LastAppliedFields()
+	if len(got) != 1 || got[0] != "externalNTPProbeTimeoutSeconds" {
+		t.Fatalf("LastAppliedFields=%v, want [externalNTPProbeTimeoutSeconds]", got)
+	}
+}
+
+// TestApply_MultiField_IncludesNTPTimeout: a multi-field cloud push
+// containing the new iter-53 field alongside iter-50/51 fields must
+// produce a stable wire-name list in cloud-emit order (audit, ntp
+// enabled, ntp servers, lan routes, ntp timeout).
+func TestApply_MultiField_IncludesNTPTimeout(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	cfg.System.ExternalNTPProbeEnabled = false
+	cfg.System.ExternalNTPProbeTimeout = 2 * time.Second
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = nil
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+
+	v := 9
+	patch := &cloud.DesiredConfigPatch{
+		AuditRetentionDays:             intPtr(21),
+		ExternalNTPProbeEnabled:        boolPtr(true),
+		ExternalNTPServers:             strSlicePtr("pool.ntp.org"),
+		LANRoutes:                      strSlicePtr("192.168.50.0/24"),
+		ExternalNTPProbeTimeoutSeconds: &v,
+	}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	want := []string{
+		"auditRetentionDays",
+		"externalNTPProbeEnabled",
+		"externalNTPServers",
+		"lanRoutes",
+		"externalNTPProbeTimeoutSeconds",
+	}
+	got := a.LastAppliedFields()
+	if len(got) != len(want) {
+		t.Fatalf("LastAppliedFields len=%d, want %d (got %v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("[%d]=%q, want %q (full=%v)", i, got[i], want[i], got)
+		}
+	}
+}

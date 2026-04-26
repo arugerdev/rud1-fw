@@ -555,6 +555,18 @@ type DesiredConfigPatch struct {
 	// not exposed here on purpose: the cloud only owns the route list,
 	// the operator still owns the global on/off via the local panel.
 	LANRoutes *[]string `json:"lanRoutes,omitempty"`
+
+	// ExternalNTPProbeTimeoutSeconds (iter 53) mirrors
+	// `cfg.System.ExternalNTPProbeTimeout` as integer seconds — the cap
+	// applied to each per-server SNTP attempt. The agent validates
+	// against `[MinDesiredNTPProbeTimeoutSeconds,
+	// MaxDesiredNTPProbeTimeoutSeconds]` (1..30s) before persisting.
+	// A change re-arms the time-health handler via the iter-50
+	// NTPApplyHook (the hook signature already takes per-server
+	// timeout). Wire-shape is integer seconds (not a Go-style
+	// duration string) so a non-Go cloud client doesn't need a
+	// duration parser to write valid patches.
+	ExternalNTPProbeTimeoutSeconds *int `json:"externalNTPProbeTimeoutSeconds,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.

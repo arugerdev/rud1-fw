@@ -87,6 +87,20 @@ const MaxDesiredNTPProbeServers = 8
 // cap — never silently truncates.
 const MaxDesiredLANRoutes = 32
 
+// MinDesiredNTPProbeTimeoutSeconds / MaxDesiredNTPProbeTimeoutSeconds
+// (iter 53) bound the per-server SNTP attempt budget the cloud can
+// push. 1s is the floor — anything tighter races wall-clock skew on
+// high-jitter cellular uplinks and trips false-negatives on the
+// time-health probe. 30s is the ceiling — beyond that the heartbeat
+// itself starts to back up because the probe runs synchronously when
+// the throttle decides to refresh the timeHealth block. A patch
+// outside this window is rejected entirely (no clamp) so an
+// operator's value is never silently rewritten.
+const (
+	MinDesiredNTPProbeTimeoutSeconds = 1
+	MaxDesiredNTPProbeTimeoutSeconds = 30
+)
+
 // NTPApplyHook is invoked after a successful Save() when at least one
 // of the NTP-related fields changed. The applier passes the post-apply
 // snapshot (enabled + the canonical server list AFTER normalize) so
@@ -364,6 +378,67 @@ func stringSlicesEqual(a, b []string) bool {
 	return true
 }
 
+// plannedChange captures the per-field "should mutate to *X" decision
+// the validation+diff stage of Apply() produces. Hoisted out of Apply()
+// (was an inline type pre-iter-53) so the canonical wire-name helpers
+// (`fieldNames`, `ntpRelated`) stay package-level — adding a 6th field
+// in iter 54+ is a one-line change in `fieldNames` instead of N
+// scattered branches in `Apply()`.
+type plannedChange struct {
+	auditRetentionDays *int           // non-nil ⇒ mutate to *auditRetentionDays
+	ntpProbeEnabled    *bool          // non-nil ⇒ mutate to *ntpProbeEnabled
+	ntpServers         *[]string      // non-nil ⇒ mutate to *ntpServers (post-normalize)
+	lanRoutes          *[]string      // non-nil ⇒ mutate to *lanRoutes (post-normalize)
+	ntpProbeTimeout    *time.Duration // non-nil ⇒ mutate to *ntpProbeTimeout (iter 53)
+}
+
+// fieldNames returns the canonical wire-name list of every field this
+// plan mutates, in stable cloud-emit order. Names match the JSON tags
+// on `cloud.DesiredConfigPatch` so a single normalisation contract
+// spans firmware ↔ cloud. Returns a fresh slice (never aliases) so the
+// caller can stash it on `lastAppliedFields` and the iter-52 accessor
+// can copy from it without racing the next Apply tick.
+func (p plannedChange) fieldNames() []string {
+	out := make([]string, 0, 5)
+	if p.auditRetentionDays != nil {
+		out = append(out, "auditRetentionDays")
+	}
+	if p.ntpProbeEnabled != nil {
+		out = append(out, "externalNTPProbeEnabled")
+	}
+	if p.ntpServers != nil {
+		out = append(out, "externalNTPServers")
+	}
+	if p.lanRoutes != nil {
+		out = append(out, "lanRoutes")
+	}
+	if p.ntpProbeTimeout != nil {
+		out = append(out, "externalNTPProbeTimeoutSeconds")
+	}
+	return out
+}
+
+// ntpRelated reports whether any of the NTP-tunable fields changed in
+// this plan — used by Apply() to gate the single grouped audit-log
+// entry + the post-save NTPApplyHook fire. Iter 53 widens the gate
+// from {ntpProbeEnabled, ntpServers} to also include ntpProbeTimeout
+// (the hook signature already takes per-server timeout; iter 50 just
+// didn't have a path to mutate it from the cloud).
+func (p plannedChange) ntpRelated() bool {
+	return p.ntpProbeEnabled != nil || p.ntpServers != nil || p.ntpProbeTimeout != nil
+}
+
+// anyChange reports whether the plan would mutate any field at all —
+// the gate Apply() uses to short-circuit the no-op heartbeat path
+// (steady-state cloud-converged device hits this on every tick).
+func (p plannedChange) anyChange() bool {
+	return p.auditRetentionDays != nil ||
+		p.ntpProbeEnabled != nil ||
+		p.ntpServers != nil ||
+		p.lanRoutes != nil ||
+		p.ntpProbeTimeout != nil
+}
+
 // Apply ingests `patch` and returns (changed, err). `changed=true` is
 // the signal that cfg.Save() ran AND at least one re-arm callback was
 // invoked — useful for callers that want to log structured diff
@@ -391,12 +466,8 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	prevNTPServers := append([]string(nil), a.cfg.System.ExternalNTPServers...)
 	prevLANRoutes := append([]string(nil), a.cfg.LAN.Routes...)
 
-	type plannedChange struct {
-		auditRetentionDays *int      // non-nil ⇒ mutate to *auditRetentionDays
-		ntpProbeEnabled    *bool     // non-nil ⇒ mutate to *ntpProbeEnabled
-		ntpServers         *[]string // non-nil ⇒ mutate to *ntpServers (post-normalize)
-		lanRoutes          *[]string // non-nil ⇒ mutate to *lanRoutes (post-normalize)
-	}
+	prevNTPTimeout := a.cfg.System.ExternalNTPProbeTimeout
+
 	var plan plannedChange
 
 	if patch.AuditRetentionDays != nil {
@@ -455,12 +526,21 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		}
 	}
 
-	anyChange := plan.auditRetentionDays != nil ||
-		plan.ntpProbeEnabled != nil ||
-		plan.ntpServers != nil ||
-		plan.lanRoutes != nil
+	if patch.ExternalNTPProbeTimeoutSeconds != nil {
+		v := *patch.ExternalNTPProbeTimeoutSeconds
+		if v < MinDesiredNTPProbeTimeoutSeconds || v > MaxDesiredNTPProbeTimeoutSeconds {
+			return false, fmt.Errorf(
+				"externalNTPProbeTimeoutSeconds=%d out of [%d,%d]",
+				v, MinDesiredNTPProbeTimeoutSeconds, MaxDesiredNTPProbeTimeoutSeconds,
+			)
+		}
+		dur := time.Duration(v) * time.Second
+		if dur != prevNTPTimeout {
+			plan.ntpProbeTimeout = &dur
+		}
+	}
 
-	if !anyChange {
+	if !plan.anyChange() {
 		return false, nil
 	}
 
@@ -479,6 +559,9 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	}
 	if plan.lanRoutes != nil {
 		a.cfg.LAN.Routes = *plan.lanRoutes
+	}
+	if plan.ntpProbeTimeout != nil {
+		a.cfg.System.ExternalNTPProbeTimeout = *plan.ntpProbeTimeout
 	}
 
 	if err := a.saver.Save(); err != nil {
@@ -503,6 +586,9 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		if plan.lanRoutes != nil {
 			a.cfg.LAN.Routes = prevLANRoutes
 		}
+		if plan.ntpProbeTimeout != nil {
+			a.cfg.System.ExternalNTPProbeTimeout = prevNTPTimeout
+		}
 		return false, fmt.Errorf("save desired config: %w", err)
 	}
 
@@ -521,19 +607,7 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	// JSON tags so a single normalisation contract spans firmware ↔
 	// cloud.
 	now := a.now()
-	fields := make([]string, 0, 4)
-	if plan.auditRetentionDays != nil {
-		fields = append(fields, "auditRetentionDays")
-	}
-	if plan.ntpProbeEnabled != nil {
-		fields = append(fields, "externalNTPProbeEnabled")
-	}
-	if plan.ntpServers != nil {
-		fields = append(fields, "externalNTPServers")
-	}
-	if plan.lanRoutes != nil {
-		fields = append(fields, "lanRoutes")
-	}
+	fields := plan.fieldNames()
 	a.mu.Lock()
 	a.lastAppliedAt = &now
 	a.lastAppliedFields = fields
@@ -556,23 +630,27 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 				OK:       true,
 			})
 		}
-		if plan.ntpProbeEnabled != nil || plan.ntpServers != nil {
-			// Group both NTP fields into a single audit entry mirroring
-			// the iter-29 local PUT shape (one entry per request,
-			// regardless of whether the operator flipped enabled,
-			// servers, or both). Snapshot the post-mutation slice so
-			// the configlog reader sees the canonical normalised list.
+		if plan.ntpRelated() {
+			// Group all NTP-tunable fields into a single audit entry
+			// mirroring the iter-29 local PUT shape (one entry per
+			// request, regardless of whether the operator flipped
+			// enabled, servers, or both). Iter-53 widens this entry to
+			// also carry the per-server timeout — same single-record
+			// pattern stays. Snapshot the post-mutation slice so the
+			// configlog reader sees the canonical normalised list.
 			postServers := append([]string(nil), a.cfg.System.ExternalNTPServers...)
 			a.appendAudit(configlog.Entry{
 				Action: "system.ntpProbe.update",
 				Actor:  "cloud",
 				Previous: map[string]any{
-					"enabled": prevNTPEnabled,
-					"servers": prevNTPServers,
+					"enabled":          prevNTPEnabled,
+					"servers":          prevNTPServers,
+					"timeoutSeconds":   int(prevNTPTimeout / time.Second),
 				},
 				Next: map[string]any{
-					"enabled": a.cfg.System.ExternalNTPProbeEnabled,
-					"servers": postServers,
+					"enabled":          a.cfg.System.ExternalNTPProbeEnabled,
+					"servers":          postServers,
+					"timeoutSeconds":   int(a.cfg.System.ExternalNTPProbeTimeout / time.Second),
 				},
 				OK: true,
 			})
@@ -629,14 +707,17 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 			Msg("desired-config: audit retention applied from cloud")
 	}
 
-	if plan.ntpProbeEnabled != nil || plan.ntpServers != nil {
+	if plan.ntpRelated() {
 		a.hookMu.Lock()
 		hook := a.ntpHook
 		a.hookMu.Unlock()
 		if hook != nil {
 			// Hand the post-apply snapshot to the hook. The slice is a
 			// fresh copy so the hook can retain it without aliasing
-			// cfg.System.ExternalNTPServers.
+			// cfg.System.ExternalNTPServers. Iter 53 also propagates
+			// the (possibly mutated) per-server timeout — the hook
+			// signature already accepted it; only the value was
+			// pinned to whatever cfg held pre-Apply.
 			postServers := append([]string(nil), a.cfg.System.ExternalNTPServers...)
 			hook(
 				a.cfg.System.ExternalNTPProbeEnabled,
@@ -647,6 +728,7 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		log.Info().
 			Bool("enabled", a.cfg.System.ExternalNTPProbeEnabled).
 			Int("servers", len(a.cfg.System.ExternalNTPServers)).
+			Dur("timeout", a.cfg.System.ExternalNTPProbeTimeout).
 			Msg("desired-config: NTP probe applied from cloud")
 	}
 
