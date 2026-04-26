@@ -1,17 +1,16 @@
-// Cloud → agent config-patch ingestion (iter 48).
+// Cloud → agent config-patch ingestion (iter 48; iter 50 multi-field).
 //
 // Until iter 47 the cloud client was outbound-only: `HBConfigSnapshot`
 // reported the agent's effective config, but a `DesiredConfigPatch`
 // piggy-backed on the heartbeat *response* lets rud1-es push operator
 // edits the other way without standing up a separate command channel.
 //
-// The applier here owns the patch-validate + atomic-save + side-effect
-// (re-arm) sequence for every supported field. It deliberately reuses
-// the existing config-validation constants (the same `[Min, Max]` window
-// the local PUT handler enforces) and the same retentionPruner contract
-// the iter-39 immediate-prune path uses, so a patch landing via the
-// cloud is observationally identical to one landing via
-// `PUT /api/system/audit/retention`.
+// Iter 50 generalises the iter-48/49 single-field (auditRetentionDays)
+// applier to handle the full operator-tunable surface. Each field gets
+// its own validator + diff check + per-field re-arm callback + audit
+// log Action key, all batched into a single atomic Save() per Apply()
+// call — never one Save per field, otherwise a multi-field patch with
+// one bad value would partial-persist before validation rejected it.
 //
 // Safety contract:
 //   - nil patch                                 → no-op, no save.
@@ -24,13 +23,16 @@
 //                                                 cfg.Save() called once,
 //                                                 per-field re-arm
 //                                                 callbacks invoked AFTER
-//                                                 a successful save.
+//                                                 a successful save, one
+//                                                 audit-log entry per
+//                                                 field actually changed.
 
 package agent
 
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +72,27 @@ type auditAppender interface {
 	Append(ctx context.Context, e configlog.Entry) error
 }
 
+// MaxDesiredNTPProbeServers caps the server list the cloud can push,
+// mirroring `handlers.MaxNTPProbeServers` (8) without taking a hard
+// dep on the handlers package. A typo upstream that double-pastes a
+// pool list must NOT silently truncate operator intent — the applier
+// rejects the whole patch above this cap, exactly like the local PUT.
+const MaxDesiredNTPProbeServers = 8
+
+// NTPApplyHook is invoked after a successful Save() when at least one
+// of the NTP-related fields changed. The applier passes the post-apply
+// snapshot (enabled + the canonical server list AFTER normalize) so
+// the hook can push to `SystemTimeHealthHandler.SetProbeOptions` AND
+// reset the heartbeat throttle in a single closure — mirroring the
+// `SetOnApply` wiring on the local PUT handler.
+//
+// `servers` is the post-normalize slice (caller-owned copy, safe to
+// retain). `perServer` is the live cfg.System.ExternalNTPProbeTimeout
+// — iter 50 doesn't expose it as a desired-config field yet, but the
+// hook needs it so the renderer side can rebuild a full
+// ExternalNTPProbeOptions struct without re-reading cfg.
+type NTPApplyHook func(enabled bool, servers []string, perServer time.Duration)
+
 // desiredConfigApplier validates + applies a `DesiredConfigPatch` to
 // the live config, then re-arms whichever runtime triggers the
 // changed fields are wired to. Constructed once at agent boot and
@@ -82,9 +105,15 @@ type auditAppender interface {
 // effect, mirroring the local PUT handler's degraded path.
 //
 // `auditLog` is nil on the same dev-hardware path (no writable
-// /var/lib/rud1/audit). Successful apples are still made; the
+// /var/lib/rud1/audit). Successful applies are still made; the
 // configlog entry is just suppressed (mirrors the local PUT handler's
 // "no auditL ⇒ no Append" branch).
+//
+// `ntpHook` is nil when the time-health handler isn't wired (early
+// boot / tests). When present and an NTP field actually changed the
+// hook fires AFTER the Save + per-field audit-append; mirrors the
+// local PUT's order so the heartbeat throttle reset always trails
+// successful disk persistence.
 //
 // `now` is injectable so tests can pin the timestamp written into the
 // `LastDesiredConfigAppliedAt` accessor without racing the wall clock.
@@ -94,6 +123,9 @@ type desiredConfigApplier struct {
 	saver    configSaver     // defaults to cfg itself; injectable for tests
 	pruner   retentionPruner // may be nil
 	auditLog auditAppender   // may be nil
+
+	hookMu  sync.Mutex
+	ntpHook NTPApplyHook // may be nil
 
 	now func() time.Time
 
@@ -124,6 +156,19 @@ func newDesiredConfigApplier(cfg *config.Config, pruner retentionPruner, auditLo
 	}
 }
 
+// SetNTPApplyHook registers the iter-50 callback the applier fires
+// after a successful save when at least one NTP-related field
+// (`ExternalNTPProbeEnabled`, `ExternalNTPServers`) actually changed.
+// Wired post-construction in agent.go so the callback can capture the
+// `SystemTimeHealthHandler` reference + the throttle-mu pair without
+// the applier needing a hard import of the handlers package. Calling
+// with nil clears the hook (used in tests).
+func (a *desiredConfigApplier) SetNTPApplyHook(fn NTPApplyHook) {
+	a.hookMu.Lock()
+	a.ntpHook = fn
+	a.hookMu.Unlock()
+}
+
 // LastAppliedAt returns a pointer to the wall-clock time of the most
 // recent successful cloud apply, or nil when no cloud apply has ever
 // mutated disk state on this device. Returned by value-copy so the
@@ -138,6 +183,58 @@ func (a *desiredConfigApplier) LastAppliedAt() *time.Time {
 	}
 	t := *a.lastAppliedAt
 	return &t
+}
+
+// normalizeNTPServers mirrors `handlers.normalizeServers` exactly but
+// inlined so the applier doesn't import the handlers package (per the
+// auditAppender comment above — keeping the agent package out of a
+// dep on the HTTP layer it serves). Trims whitespace, drops empties,
+// dedupes case-insensitively, returns an error when the post-dedupe
+// length exceeds MaxDesiredNTPProbeServers. A nil/empty input returns
+// nil (cleared list) — the caller treats empty == "probe disabled
+// regardless of Enabled flag", same semantic the local PUT uses.
+func normalizeNTPServers(in []string) ([]string, error) {
+	if len(in) == 0 {
+		// Distinguish nil from empty for the diff check: a nil-vs-nil
+		// or empty-vs-empty comparison after this is a no-op.
+		return []string{}, nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		key := strings.ToLower(s)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) > MaxDesiredNTPProbeServers {
+		return nil, fmt.Errorf("at most %d NTP servers allowed (got %d)", MaxDesiredNTPProbeServers, len(out))
+	}
+	return out, nil
+}
+
+// stringSlicesEqual is the non-allocating order-sensitive equality used
+// by the diff check. The cloud is expected to send servers in the same
+// canonical order the agent reports back via heartbeat, so a different
+// permutation legitimately means "operator changed the priority order"
+// and SHOULD trip the change path. Order-insensitive equality would
+// silently swallow that intent.
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Apply ingests `patch` and returns (changed, err). `changed=true` is
@@ -163,12 +260,15 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	// no-op-mutation path skips Save entirely.
 	prevAuditRetention := a.cfg.System.AuditRetentionDays
 	prevAuditEffective := a.cfg.System.AuditRetentionDaysOrDefault()
+	prevNTPEnabled := a.cfg.System.ExternalNTPProbeEnabled
+	prevNTPServers := append([]string(nil), a.cfg.System.ExternalNTPServers...)
 
 	type plannedChange struct {
-		auditRetentionDays *int // non-nil ⇒ mutate to *auditRetentionDays
+		auditRetentionDays *int      // non-nil ⇒ mutate to *auditRetentionDays
+		ntpProbeEnabled    *bool     // non-nil ⇒ mutate to *ntpProbeEnabled
+		ntpServers         *[]string // non-nil ⇒ mutate to *ntpServers (post-normalize)
 	}
 	var plan plannedChange
-	anyChange := false
 
 	if patch.AuditRetentionDays != nil {
 		v := *patch.AuditRetentionDays
@@ -185,9 +285,32 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		// contract honest — same input ⇒ same output.
 		if v != prevAuditRetention {
 			plan.auditRetentionDays = &v
-			anyChange = true
 		}
 	}
+
+	if patch.ExternalNTPProbeEnabled != nil {
+		v := *patch.ExternalNTPProbeEnabled
+		if v != prevNTPEnabled {
+			plan.ntpProbeEnabled = &v
+		}
+	}
+
+	if patch.ExternalNTPServers != nil {
+		normalized, err := normalizeNTPServers(*patch.ExternalNTPServers)
+		if err != nil {
+			return false, fmt.Errorf("externalNTPServers: %w", err)
+		}
+		// Treat nil and empty interchangeably for the diff check —
+		// either represents "no servers configured". prev may be nil
+		// (default config) or an empty []string (cleared via local PUT).
+		if !stringSlicesEqual(normalized, prevNTPServers) {
+			plan.ntpServers = &normalized
+		}
+	}
+
+	anyChange := plan.auditRetentionDays != nil ||
+		plan.ntpProbeEnabled != nil ||
+		plan.ntpServers != nil
 
 	if !anyChange {
 		return false, nil
@@ -200,53 +323,85 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	if plan.auditRetentionDays != nil {
 		a.cfg.System.AuditRetentionDays = *plan.auditRetentionDays
 	}
+	if plan.ntpProbeEnabled != nil {
+		a.cfg.System.ExternalNTPProbeEnabled = *plan.ntpProbeEnabled
+	}
+	if plan.ntpServers != nil {
+		a.cfg.System.ExternalNTPServers = *plan.ntpServers
+	}
 
 	if err := a.saver.Save(); err != nil {
-		// Roll back every staged mutation. Currently a single field, but
-		// future patches may carry several — keeping the rollback
-		// symmetric with the mutation stage means new fields just need
-		// a matching restore line.
+		// Roll back every staged mutation. The rollback is symmetric
+		// with the mutation stage so new fields just need a matching
+		// restore line.
 		//
 		// Critical: NO audit log entry on this path. The on-disk YAML
-		// never changed, so emitting a `system.audit.retention.set`
-		// entry would lie to operators reading the configlog page. We
-		// also do NOT advance lastAppliedAt — the cloud must keep
-		// re-pushing until a save succeeds.
+		// never changed, so emitting any `system.*.set` entry would lie
+		// to operators reading the configlog page. We also do NOT
+		// advance lastAppliedAt — the cloud must keep re-pushing until
+		// a save succeeds.
 		if plan.auditRetentionDays != nil {
 			a.cfg.System.AuditRetentionDays = prevAuditRetention
+		}
+		if plan.ntpProbeEnabled != nil {
+			a.cfg.System.ExternalNTPProbeEnabled = prevNTPEnabled
+		}
+		if plan.ntpServers != nil {
+			a.cfg.System.ExternalNTPServers = prevNTPServers
 		}
 		return false, fmt.Errorf("save desired config: %w", err)
 	}
 
 	// Save succeeded — record the apply time so the next heartbeat can
-	// confirm convergence to the cloud. Done BEFORE the prune side
-	// effect because lastAppliedAt is about "did the cloud's edit reach
-	// disk", not "did the prune run cleanly". Mirrors the local PUT
-	// handler's choice to return 200 on prune failure.
+	// confirm convergence to the cloud. Done BEFORE the prune / hook
+	// side effects because lastAppliedAt is about "did the cloud's
+	// edit reach disk", not "did the side-effects run cleanly".
 	now := a.now()
 	a.mu.Lock()
 	a.lastAppliedAt = &now
 	a.mu.Unlock()
 
-	// Mirror the local PUT handler's audit-log shape exactly: same
-	// Action, same Previous/Next map keys, only the Actor differs
-	// ("cloud" instead of "operator") so the configlog page can
-	// disambiguate cloud-applied edits from operator-applied ones.
-	// Append failures are warn-logged but never propagated — matches
-	// every other audit-emitting handler in the codebase.
-	if a.auditLog != nil && plan.auditRetentionDays != nil {
-		if err := a.auditLog.Append(context.Background(), configlog.Entry{
-			Action:   "system.audit.retention.set",
-			Actor:    "cloud",
-			Previous: map[string]any{"days": prevAuditRetention},
-			Next:     map[string]any{"days": *plan.auditRetentionDays},
-			OK:       true,
-		}); err != nil {
-			log.Warn().Err(err).Msg("desired-config: audit append failed (non-fatal)")
+	// ── Stage 3: per-field audit-log entries ────────────────────────────
+	// One Action key per field actually changed. Mirrors the local PUT
+	// handlers' Actions exactly (`system.audit.retention.set`,
+	// `system.ntpProbe.update`) — only the Actor differs ("cloud" vs
+	// "operator") so the configlog page can disambiguate cloud-applied
+	// edits from operator-applied ones. Append failures are warn-logged
+	// but never propagated.
+	if a.auditLog != nil {
+		if plan.auditRetentionDays != nil {
+			a.appendAudit(configlog.Entry{
+				Action:   "system.audit.retention.set",
+				Actor:    "cloud",
+				Previous: map[string]any{"days": prevAuditRetention},
+				Next:     map[string]any{"days": *plan.auditRetentionDays},
+				OK:       true,
+			})
+		}
+		if plan.ntpProbeEnabled != nil || plan.ntpServers != nil {
+			// Group both NTP fields into a single audit entry mirroring
+			// the iter-29 local PUT shape (one entry per request,
+			// regardless of whether the operator flipped enabled,
+			// servers, or both). Snapshot the post-mutation slice so
+			// the configlog reader sees the canonical normalised list.
+			postServers := append([]string(nil), a.cfg.System.ExternalNTPServers...)
+			a.appendAudit(configlog.Entry{
+				Action: "system.ntpProbe.update",
+				Actor:  "cloud",
+				Previous: map[string]any{
+					"enabled": prevNTPEnabled,
+					"servers": prevNTPServers,
+				},
+				Next: map[string]any{
+					"enabled": a.cfg.System.ExternalNTPProbeEnabled,
+					"servers": postServers,
+				},
+				OK: true,
+			})
 		}
 	}
 
-	// ── Stage 3: re-arm runtime triggers ────────────────────────────────
+	// ── Stage 4: re-arm runtime triggers ────────────────────────────────
 	// Only after a successful save — a re-arm before persistence would
 	// leave the runtime out of sync with the YAML if Save() failed.
 	if plan.auditRetentionDays != nil {
@@ -278,5 +433,39 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 			Msg("desired-config: audit retention applied from cloud")
 	}
 
+	if plan.ntpProbeEnabled != nil || plan.ntpServers != nil {
+		a.hookMu.Lock()
+		hook := a.ntpHook
+		a.hookMu.Unlock()
+		if hook != nil {
+			// Hand the post-apply snapshot to the hook. The slice is a
+			// fresh copy so the hook can retain it without aliasing
+			// cfg.System.ExternalNTPServers.
+			postServers := append([]string(nil), a.cfg.System.ExternalNTPServers...)
+			hook(
+				a.cfg.System.ExternalNTPProbeEnabled,
+				postServers,
+				a.cfg.System.ExternalNTPProbeTimeout,
+			)
+		}
+		log.Info().
+			Bool("enabled", a.cfg.System.ExternalNTPProbeEnabled).
+			Int("servers", len(a.cfg.System.ExternalNTPServers)).
+			Msg("desired-config: NTP probe applied from cloud")
+	}
+
 	return true, nil
+}
+
+// appendAudit is a thin wrapper that emits one configlog entry and
+// warn-logs an append failure rather than propagating it. Centralised
+// so each per-field audit emission in Apply() stays a single line.
+// Skipped silently when auditLog is nil (dev-hardware degraded path).
+func (a *desiredConfigApplier) appendAudit(e configlog.Entry) {
+	if a.auditLog == nil {
+		return
+	}
+	if err := a.auditLog.Append(context.Background(), e); err != nil {
+		log.Warn().Err(err).Str("action", e.Action).Msg("desired-config: audit append failed (non-fatal)")
+	}
 }

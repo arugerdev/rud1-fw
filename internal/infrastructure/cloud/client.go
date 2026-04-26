@@ -516,6 +516,22 @@ type DesiredConfigPatch struct {
 	// value is strictly smaller than the previous effective window —
 	// matching the iter-39 prune-on-shrink contract.
 	AuditRetentionDays *int `json:"auditRetentionDays,omitempty"`
+
+	// ExternalNTPProbeEnabled mirrors `cfg.System.ExternalNTPProbeEnabled`
+	// (iter 50). A change re-arms the runtime time-health handler via
+	// SetProbeOptions AND resets the heartbeat throttle so the next
+	// tick re-emits the (potentially changed) timeHealth block instead
+	// of waiting for the 1h keepalive — same observable behaviour as
+	// `PUT /api/system/ntp-probe-config`.
+	ExternalNTPProbeEnabled *bool `json:"externalNTPProbeEnabled,omitempty"`
+
+	// ExternalNTPServers mirrors `cfg.System.ExternalNTPServers` (iter 50).
+	// The agent normalises the list (trim, drop empties, dedupe
+	// case-insensitively) and rejects when more than MaxNTPProbeServers
+	// remain — same window the local PUT enforces. An explicit empty
+	// slice clears the list (probe becomes effectively disabled regardless
+	// of the Enabled flag — matches the local PUT semantics).
+	ExternalNTPServers *[]string `json:"externalNTPServers,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.

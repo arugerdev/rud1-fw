@@ -471,6 +471,26 @@ func New(cfg *config.Config) (*Agent, error) {
 		desiredAuditLog = a.auditLog
 	}
 	a.desiredConfig = newDesiredConfigApplier(cfg, desiredPruner, desiredAuditLog)
+	// Iter 50: wire the NTP-probe re-arm hook so a cloud-pushed
+	// `externalNTPProbeEnabled`/`externalNTPServers` mutation is observ-
+	// ationally identical to a local PUT. The hook fires after a
+	// successful save + audit-append; it pushes the live opts into the
+	// time-health handler (so the next /api/system/time-health call
+	// sees the new state) AND resets the heartbeat throttle (so the
+	// next heartbeat re-emits the timeHealth block immediately rather
+	// than waiting for the 1h keepalive). Captured by closure so the
+	// applier itself stays free of HTTP-layer imports.
+	a.desiredConfig.SetNTPApplyHook(func(enabled bool, servers []string, perServer time.Duration) {
+		sysTimeHealthH.SetProbeOptions(handlers.ExternalNTPProbeOptions{
+			Enabled:   enabled,
+			Servers:   servers,
+			PerServer: perServer,
+		})
+		a.timeHealthThrottleMu.Lock()
+		a.lastTimeHealthSent = time.Time{}
+		a.lastTimeHealthFingerprint = ""
+		a.timeHealthThrottleMu.Unlock()
+	})
 
 	return a, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -895,3 +896,438 @@ type stubDesiredState struct {
 }
 
 func (s stubDesiredState) LastAppliedAt() *time.Time { return s.at }
+
+// ── iter 50: multi-field desired-config (externalNTP fields) ───────────
+
+// boolPtr / strSlicePtr keep the iter-50 table-driven tests readable.
+func boolPtr(v bool) *bool                { return &v }
+func strSlicePtr(v ...string) *[]string   { x := append([]string(nil), v...); return &x }
+
+// fakeNTPHook captures the iter-50 NTPApplyHook payloads so tests can
+// pin the callback runs against the exact post-apply snapshot the
+// applier built.
+type fakeNTPHook struct {
+	mu           sync.Mutex
+	calls        int
+	lastEnabled  bool
+	lastServers  []string
+	lastPerSrv   time.Duration
+}
+
+func (h *fakeNTPHook) Hook() NTPApplyHook {
+	return func(enabled bool, servers []string, perServer time.Duration) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.calls++
+		h.lastEnabled = enabled
+		h.lastServers = append([]string(nil), servers...)
+		h.lastPerSrv = perServer
+	}
+}
+
+func (h *fakeNTPHook) snapshot() (int, bool, []string, time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := append([]string(nil), h.lastServers...)
+	return h.calls, h.lastEnabled, out, h.lastPerSrv
+}
+
+// TestHeartbeatResponse_DecodesNTPFields pins the wire shape: the cloud
+// can ship `externalNTPProbeEnabled` and `externalNTPServers` inside
+// the `desiredConfig` block. The decoder must surface them on the
+// pointer-typed fields without disturbing the iter-48 retention field.
+func TestHeartbeatResponse_DecodesNTPFields(t *testing.T) {
+	body := `{
+		"ok": true,
+		"desiredConfig": {
+			"auditRetentionDays": 21,
+			"externalNTPProbeEnabled": true,
+			"externalNTPServers": ["pool.ntp.org", "time.cloudflare.com"]
+		}
+	}`
+	var resp cloud.HeartbeatResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DesiredConfig == nil {
+		t.Fatalf("DesiredConfig nil")
+	}
+	if resp.DesiredConfig.ExternalNTPProbeEnabled == nil || *resp.DesiredConfig.ExternalNTPProbeEnabled != true {
+		t.Fatalf("ExternalNTPProbeEnabled missing or wrong: %+v",
+			resp.DesiredConfig.ExternalNTPProbeEnabled)
+	}
+	if resp.DesiredConfig.ExternalNTPServers == nil ||
+		len(*resp.DesiredConfig.ExternalNTPServers) != 2 ||
+		(*resp.DesiredConfig.ExternalNTPServers)[0] != "pool.ntp.org" {
+		t.Fatalf("ExternalNTPServers: %+v", resp.DesiredConfig.ExternalNTPServers)
+	}
+	if resp.DesiredConfig.AuditRetentionDays == nil || *resp.DesiredConfig.AuditRetentionDays != 21 {
+		t.Fatalf("retention field disturbed: %+v", resp.DesiredConfig.AuditRetentionDays)
+	}
+}
+
+// TestApply_NTPEnabled_FiresHook_Persists_Audits is the iter-50 happy
+// path: a cloud push enabling the probe must persist via Save, fire
+// the NTP apply hook with the post-snapshot values, and emit one
+// `system.ntpProbe.update` audit entry with Actor:"cloud".
+func TestApply_NTPEnabled_FiresHook_Persists_Audits(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeEnabled = false
+	cfg.System.ExternalNTPProbeTimeout = 3 * time.Second
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{ExternalNTPProbeEnabled: boolPtr(true)}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false, want true")
+	}
+	if !cfg.System.ExternalNTPProbeEnabled {
+		t.Fatalf("cfg not mutated")
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1", saver.calls.Load())
+	}
+	calls, gotEnabled, _, gotPerSrv := hook.snapshot()
+	if calls != 1 {
+		t.Fatalf("hook calls=%d, want 1", calls)
+	}
+	if !gotEnabled {
+		t.Fatalf("hook saw enabled=%v, want true", gotEnabled)
+	}
+	if gotPerSrv != 3*time.Second {
+		t.Fatalf("hook saw perServer=%v, want 3s (preserved from cfg)", gotPerSrv)
+	}
+	entries := appender.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries=%d, want 1", len(entries))
+	}
+	if entries[0].Action != "system.ntpProbe.update" {
+		t.Fatalf("Action=%q, want system.ntpProbe.update", entries[0].Action)
+	}
+	if entries[0].Actor != "cloud" {
+		t.Fatalf("Actor=%q, want cloud", entries[0].Actor)
+	}
+	if a.LastAppliedAt() == nil {
+		t.Fatalf("LastAppliedAt should advance on NTP apply")
+	}
+}
+
+// TestApply_NTPServers_NormalizeAndDedupe pins the iter-50 server-list
+// validation: the applier trims, drops empties, dedupes case-insensitive,
+// and writes the canonical list to disk. Mirrors `handlers.normalizeServers`
+// — a cloud push and a local PUT must produce byte-identical YAML.
+func TestApply_NTPServers_NormalizeAndDedupe(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPServers = nil
+	saver := &fakeSaver{}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{
+		ExternalNTPServers: strSlicePtr(
+			"  pool.ntp.org  ", "", "POOL.ntp.org", "time.cloudflare.com",
+		),
+	}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false")
+	}
+	want := []string{"pool.ntp.org", "time.cloudflare.com"}
+	got := cfg.System.ExternalNTPServers
+	if len(got) != len(want) {
+		t.Fatalf("post-normalize len=%d, want %d (got %v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("post-normalize[%d]=%q, want %q (got %v)", i, got[i], want[i], got)
+		}
+	}
+	_, _, hookServers, _ := hook.snapshot()
+	if len(hookServers) != len(want) || hookServers[0] != want[0] {
+		t.Fatalf("hook saw servers=%v, want %v", hookServers, want)
+	}
+}
+
+// TestApply_NTPServers_OverCapRejected pins the upper-bound rejection:
+// more than MaxDesiredNTPProbeServers entries (after dedupe) must
+// reject the whole patch. A cloud bug pasting the same list twice
+// must NOT silently truncate operator intent.
+func TestApply_NTPServers_OverCapRejected(t *testing.T) {
+	cfg := config.Default()
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	too := make([]string, MaxDesiredNTPProbeServers+1)
+	for i := range too {
+		too[i] = fmt.Sprintf("ntp-%d.example", i)
+	}
+	patch := &cloud.DesiredConfigPatch{ExternalNTPServers: &too}
+	_, err := a.Apply(patch)
+	if err == nil {
+		t.Fatalf("over-cap server list must error")
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("rejected patch must not Save, got %d", saver.calls.Load())
+	}
+}
+
+// TestApply_NTPMultiField_AtomicSingleSave is the headline iter-50
+// invariant: a patch carrying BOTH NTP fields fires exactly ONE Save()
+// — never one per field, otherwise a multi-field patch with a bad
+// value would partial-persist before the validator rejected it. Also
+// fires exactly ONE hook invocation with the joint post-apply snapshot.
+func TestApply_NTPMultiField_AtomicSingleSave(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeEnabled = false
+	cfg.System.ExternalNTPServers = nil
+	saver := &fakeSaver{}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{
+		ExternalNTPProbeEnabled: boolPtr(true),
+		ExternalNTPServers:      strSlicePtr("pool.ntp.org"),
+	}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false")
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("multi-field patch must Save exactly once, got %d", saver.calls.Load())
+	}
+	calls, gotEnabled, gotServers, _ := hook.snapshot()
+	if calls != 1 {
+		t.Fatalf("multi-field patch must fire hook exactly once, got %d calls", calls)
+	}
+	if !gotEnabled || len(gotServers) != 1 {
+		t.Fatalf("hook saw joint snapshot wrong: enabled=%v servers=%v", gotEnabled, gotServers)
+	}
+}
+
+// TestApply_RetentionAndNTP_TwoAuditEntries: a patch touching both
+// the retention field AND an NTP field must emit exactly ONE entry per
+// field (not one combined entry, not three). One Save, one
+// LastAppliedAt advance, two configlog entries — same as if the
+// operator had done two sequential local PUTs.
+func TestApply_RetentionAndNTP_TwoAuditEntries(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	cfg.System.ExternalNTPProbeEnabled = false
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+
+	patch := &cloud.DesiredConfigPatch{
+		AuditRetentionDays:      intPtr(7),
+		ExternalNTPProbeEnabled: boolPtr(true),
+	}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1", saver.calls.Load())
+	}
+	entries := appender.snapshot()
+	if len(entries) != 2 {
+		t.Fatalf("audit entries=%d, want 2 (one per field)", len(entries))
+	}
+	actions := map[string]bool{entries[0].Action: true, entries[1].Action: true}
+	if !actions["system.audit.retention.set"] || !actions["system.ntpProbe.update"] {
+		t.Fatalf("expected both Action keys, got %v", actions)
+	}
+	for _, e := range entries {
+		if e.Actor != "cloud" {
+			t.Fatalf("Actor=%q on entry %s, want cloud", e.Actor, e.Action)
+		}
+	}
+}
+
+// TestApply_NTP_SameValue_NoOp pins the steady-state path: once the
+// cloud has converged on the NTP fields, every subsequent heartbeat
+// carrying the same values must NOT touch disk and must NOT fire the
+// re-arm hook (otherwise the heartbeat throttle would reset every
+// tick — the local PUT semantic is identical).
+func TestApply_NTP_SameValue_NoOp(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeEnabled = true
+	cfg.System.ExternalNTPServers = []string{"pool.ntp.org"}
+	saver := &fakeSaver{}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{
+		ExternalNTPProbeEnabled: boolPtr(true),
+		ExternalNTPServers:      strSlicePtr("pool.ntp.org"),
+	}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if changed {
+		t.Fatalf("same-value apply must report changed=false")
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("same-value apply must not Save, got %d", saver.calls.Load())
+	}
+	calls, _, _, _ := hook.snapshot()
+	if calls != 0 {
+		t.Fatalf("same-value apply must not fire hook, got %d calls", calls)
+	}
+}
+
+// TestApply_NTPSaveError_RollsBack: a Save() failure with a multi-field
+// NTP patch must roll BOTH fields back to their pre-apply values so
+// the runtime doesn't drift from disk. The hook must NOT fire either.
+func TestApply_NTPSaveError_RollsBack(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeEnabled = false
+	cfg.System.ExternalNTPServers = []string{"old.example"}
+	saver := &fakeSaver{err: errors.New("fs full")}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{
+		ExternalNTPProbeEnabled: boolPtr(true),
+		ExternalNTPServers:      strSlicePtr("new.example"),
+	}
+	if _, err := a.Apply(patch); err == nil {
+		t.Fatalf("save error must propagate")
+	}
+	if cfg.System.ExternalNTPProbeEnabled {
+		t.Fatalf("enabled rolled forward despite save failure")
+	}
+	if len(cfg.System.ExternalNTPServers) != 1 || cfg.System.ExternalNTPServers[0] != "old.example" {
+		t.Fatalf("servers rolled forward despite save failure: %v", cfg.System.ExternalNTPServers)
+	}
+	calls, _, _, _ := hook.snapshot()
+	if calls != 0 {
+		t.Fatalf("hook fired despite save failure, got %d calls", calls)
+	}
+}
+
+// TestApply_NTPNoHook_StillSaves covers the "hook not yet wired"
+// boot-window: if the agent hasn't registered the NTP hook yet (early
+// bootstrap), the applier must still persist + audit-log without
+// panicking. Mirrors the iter-49 nil-pruner contract.
+func TestApply_NTPNoHook_StillSaves(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPProbeEnabled = false
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	// no SetNTPApplyHook call
+
+	patch := &cloud.DesiredConfigPatch{ExternalNTPProbeEnabled: boolPtr(true)}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed || !cfg.System.ExternalNTPProbeEnabled || saver.calls.Load() != 1 {
+		t.Fatalf("nil hook must not block save: changed=%v cfg=%v saves=%d",
+			changed, cfg.System.ExternalNTPProbeEnabled, saver.calls.Load())
+	}
+}
+
+// TestApply_NTPServers_EmptyClears pins the "explicit empty list
+// clears" semantic. A cloud push of `externalNTPServers: []` must
+// reach disk as an empty list AND fire the hook so the live
+// time-health handler stops probing.
+func TestApply_NTPServers_EmptyClears(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPServers = []string{"pool.ntp.org"}
+	saver := &fakeSaver{}
+	hook := &fakeNTPHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetNTPApplyHook(hook.Hook())
+
+	empty := []string{}
+	patch := &cloud.DesiredConfigPatch{ExternalNTPServers: &empty}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(cfg.System.ExternalNTPServers) != 0 {
+		t.Fatalf("servers not cleared: %v", cfg.System.ExternalNTPServers)
+	}
+	calls, _, hookServers, _ := hook.snapshot()
+	if calls != 1 {
+		t.Fatalf("hook calls=%d, want 1 on clear", calls)
+	}
+	if len(hookServers) != 0 {
+		t.Fatalf("hook saw non-empty servers on clear: %v", hookServers)
+	}
+}
+
+// TestApply_NTP_OrderChange_TripsDiff: server-list order matters. The
+// cloud sending a different permutation legitimately means "operator
+// changed the priority order"; the diff check must trip on that path
+// rather than treating it as a no-op.
+func TestApply_NTP_OrderChange_TripsDiff(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.ExternalNTPServers = []string{"a.example", "b.example"}
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	patch := &cloud.DesiredConfigPatch{
+		ExternalNTPServers: strSlicePtr("b.example", "a.example"),
+	}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("order change must trip diff (changed=false)")
+	}
+	if cfg.System.ExternalNTPServers[0] != "b.example" {
+		t.Fatalf("post-apply order wrong: %v", cfg.System.ExternalNTPServers)
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1", saver.calls.Load())
+	}
+}
+
+// TestNormalizeNTPServers_Direct exercises the inlined normalize
+// helper directly so each branch (trim, drop-empty, dedupe, over-cap
+// reject) is pinned independent of the Apply() integration.
+func TestNormalizeNTPServers_Direct(t *testing.T) {
+	t.Run("nil_returns_empty", func(t *testing.T) {
+		out, err := normalizeNTPServers(nil)
+		if err != nil || len(out) != 0 {
+			t.Fatalf("got (%v, %v)", out, err)
+		}
+	})
+	t.Run("trims_drops_empties_dedupes", func(t *testing.T) {
+		out, err := normalizeNTPServers([]string{" a ", "", "A", "b"})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if len(out) != 2 || out[0] != "a" || out[1] != "b" {
+			t.Fatalf("got %v", out)
+		}
+	})
+	t.Run("over_cap_errors", func(t *testing.T) {
+		too := make([]string, MaxDesiredNTPProbeServers+1)
+		for i := range too {
+			too[i] = fmt.Sprintf("h%d.example", i)
+		}
+		_, err := normalizeNTPServers(too)
+		if err == nil {
+			t.Fatalf("over-cap must error")
+		}
+	})
+}
