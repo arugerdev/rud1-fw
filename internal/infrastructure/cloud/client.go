@@ -313,10 +313,17 @@ type HBLANRoute struct {
 // WG peers, so the cloud can advertise them in each client peer's
 // AllowedIPs. `Enabled=false` or empty `Routes` ⇒ cloud ignores the field
 // and emits only the Pi's own /24.
+//
+// LastAppliedAt is the wall-clock time of the most recent Apply() call on
+// the lan.Manager (RFC3339, omitted when zero). Surfaced so the cloud
+// dashboard can mirror the rud1-app StatusStrip's "Última sync" indicator
+// — operators can confirm at a glance the kernel state matches what the
+// cloud thinks without SSH'ing in.
 type HBLAN struct {
-	Enabled bool         `json:"enabled"`
-	Uplink  string       `json:"uplink,omitempty"`
-	Routes  []HBLANRoute `json:"routes,omitempty"`
+	Enabled       bool         `json:"enabled"`
+	Uplink        string       `json:"uplink,omitempty"`
+	Routes        []HBLANRoute `json:"routes,omitempty"`
+	LastAppliedAt string       `json:"lastAppliedAt,omitempty"`
 }
 
 // HBInfo carries static device identification fields.

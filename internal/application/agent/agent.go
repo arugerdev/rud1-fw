@@ -940,6 +940,14 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			Uplink:  a.lanMgr.Uplink(),
 			Routes:  routes,
 		}
+		// Iter 57: surface the kernel-side apply timestamp so the cloud can
+		// render a "last sync" chip mirroring the on-device StatusStrip.
+		// Zero ⇒ Apply has never run this boot (e.g. routing flag-toggled on
+		// but no subnets configured yet); omit the field entirely so older
+		// cloud code paths stay neutral.
+		if t := a.lanMgr.LastAppliedAt(); !t.IsZero() {
+			hbLAN.LastAppliedAt = t.UTC().Format(time.RFC3339Nano)
+		}
 	}
 
 	// ── System (extended stats) ───────────────────────────────────────────
