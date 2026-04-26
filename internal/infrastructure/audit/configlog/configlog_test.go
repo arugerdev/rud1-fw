@@ -1401,3 +1401,88 @@ func TestStatsCompressionByDayBelowCapNoTrim(t *testing.T) {
 		t.Fatalf("CompressionByDay len=%d, want %d (below cap, no trim)", len(got.CompressionByDay), days)
 	}
 }
+
+// TestAddCompressionDayCappedSortInvariantOldestFirst (iter 46): pin
+// the cap contract to the day key itself, not to the iteration order.
+// The iter-45 implementation relied on listFiles() returning newest-
+// first and "stopped adding once full", which silently inverts to
+// "keep oldest 90" if a future re-sort or filename-format change flips
+// the order. Iterate 95 days oldest-first and assert that the newest
+// 90 are still kept and the 5 oldest are dropped — the regression
+// that catches a sort-order flip.
+func TestAddCompressionDayCappedSortInvariantOldestFirst(t *testing.T) {
+	const total = 95
+	const cap = 90 // mirrors maxCompressionDays
+	newest := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
+
+	// Build day keys oldest-first (the inverse of listFiles()'s real
+	// order). i=0 is the oldest (newest-94d), i=total-1 is newest.
+	var m map[string]float64
+	for i := 0; i < total; i++ {
+		day := newest.AddDate(0, 0, -(total-1-i)).Format("2006-01-02")
+		m = addCompressionDayCapped(m, day, 1.0+float64(i)/100.0, cap)
+	}
+
+	if len(m) != cap {
+		t.Fatalf("len=%d, want %d (cap must hold regardless of iteration order)", len(m), cap)
+	}
+	// Newest 90 days kept (i=0 is newest, i=89 is newest-89d).
+	for i := 0; i < cap; i++ {
+		day := newest.AddDate(0, 0, -i).Format("2006-01-02")
+		if _, ok := m[day]; !ok {
+			t.Fatalf("expected newest-%d day %q kept under oldest-first iteration; got map=%v", i, day, m)
+		}
+	}
+	// Oldest 5 days dropped.
+	for i := cap; i < total; i++ {
+		day := newest.AddDate(0, 0, -i).Format("2006-01-02")
+		if _, ok := m[day]; ok {
+			t.Fatalf("expected oldest day %q dropped under oldest-first iteration (i=%d)", day, i)
+		}
+	}
+}
+
+// TestAddCompressionDayCappedTieBreakRandomOrder (iter 46): with
+// exactly cap+1 days inserted in a deterministic-but-shuffled order,
+// the resulting map must hold exactly `cap` entries and the single
+// dropped key must be the lexicographically-smallest YYYY-MM-DD
+// (which, given fixed-width day keys, is the chronologically oldest).
+// Pinning this catches accidental "drop newest" or "drop random"
+// regressions in the eviction path.
+func TestAddCompressionDayCappedTieBreakRandomOrder(t *testing.T) {
+	const cap = 5 // small cap keeps the test legible
+	const total = cap + 1
+
+	// Six consecutive days starting 2026-04-20 → 2026-04-25.
+	base := time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)
+	days := make([]string, total)
+	for i := 0; i < total; i++ {
+		days[i] = base.AddDate(0, 0, i).Format("2006-01-02")
+	}
+	// Deterministic non-monotonic permutation — explicitly avoids
+	// either pure newest-first or pure oldest-first so neither sort
+	// order can accidentally satisfy the test.
+	order := []int{3, 0, 5, 1, 4, 2}
+	if len(order) != total {
+		t.Fatalf("test setup: order len=%d, want %d", len(order), total)
+	}
+
+	var m map[string]float64
+	for _, i := range order {
+		m = addCompressionDayCapped(m, days[i], 1.0+float64(i)/10.0, cap)
+	}
+
+	if len(m) != cap {
+		t.Fatalf("len=%d, want %d", len(m), cap)
+	}
+	// The lex-smallest key (days[0] = "2026-04-20") must be the one
+	// dropped; the other five must all be present.
+	if _, ok := m[days[0]]; ok {
+		t.Fatalf("expected lex-smallest %q to be evicted; got map=%v", days[0], m)
+	}
+	for i := 1; i < total; i++ {
+		if _, ok := m[days[i]]; !ok {
+			t.Fatalf("expected %q to be retained; got map=%v", days[i], m)
+		}
+	}
+}

@@ -728,21 +728,27 @@ func (l *DiskLogger) Stats() (Stats, error) {
 		// re-marshal estimate dropped to zero (malformed gzip whose
 		// entries can't be parsed back into Entry shapes).
 		//
-		// Iter 45: cap the histogram at maxCompressionDays. `names` is
-		// sorted newest-first so we simply stop adding once we've
-		// reached the bound — keeping the most recent N days, dropping
-		// the oldest. Aggregates above (TotalBytes/EntryBytes/
-		// FileCount/TotalEntries) are NOT affected by this cap; they
-		// remain a full inventory of on-disk state.
+		// Iter 45: cap the histogram at maxCompressionDays. Aggregates
+		// above (TotalBytes/EntryBytes/FileCount/TotalEntries) are NOT
+		// affected by this cap; they remain a full inventory of on-disk
+		// state.
+		//
+		// Iter 46: switch from "stop adding once full" to "evict oldest
+		// when at cap" via addCompressionDayCapped. The behaviour is
+		// identical for the current newest-first iteration order — we
+		// still keep the most recent N days — but the contract is now
+		// pinned to the day key itself (smallest YYYY-MM-DD evicted)
+		// rather than to the iteration order, so a future re-sort or
+		// filename-format change cannot quietly invert which days the
+		// fleet dashboard sees.
 		if fileEntryBytes > 0 && fi.Size() > 0 && fileEntryBytes > fi.Size() {
-			if len(out.CompressionByDay) < maxCompressionDays {
-				day := dayKeyFromName(name)
-				if day != "" {
-					if out.CompressionByDay == nil {
-						out.CompressionByDay = make(map[string]float64)
-					}
-					out.CompressionByDay[day] = float64(fileEntryBytes) / float64(fi.Size())
-				}
+			day := dayKeyFromName(name)
+			if day != "" {
+				out.CompressionByDay = addCompressionDayCapped(
+					out.CompressionByDay, day,
+					float64(fileEntryBytes)/float64(fi.Size()),
+					maxCompressionDays,
+				)
 			}
 		}
 	}
@@ -759,6 +765,55 @@ func (l *DiskLogger) Stats() (Stats, error) {
 		out.OldestEntryAt = oldest
 	}
 	return out, nil
+}
+
+// addCompressionDayCapped inserts (day -> ratio) into m, evicting the
+// lexicographically-smallest existing key first when m is already at
+// the cap. Day keys are YYYY-MM-DD strings, so lexical order is also
+// chronological order — the evicted key is the oldest day in the map.
+//
+// The map is allocated lazily so callers can pass nil for the
+// first-insert case. If `day` is already present, the value is updated
+// in place without touching the eviction path (the size is unchanged).
+//
+// Iter 46: factored out of Stats() so the cap contract is independent
+// of the directory-listing sort order. The previous implementation
+// ("stop adding once len == cap") relied on listFiles() returning
+// names newest-first; a future re-sort or filename-format change would
+// have silently inverted which days the fleet dashboard kept.
+func addCompressionDayCapped(m map[string]float64, day string, ratio float64, cap int) map[string]float64 {
+	if cap <= 0 {
+		return m
+	}
+	if m == nil {
+		m = make(map[string]float64)
+	}
+	if _, exists := m[day]; exists {
+		m[day] = ratio
+		return m
+	}
+	if len(m) >= cap {
+		// Find the lexicographically-smallest key (oldest YYYY-MM-DD)
+		// and evict it. We only do this on the insert path, so the
+		// O(N) scan runs at most once per day-file past the cap —
+		// negligible for N=90 and a heartbeat-cadence Stats() call.
+		var oldest string
+		for k := range m {
+			if oldest == "" || k < oldest {
+				oldest = k
+			}
+		}
+		// Refuse to evict ourselves: if the incoming day is older than
+		// every existing key, drop the new entry instead. This keeps
+		// the "newest N kept" guarantee true for arbitrary iteration
+		// orders — including the oldest-first regression case.
+		if day < oldest {
+			return m
+		}
+		delete(m, oldest)
+	}
+	m[day] = ratio
+	return m
 }
 
 // boundaryAt returns the timestamp of the last (newest) or first
