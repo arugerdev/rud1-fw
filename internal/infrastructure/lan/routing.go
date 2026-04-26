@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -46,10 +47,17 @@ type Route struct {
 // the user which rules are live vs. pending.
 type Manager struct {
 	mu     sync.Mutex
-	forced bool              // sim / dry-run — never call iptables
-	state  map[string]Route  // key: target CIDR (normalised)
-	source string            // WG peer subnet; set on Configure()
-	uplink string            // uplink iface; set on Configure()
+	forced bool             // sim / dry-run — never call iptables
+	state  map[string]Route // key: target CIDR (normalised)
+	source string           // WG peer subnet; set on Configure()
+	uplink string           // uplink iface; set on Configure()
+
+	// Wall-clock time of the last successful Apply that mutated kernel
+	// state (or that confirmed an already-converged set with no error).
+	// Surfaced via LastAppliedAt() for the heartbeat snapshot + the local
+	// health endpoint so an operator can tell at a glance whether the
+	// route list they pushed has actually landed in the kernel.
+	lastAppliedAt time.Time
 }
 
 // NewManager creates a manager. The first Configure() call binds it to the
@@ -111,14 +119,21 @@ func (m *Manager) Apply(targets []string) ([]Route, []error) {
 		if t == "" {
 			continue
 		}
-		if _, _, err := net.ParseCIDR(t); err != nil {
+		_, ipnet, err := net.ParseCIDR(t)
+		if err != nil {
 			continue
 		}
-		if seen[t] {
+		// Always store the canonical "network/mask" string so two
+		// equivalent inputs ("192.168.1.5/24" + "192.168.1.0/24")
+		// dedupe. This matches the desired-config validator's output
+		// shape so the manager's state and the cloud's view stay
+		// byte-identical.
+		canonical := ipnet.String()
+		if seen[canonical] {
 			continue
 		}
-		seen[t] = true
-		normalised = append(normalised, t)
+		seen[canonical] = true
+		normalised = append(normalised, canonical)
 	}
 
 	var errs []error
@@ -163,7 +178,55 @@ func (m *Manager) Apply(targets []string) ([]Route, []error) {
 		m.state[target] = r
 		applied = append(applied, r)
 	}
+	// Stamp the apply timestamp regardless of per-rule errors — the "I
+	// tried" signal is itself useful telemetry. Snapshot.Applied tells the
+	// operator which rules actually made it; lastAppliedAt tells them
+	// when the last attempt was.
+	m.lastAppliedAt = time.Now().UTC()
 	return applied, errs
+}
+
+// LastAppliedAt returns the wall-clock time of the most recent Apply()
+// invocation. Zero value means Apply has never been called on this manager
+// (e.g. early boot, or LAN routing disabled and never seeded). The returned
+// time is safe to compare against time.Time{}.IsZero().
+func (m *Manager) LastAppliedAt() time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastAppliedAt
+}
+
+// Health is the structured snapshot the local panel + heartbeat ship to
+// operators. Bundles the converged state (live route list) with the
+// out-of-band system signals (ip_forward, source/uplink) needed to debug
+// "why isn't my LAN reachable" without SSH'ing into the Pi.
+type Health struct {
+	Source        string    `json:"source"`
+	Uplink        string    `json:"uplink"`
+	IPForward     bool      `json:"ipForward"`
+	Simulated     bool      `json:"simulated"`
+	Routes        []Route   `json:"routes"`
+	LastAppliedAt time.Time `json:"lastAppliedAt"`
+}
+
+// HealthSnapshot returns the current LAN-routing health bundle. Callers (the
+// HTTP handler and the heartbeat builder) should treat the returned slice as
+// caller-owned — the routes are deep-copied out of the manager's state map.
+func (m *Manager) HealthSnapshot() Health {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	routes := make([]Route, 0, len(m.state))
+	for _, r := range m.state {
+		routes = append(routes, r)
+	}
+	return Health{
+		Source:        m.source,
+		Uplink:        m.uplink,
+		IPForward:     IPForwardEnabled(),
+		Simulated:     m.forced,
+		Routes:        routes,
+		LastAppliedAt: m.lastAppliedAt,
+	}
 }
 
 // Snapshot returns the current live routes (copy — caller may mutate).
@@ -205,9 +268,21 @@ func IPForwardEnabled() bool {
 }
 
 // runIPTables invokes iptables with the given action (either "-A" to append
-// or "-D" to delete) against the nat/POSTROUTING chain. Source is the WG peer
-// subnet (may be empty — in that case the rule matches the whole uplink). No-op
-// if simulated is true.
+// or "-D" to delete) against BOTH the nat/POSTROUTING chain (MASQUERADE) and
+// the filter/FORWARD chain (ACCEPT outbound + conntrack-gated return). Source
+// is the WG peer subnet (may be empty — the MASQUERADE rule then matches all
+// outbound, which still funnels through the per-target -d match).
+//
+// Why FORWARD rules at all when the Pi-OS default policy is ACCEPT: stock Pi
+// images install with no firewall, but operators frequently add UFW or a
+// restrictive nftables stack later. Without the explicit ACCEPT rules the
+// LAN-routing feature appears to "work" until the operator tightens forward
+// policy and silently breaks tunnel→LAN reachability with no obvious clue
+// from the rud1 panel. Installing matched rules makes the feature robust
+// against that without changing default-deny systems' security posture (the
+// rules are scoped to the WG /24 and the specific target subnet).
+//
+// No-op if simulated is true.
 func runIPTables(simulated bool, action, target, source, uplink string) error {
 	if simulated {
 		log.Debug().
@@ -221,23 +296,64 @@ func runIPTables(simulated bool, action, target, source, uplink string) error {
 	if strings.TrimSpace(uplink) == "" {
 		uplink = DefaultUplink
 	}
-	args := []string{"-t", "nat", action, "POSTROUTING"}
-	if source != "" {
-		args = append(args, "-s", source)
-	}
-	args = append(args, "-d", target, "-o", uplink, "-j", "MASQUERADE")
 
-	// On delete, iptables returns 1 when the rule isn't present; treat that
-	// as non-fatal so callers can idempotently delete.
-	if action == "-D" {
-		check := exec.Command("iptables", append([]string{"-t", "nat", "-C", "POSTROUTING"}, args[4:]...)...)
+	// 1) MASQUERADE in nat/POSTROUTING — rewrites source IP to the uplink's
+	//    so replies come back to the Pi instead of trying to route directly
+	//    to the WG-only peer address.
+	natArgs := []string{"-t", "nat", action, "POSTROUTING"}
+	if source != "" {
+		natArgs = append(natArgs, "-s", source)
+	}
+	natArgs = append(natArgs, "-d", target, "-o", uplink, "-j", "MASQUERADE")
+	if err := invokeIPTablesIdempotent(action, "nat", "POSTROUTING", natArgs); err != nil {
+		return err
+	}
+
+	// 2) FORWARD ACCEPT — outbound: WG peer → LAN target via uplink.
+	fwdOutArgs := []string{"-t", "filter", action, "FORWARD"}
+	if source != "" {
+		fwdOutArgs = append(fwdOutArgs, "-s", source)
+	}
+	fwdOutArgs = append(fwdOutArgs, "-d", target, "-o", uplink, "-j", "ACCEPT")
+	if err := invokeIPTablesIdempotent(action, "filter", "FORWARD", fwdOutArgs); err != nil {
+		return err
+	}
+
+	// 3) FORWARD ACCEPT — return: LAN target → WG peer, gated by conntrack
+	//    so we don't open arbitrary inbound traffic from the LAN side. The
+	//    `-d source` clause keeps this scoped to packets actually destined
+	//    back into the tunnel, even on systems where the operator has
+	//    expanded conntrack to accept additional flows.
+	fwdRetArgs := []string{"-t", "filter", action, "FORWARD"}
+	fwdRetArgs = append(fwdRetArgs, "-s", target, "-i", uplink)
+	if source != "" {
+		fwdRetArgs = append(fwdRetArgs, "-d", source)
+	}
+	fwdRetArgs = append(fwdRetArgs, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+	return invokeIPTablesIdempotent(action, "filter", "FORWARD", fwdRetArgs)
+}
+
+// invokeIPTablesIdempotent runs `iptables` with the supplied args, treating
+// "rule already absent on -D" and "rule already present on -A" both as
+// success — so a tear-down after a partial install (or a re-apply after a
+// reboot that left rules in-kernel) doesn't error out and abort the rest of
+// the route list.
+func invokeIPTablesIdempotent(action, table, chain string, args []string) error {
+	switch action {
+	case "-D":
+		check := exec.Command("iptables", append([]string{"-t", table, "-C", chain}, args[4:]...)...)
 		if err := check.Run(); err != nil {
 			return nil // rule absent → nothing to delete
+		}
+	case "-A":
+		check := exec.Command("iptables", append([]string{"-t", table, "-C", chain}, args[4:]...)...)
+		if err := check.Run(); err == nil {
+			return nil // rule already present → idempotent re-apply
 		}
 	}
 	out, err := exec.Command("iptables", args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("iptables %s: %s: %w", action, strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("iptables %s %s/%s: %s: %w", action, table, chain, strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }

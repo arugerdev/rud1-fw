@@ -70,14 +70,18 @@ type healthLANRoute struct {
 
 // healthLAN is the nested LAN block: current configured uplink, WG source
 // subnet, `sysctl net.ipv4.ip_forward` state, simulated flag, and the
-// live route list from lan.Manager.Snapshot().
+// live route list from lan.Manager.Snapshot(). LastAppliedAt is the
+// wall-clock of the most recent Apply() call (RFC3339, UTC), or null
+// when LAN routing has never been applied this boot — surfaces "the
+// route list landed in the kernel at HH:MM" without a debug shell.
 type healthLAN struct {
-	Enabled   bool             `json:"enabled"`
-	Uplink    string           `json:"uplink"`
-	Source    string           `json:"source"`
-	IPForward bool             `json:"ipForward"`
-	Simulated bool             `json:"simulated"`
-	Routes    []healthLANRoute `json:"routes"`
+	Enabled       bool             `json:"enabled"`
+	Uplink        string           `json:"uplink"`
+	Source        string           `json:"source"`
+	IPForward     bool             `json:"ipForward"`
+	Simulated     bool             `json:"simulated"`
+	Routes        []healthLANRoute `json:"routes"`
+	LastAppliedAt *time.Time       `json:"lastAppliedAt,omitempty"`
 }
 
 // healthUSBIP is the nested USB/IP block: daemon flag, counts derived
@@ -186,7 +190,7 @@ func (h *SystemHealthHandler) Health(w http.ResponseWriter, r *http.Request) {
 					Applied: r.Applied,
 				})
 			}
-			resp.LAN = &healthLAN{
+			block := &healthLAN{
 				Enabled:   len(live) > 0,
 				Uplink:    h.lanMgr.Uplink(),
 				Source:    h.lanMgr.Source(),
@@ -194,6 +198,11 @@ func (h *SystemHealthHandler) Health(w http.ResponseWriter, r *http.Request) {
 				Simulated: h.lanMgr.Simulated(),
 				Routes:    routes,
 			}
+			if applied := h.lanMgr.LastAppliedAt(); !applied.IsZero() {
+				ts := applied
+				block.LastAppliedAt = &ts
+			}
+			resp.LAN = block
 		}()
 	}
 
