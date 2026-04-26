@@ -133,6 +133,55 @@ func TestHealthSnapshot_ReflectsState(t *testing.T) {
 	}
 }
 
+func TestLastApplyError_ResetsOnCleanApply(t *testing.T) {
+	m := newSimManager(t)
+	m.Configure("10.77.42.0/24", "eth0")
+
+	// Iter 58: even though the simulated path can't realistically produce
+	// per-rule errors, the LastApplyError() accessor still has to be
+	// idempotent across "apply with no errors" and report "" as expected.
+	if got := m.LastApplyError(); got != "" {
+		t.Fatalf("expected empty LastApplyError before first Apply, got %q", got)
+	}
+	if _, errs := m.Apply([]string{"192.168.1.0/24"}); len(errs) != 0 {
+		t.Fatalf("clean apply: unexpected errs: %v", errs)
+	}
+	if got := m.LastApplyError(); got != "" {
+		t.Errorf("expected empty LastApplyError after clean apply, got %q", got)
+	}
+
+	// Stuff a sentinel value in directly to verify the next clean Apply
+	// clears it (real failure → recovery cycle). This exercises the
+	// "cleared on every Apply" contract documented on the field.
+	m.mu.Lock()
+	m.lastApplyError = "iptables: v1.8.7: can't initialize iptables table `nat'"
+	m.mu.Unlock()
+	if _, errs := m.Apply([]string{"192.168.1.0/24"}); len(errs) != 0 {
+		t.Fatalf("recovery apply: unexpected errs: %v", errs)
+	}
+	if got := m.LastApplyError(); got != "" {
+		t.Errorf("expected LastApplyError to be cleared after clean Apply, got %q", got)
+	}
+}
+
+func TestHealthSnapshot_IncludesLastApplyError(t *testing.T) {
+	m := newSimManager(t)
+	m.Configure("10.77.42.0/24", "eth0")
+	if _, errs := m.Apply([]string{"192.168.10.0/24"}); len(errs) != 0 {
+		t.Fatalf("apply errs: %v", errs)
+	}
+	// Inject a sentinel directly so HealthSnapshot's plumbing is
+	// exercised independently from the (simulated) iptables shell-out.
+	m.mu.Lock()
+	m.lastApplyError = "boom"
+	m.mu.Unlock()
+
+	h := m.HealthSnapshot()
+	if h.LastApplyError != "boom" {
+		t.Errorf("HealthSnapshot.LastApplyError: got %q, want %q", h.LastApplyError, "boom")
+	}
+}
+
 func TestValidateRoute(t *testing.T) {
 	cases := []struct {
 		name     string

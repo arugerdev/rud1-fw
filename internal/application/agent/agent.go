@@ -948,6 +948,14 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		if t := a.lanMgr.LastAppliedAt(); !t.IsZero() {
 			hbLAN.LastAppliedAt = t.UTC().Format(time.RFC3339Nano)
 		}
+		// Iter 58: forward the digest of the most recent Apply's first
+		// error so the cloud can light up an actionable callout (and emit
+		// an aggregate alert if it stays non-empty across consecutive
+		// heartbeats). Empty string ⇒ last apply was clean — omit the
+		// field rather than send "" so legacy cloud paths stay neutral.
+		if errMsg := a.lanMgr.LastApplyError(); errMsg != "" {
+			hbLAN.LastApplyError = errMsg
+		}
 	}
 
 	// ── System (extended stats) ───────────────────────────────────────────

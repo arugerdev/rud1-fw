@@ -324,6 +324,13 @@ type HBLAN struct {
 	Uplink        string       `json:"uplink,omitempty"`
 	Routes        []HBLANRoute `json:"routes,omitempty"`
 	LastAppliedAt string       `json:"lastAppliedAt,omitempty"`
+	// Iter 58: digest of the first per-rule error from the most recent
+	// Apply (empty when last apply was clean). Lets the cloud surface
+	// "your LAN routing wedged on this rule" without making the operator
+	// SSH in to read journalctl. Cleared on every successful Apply, so a
+	// transient failure that recovers next iteration disappears from
+	// the dashboard automatically.
+	LastApplyError string `json:"lastApplyError,omitempty"`
 }
 
 // HBInfo carries static device identification fields.

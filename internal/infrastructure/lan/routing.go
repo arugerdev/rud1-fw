@@ -58,6 +58,14 @@ type Manager struct {
 	// health endpoint so an operator can tell at a glance whether the
 	// route list they pushed has actually landed in the kernel.
 	lastAppliedAt time.Time
+
+	// Iter 58: human-readable digest of the first per-rule error from the
+	// most recent Apply, or "" when the last Apply was clean. Surfaced via
+	// LastApplyError()/HealthSnapshot() so the cloud and the on-device
+	// panel can show "your LAN routing wedged on this rule" without making
+	// the operator tail journalctl. Cleared on every Apply, so a transient
+	// failure that recovers next iteration disappears from the UI.
+	lastApplyError string
 }
 
 // NewManager creates a manager. The first Configure() call binds it to the
@@ -183,6 +191,17 @@ func (m *Manager) Apply(targets []string) ([]Route, []error) {
 	// operator which rules actually made it; lastAppliedAt tells them
 	// when the last attempt was.
 	m.lastAppliedAt = time.Now().UTC()
+	// Capture the first error verbatim — multiple per-rule errors usually
+	// share a root cause (no iptables binary, kernel module missing) so
+	// surfacing the head of the list is more actionable than a wall of
+	// "add 192.168.1.0/24: ... add 192.168.2.0/24: ..." that says the
+	// same thing five times. Cleared on success so the UI doesn't get
+	// stuck on an old failure once the operator fixed it.
+	if len(errs) > 0 {
+		m.lastApplyError = errs[0].Error()
+	} else {
+		m.lastApplyError = ""
+	}
 	return applied, errs
 }
 
@@ -196,17 +215,28 @@ func (m *Manager) LastAppliedAt() time.Time {
 	return m.lastAppliedAt
 }
 
+// LastApplyError returns the digest of the first per-rule error from the
+// most recent Apply(), or "" when Apply has either never run or its last
+// run was clean. Iter 58: paired with LastAppliedAt for the cloud + local
+// "your LAN routing wedged" callout.
+func (m *Manager) LastApplyError() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastApplyError
+}
+
 // Health is the structured snapshot the local panel + heartbeat ship to
 // operators. Bundles the converged state (live route list) with the
 // out-of-band system signals (ip_forward, source/uplink) needed to debug
 // "why isn't my LAN reachable" without SSH'ing into the Pi.
 type Health struct {
-	Source        string    `json:"source"`
-	Uplink        string    `json:"uplink"`
-	IPForward     bool      `json:"ipForward"`
-	Simulated     bool      `json:"simulated"`
-	Routes        []Route   `json:"routes"`
-	LastAppliedAt time.Time `json:"lastAppliedAt"`
+	Source         string    `json:"source"`
+	Uplink         string    `json:"uplink"`
+	IPForward      bool      `json:"ipForward"`
+	Simulated      bool      `json:"simulated"`
+	Routes         []Route   `json:"routes"`
+	LastAppliedAt  time.Time `json:"lastAppliedAt"`
+	LastApplyError string    `json:"lastApplyError,omitempty"`
 }
 
 // HealthSnapshot returns the current LAN-routing health bundle. Callers (the
@@ -220,12 +250,13 @@ func (m *Manager) HealthSnapshot() Health {
 		routes = append(routes, r)
 	}
 	return Health{
-		Source:        m.source,
-		Uplink:        m.uplink,
-		IPForward:     IPForwardEnabled(),
-		Simulated:     m.forced,
-		Routes:        routes,
-		LastAppliedAt: m.lastAppliedAt,
+		Source:         m.source,
+		Uplink:         m.uplink,
+		IPForward:      IPForwardEnabled(),
+		Simulated:      m.forced,
+		Routes:         routes,
+		LastAppliedAt:  m.lastAppliedAt,
+		LastApplyError: m.lastApplyError,
 	}
 }
 
