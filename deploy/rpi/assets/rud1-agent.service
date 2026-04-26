@@ -34,7 +34,11 @@ ProtectSystem=full
 #   - /boot/firmware (and /boot fallback): the FAT identity file.
 #   - /etc/wireguard:                      atomic writes of wg0.conf during
 #                                          peer provisioning by the cloud.
-ReadWritePaths=/boot/firmware /boot /etc/wireguard
+#   - /etc/rud1-agent:                     atomic rewrites of config.yaml from
+#                                          the setup wizard, NTP/audit endpoints,
+#                                          and the cloud→agent desired-config
+#                                          applier (cfg.Save() in persist.go).
+ReadWritePaths=/boot/firmware /boot /etc/wireguard /etc/rud1-agent
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelLogs=yes

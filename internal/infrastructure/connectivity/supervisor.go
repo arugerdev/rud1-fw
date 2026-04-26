@@ -146,16 +146,35 @@ func (s *Supervisor) evaluate(ctx context.Context) {
 	apStatus, _ := s.ap.APStatus(ctx)
 	s.apUp = apStatus != nil && apStatus.Active
 
-	// Pre-wizard: a device whose Setup.Complete=false has nothing
-	// meaningful to do online (no API token agreed, nothing to phone
-	// home about), so skip every grace/threshold and keep the AP up so
-	// an installer can always reach it. Any "online" hysteresis would
-	// just flicker the radio while the installer's phone is associated.
+	// Pre-wizard: a device whose Setup.Complete=false needs to be
+	// reachable by the installer. Two cases:
+	//   - No uplink (truly fresh device, no Ethernet, no preset WiFi):
+	//     raise the setup AP so a phone can associate and walk the
+	//     wizard. Skip the offline-threshold hysteresis — every second
+	//     without an AP on a fresh device is dead time.
+	//   - Uplink already up (Ethernet plugged in or WiFi pre-configured
+	//     on the SD card): the panel is already reachable at
+	//     http://<host>.local / the LAN IP, so DON'T raise the AP. On
+	//     a Pi 3-class radio, raising AP on the same wlan0 used as STA
+	//     thrashes the LAN connection and breaks mDNS for everyone
+	//     trying to reach the panel.
+	// If uplink toggles during the wizard, mirror it: raise on offline,
+	// drop on online — without the post-wizard hysteresis windows.
 	if !s.opts.IsSetupComplete() {
-		if !s.apUp {
-			log.Info().Msg("setup not complete — raising setup AP unconditionally")
+		online := false
+		if s.internet != nil {
+			online = s.internet()
+		}
+		switch {
+		case !online && !s.apUp:
+			log.Info().Msg("setup not complete and no uplink — raising setup AP")
 			if err := s.ap.APEnable(ctx); err != nil {
 				log.Error().Err(err).Msg("supervisor: failed to raise AP (pre-wizard)")
+			}
+		case online && s.apUp:
+			log.Info().Msg("setup not complete but uplink present — dropping setup AP (panel reachable via LAN)")
+			if err := s.ap.APDisable(ctx); err != nil {
+				log.Warn().Err(err).Msg("supervisor: failed to drop AP (pre-wizard)")
 			}
 		}
 		// Reset hysteresis state so the post-wizard transition starts fresh.

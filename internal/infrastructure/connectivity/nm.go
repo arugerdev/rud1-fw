@@ -159,6 +159,20 @@ func (b *NMBackend) Saved(ctx context.Context) ([]cx.SavedWiFi, error) {
 
 // Connect joins a WiFi network, persisting credentials. Returns an error
 // with a stable prefix when auth fails (so the UI can show a helpful hint).
+//
+// Any pre-existing connection profile with the same SSID is deleted first.
+// `nmcli device wifi connect` reuses an existing profile when one matches
+// by name, which is fine when that profile is healthy — but a previous
+// connect attempt that aborted before NM finished writing the security
+// section leaves behind a profile with no `802-11-wireless-security.*`
+// keys. From then on every retry fails with
+//
+//	Error: 802-11-wireless-security.key-mgmt: property is missing.
+//
+// because nmcli keeps reusing the broken profile and never rebuilds it
+// from the scan beacon. Wiping it before each call makes Connect
+// deterministic: the password the operator just typed is the only thing
+// that decides success/failure, regardless of past failed attempts.
 func (b *NMBackend) Connect(ctx context.Context, req cx.ConnectRequest) error {
 	if !b.Available() {
 		return ErrUnavailable
@@ -166,6 +180,11 @@ func (b *NMBackend) Connect(ctx context.Context, req cx.ConnectRequest) error {
 	if req.SSID == "" {
 		return errors.New("ssid required")
 	}
+
+	// Best-effort cleanup of stale profiles. `nmcli connection delete`
+	// returns non-zero when no match exists; swallow that — there's
+	// nothing to clean and we still want to attempt the connect.
+	_, _ = b.run(ctx, 3*time.Second, "connection", "delete", req.SSID)
 
 	args := []string{"device", "wifi", "connect", req.SSID, "ifname", b.wifiIface}
 	if req.Password != "" {

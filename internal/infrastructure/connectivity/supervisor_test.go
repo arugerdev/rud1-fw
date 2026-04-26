@@ -73,32 +73,35 @@ func newSupForTest(ap apController, internet func() bool, opts SupervisorOptions
 	}
 }
 
-// TestSupervisor_PersistsAPWhenNotComplete: with IsSetupComplete()=false +
-// internet up, the supervisor should still raise the AP on the very first
-// tick (no boot grace, no offline threshold). After flipping
-// IsSetupComplete()=true the AP must drop within OnlineToDropAP.
-func TestSupervisor_PersistsAPWhenNotComplete(t *testing.T) {
+// TestSupervisor_PreWizardOfflineRaisesAP: with IsSetupComplete()=false +
+// uplink down, the supervisor should raise the AP on the very first tick
+// (no boot grace, no offline threshold) so a freshly-flashed device
+// without WiFi/Ethernet still exposes a way for the installer to reach
+// it. After flipping IsSetupComplete()=true the AP must drop within
+// OnlineToDropAP once uplink stabilises.
+func TestSupervisor_PreWizardOfflineRaisesAP(t *testing.T) {
 	ap := &fakeAP{available: true}
 
 	complete := false
 	getter := func() bool { return complete }
+	online := false
 
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	sup := newSupForTest(ap, func() bool { return true /* online */ }, SupervisorOptions{
+	sup := newSupForTest(ap, func() bool { return online }, SupervisorOptions{
 		IsSetupComplete: getter,
 		OfflineToAP:     15 * time.Second,
 		OnlineToDropAP:  30 * time.Second,
 		BootGrace:       20 * time.Second,
 	}, now)
 
-	// Tick 1: complete=false → AP raised IMMEDIATELY despite uplink up
-	// and despite still being inside boot grace.
+	// Tick 1: complete=false, no uplink → AP raised IMMEDIATELY despite
+	// still being inside boot grace.
 	sup.evaluate(context.Background())
 	if ap.enableCalls != 1 {
 		t.Fatalf("APEnable calls = %d after first tick (want 1)", ap.enableCalls)
 	}
 	if !ap.active {
-		t.Fatalf("AP must be active after first tick when setup not complete")
+		t.Fatalf("AP must be active after first tick when setup not complete + offline")
 	}
 
 	// Tick 2 (still pre-wizard, AP already up): no further enable calls.
@@ -107,9 +110,10 @@ func TestSupervisor_PersistsAPWhenNotComplete(t *testing.T) {
 		t.Fatalf("APEnable should be idempotent while already up; got %d calls", ap.enableCalls)
 	}
 
-	// Flip wizard complete + internet still up. Advance clock past
+	// Flip wizard complete + uplink up. Advance clock past
 	// OnlineToDropAP so the supervisor decides to drop.
 	complete = true
+	online = true
 	current := now
 	advance := func(d time.Duration) {
 		current = current.Add(d)
@@ -131,6 +135,56 @@ func TestSupervisor_PersistsAPWhenNotComplete(t *testing.T) {
 	}
 	if ap.disableCalls == 0 {
 		t.Fatalf("APDisable was never called after wizard complete + online")
+	}
+}
+
+// TestSupervisor_PreWizardOnlineSkipsAP: with IsSetupComplete()=false but
+// uplink already up (Ethernet plugged in, or WiFi pre-configured on the
+// SD card before first boot), the supervisor MUST NOT raise the setup
+// AP. Otherwise we thrash the same wlan0 that's serving the LAN, break
+// mDNS, and lock the installer out of the panel they could already
+// reach via http://<host>.local.
+func TestSupervisor_PreWizardOnlineSkipsAP(t *testing.T) {
+	ap := &fakeAP{available: true}
+
+	complete := false
+	online := true
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	sup := newSupForTest(ap, func() bool { return online }, SupervisorOptions{
+		IsSetupComplete: func() bool { return complete },
+	}, now)
+
+	// Repeated ticks while pre-wizard + online: no enable, no disable.
+	for i := 0; i < 5; i++ {
+		sup.evaluate(context.Background())
+	}
+	if ap.enableCalls != 0 {
+		t.Fatalf("AP must not be raised pre-wizard when uplink present; got %d enable calls", ap.enableCalls)
+	}
+	if ap.disableCalls != 0 {
+		t.Fatalf("AP must not be touched at all when never raised; got %d disable calls", ap.disableCalls)
+	}
+}
+
+// TestSupervisor_PreWizardOnlineDropsExistingAP: edge case — the AP was
+// up (e.g. raised earlier when offline) and uplink came back during the
+// wizard. The supervisor should drop the AP immediately so the LAN
+// stops being thrashed; the wizard can be finished from the panel.
+func TestSupervisor_PreWizardOnlineDropsExistingAP(t *testing.T) {
+	ap := &fakeAP{available: true, active: true}
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	sup := newSupForTest(ap, func() bool { return true /* online */ }, SupervisorOptions{
+		IsSetupComplete: func() bool { return false /* pre-wizard */ },
+	}, now)
+
+	sup.evaluate(context.Background())
+	if ap.active {
+		t.Fatalf("AP must be dropped pre-wizard once uplink is present")
+	}
+	if ap.disableCalls != 1 {
+		t.Fatalf("APDisable should have been called once; got %d", ap.disableCalls)
 	}
 }
 
