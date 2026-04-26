@@ -33,7 +33,7 @@ func (f fakeAuditStats) Stats() (configlog.Stats, error) {
 func TestBuildHeartbeatConfig_ReportsEffectiveRetention(t *testing.T) {
 	cfg := config.Default()
 	cfg.System.AuditRetentionDays = 30
-	got := buildHeartbeatConfig(cfg, nil)
+	got := buildHeartbeatConfig(cfg, nil, nil)
 	if got == nil {
 		t.Fatal("snapshot must never be nil")
 	}
@@ -50,7 +50,7 @@ func TestBuildHeartbeatConfig_ReportsEffectiveRetention(t *testing.T) {
 func TestBuildHeartbeatConfig_ZeroFallsBackToDefault(t *testing.T) {
 	cfg := config.Default()
 	cfg.System.AuditRetentionDays = 0
-	got := buildHeartbeatConfig(cfg, nil)
+	got := buildHeartbeatConfig(cfg, nil, nil)
 	if got.AuditRetentionDays != config.DefaultAuditRetentionDays {
 		t.Fatalf("zero retention should fall back to default %d, got %d",
 			config.DefaultAuditRetentionDays, got.AuditRetentionDays)
@@ -64,7 +64,7 @@ func TestBuildHeartbeatConfig_ZeroFallsBackToDefault(t *testing.T) {
 func TestBuildHeartbeatConfig_NegativeFallsBackToDefault(t *testing.T) {
 	cfg := config.Default()
 	cfg.System.AuditRetentionDays = -5
-	got := buildHeartbeatConfig(cfg, nil)
+	got := buildHeartbeatConfig(cfg, nil, nil)
 	if got.AuditRetentionDays != config.DefaultAuditRetentionDays {
 		t.Fatalf("negative retention should fall back to default %d, got %d",
 			config.DefaultAuditRetentionDays, got.AuditRetentionDays)
@@ -79,7 +79,7 @@ func TestBuildHeartbeatConfig_NegativeFallsBackToDefault(t *testing.T) {
 func TestBuildHeartbeatConfig_OversizeClampedToMax(t *testing.T) {
 	cfg := config.Default()
 	cfg.System.AuditRetentionDays = 9999
-	got := buildHeartbeatConfig(cfg, nil)
+	got := buildHeartbeatConfig(cfg, nil, nil)
 	if got.AuditRetentionDays != config.MaxAuditRetentionDays {
 		t.Fatalf("oversize retention should clamp to max %d, got %d",
 			config.MaxAuditRetentionDays, got.AuditRetentionDays)
@@ -93,7 +93,7 @@ func TestBuildHeartbeatConfig_OversizeClampedToMax(t *testing.T) {
 // cloud-side warning thresholds.
 func TestBuildHeartbeatConfig_DefaultConstructor_ReportsDefault(t *testing.T) {
 	cfg := config.Default()
-	got := buildHeartbeatConfig(cfg, nil)
+	got := buildHeartbeatConfig(cfg, nil, nil)
 	if got.AuditRetentionDays != config.DefaultAuditRetentionDays {
 		t.Fatalf("Default() retention: got %d, want %d",
 			got.AuditRetentionDays, config.DefaultAuditRetentionDays)
@@ -106,7 +106,7 @@ func TestBuildHeartbeatConfig_DefaultConstructor_ReportsDefault(t *testing.T) {
 // very first heartbeat).
 func TestBuildHeartbeatConfig_NilAuditLog_OmitsStats(t *testing.T) {
 	cfg := config.Default()
-	got := buildHeartbeatConfig(cfg, nil)
+	got := buildHeartbeatConfig(cfg, nil, nil)
 	if got.AuditRetentionStats != nil {
 		t.Fatalf("AuditRetentionStats: got %+v, want nil", got.AuditRetentionStats)
 	}
@@ -119,7 +119,7 @@ func TestBuildHeartbeatConfig_NilAuditLog_OmitsStats(t *testing.T) {
 func TestBuildHeartbeatConfig_StatsErrorOmitsStats(t *testing.T) {
 	cfg := config.Default()
 	src := fakeAuditStats{err: errors.New("eperm")}
-	got := buildHeartbeatConfig(cfg, src)
+	got := buildHeartbeatConfig(cfg, src, nil)
 	if got.AuditRetentionStats != nil {
 		t.Fatalf("AuditRetentionStats on Stats() error: got %+v, want nil", got.AuditRetentionStats)
 	}
@@ -146,7 +146,7 @@ func TestBuildHeartbeatConfig_StatsForwardedAndFormatted(t *testing.T) {
 		NewestEntryAt: newest,
 		LastPruneAt:   prune,
 	}}
-	got := buildHeartbeatConfig(cfg, src)
+	got := buildHeartbeatConfig(cfg, src, nil)
 	if got.AuditRetentionStats == nil {
 		t.Fatal("AuditRetentionStats: got nil, want populated")
 	}
@@ -179,7 +179,7 @@ func TestBuildHeartbeatConfig_ZeroTimesOmitted(t *testing.T) {
 		TotalBytes:   0,
 		FileCount:    0,
 	}}
-	got := buildHeartbeatConfig(cfg, src)
+	got := buildHeartbeatConfig(cfg, src, nil)
 	if got.AuditRetentionStats == nil {
 		t.Fatal("stats block missing")
 	}
@@ -205,7 +205,7 @@ func TestBuildHeartbeatConfig_EntryBytesOmittedWhenZero(t *testing.T) {
 		EntryBytes:   0,
 		FileCount:    0,
 	}}
-	got := buildHeartbeatConfig(cfg, src)
+	got := buildHeartbeatConfig(cfg, src, nil)
 	if got.AuditRetentionStats == nil {
 		t.Fatal("stats block missing")
 	}
@@ -238,7 +238,7 @@ func TestBuildHeartbeatConfig_EntryBytesEmittedWhenNonZero(t *testing.T) {
 		EntryBytes:   400,
 		FileCount:    1,
 	}}
-	got := buildHeartbeatConfig(cfg, src)
+	got := buildHeartbeatConfig(cfg, src, nil)
 	buf, err := json.Marshal(got.AuditRetentionStats)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

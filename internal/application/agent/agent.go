@@ -460,10 +460,17 @@ func New(cfg *config.Config) (*Agent, error) {
 	// (cfg still saves, runtime SetMaxFiles is skipped) — matches the
 	// no-disk-logger branch of NewSystemAuditRetentionHandler.
 	var desiredPruner retentionPruner
+	var desiredAuditLog auditAppender
 	if a.auditLog != nil {
 		desiredPruner = a.auditLog
+		// Same handle as the local PUT handler's auditL — a cloud apply
+		// lands in the SAME daily JSONL file, just with Actor:"cloud"
+		// instead of Actor:"operator". This is iter 49's headline
+		// disambiguation: operators reading the configlog page can now
+		// tell who pushed each retention edit.
+		desiredAuditLog = a.auditLog
 	}
-	a.desiredConfig = newDesiredConfigApplier(cfg, desiredPruner)
+	a.desiredConfig = newDesiredConfigApplier(cfg, desiredPruner, desiredAuditLog)
 
 	return a, nil
 }
@@ -957,7 +964,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 	// cloud needs to reflect or alert on. Currently just the effective
 	// audit-log retention so the cloud can warn when a device drops
 	// below an org-wide compliance default. Tiny payload, no throttling.
-	hbConfig := buildHeartbeatConfig(a.cfg, a.auditLog)
+	hbConfig := buildHeartbeatConfig(a.cfg, a.auditLog, a.desiredConfig)
 
 	payload := cloud.HeartbeatPayload{
 		RegistrationCode: a.identity.RegistrationCode,
@@ -1275,6 +1282,15 @@ type auditStatsSource interface {
 	Stats() (configlog.Stats, error)
 }
 
+// desiredConfigStateSource is the minimal interface buildHeartbeatConfig
+// needs from the iter-48 applier to populate the iter-49
+// `LastDesiredConfigAppliedAt` field. Defined as an interface so the
+// snapshot test can pass a stub without standing up a full applier
+// (which would in turn require a config + saver + pruner triad).
+type desiredConfigStateSource interface {
+	LastAppliedAt() *time.Time
+}
+
 // buildHeartbeatConfig captures the operator-tunable system config snapshot
 // the cloud needs on every heartbeat. Never returns nil — the cloud expects
 // at least the audit-retention floor so it can flag drift, and the
@@ -1287,9 +1303,20 @@ type auditStatsSource interface {
 // degrade gracefully — the retention-days field is still shipped, and
 // AuditRetentionStats stays nil so the cloud suppresses the coverage
 // chip rather than surface a misleading "0 entries" state.
-func buildHeartbeatConfig(cfg *config.Config, auditLog auditStatsSource) *cloud.HBConfigSnapshot {
+//
+// `desired` may be nil on the dev/test path where the heartbeat is
+// driven without a full agent boot. When non-nil and a cloud apply has
+// happened, the apply timestamp piggy-backs onto the snapshot so the
+// cloud can confirm convergence rather than guessing from drift.
+func buildHeartbeatConfig(cfg *config.Config, auditLog auditStatsSource, desired desiredConfigStateSource) *cloud.HBConfigSnapshot {
 	out := &cloud.HBConfigSnapshot{
 		AuditRetentionDays: cfg.System.AuditRetentionDaysOrDefault(),
+	}
+	if desired != nil {
+		if t := desired.LastAppliedAt(); t != nil {
+			utc := t.UTC()
+			out.LastDesiredConfigAppliedAt = &utc
+		}
 	}
 	if auditLog == nil {
 		return out

@@ -210,6 +210,15 @@ type HBConfigSnapshot struct {
 	// been offline and the on-disk window is shorter than the configured
 	// retention.
 	AuditRetentionStats *HBAuditRetentionStats `json:"auditRetentionStats,omitempty"`
+	// LastDesiredConfigAppliedAt (iter 49) is the wall-clock time of the
+	// most recent successful `desiredConfigApplier.Apply` that mutated
+	// disk state. Lets the cloud confirm convergence directly instead of
+	// inferring it from drift between the desired patch and the next
+	// heartbeat snapshot. Nil/omitted when no cloud apply has ever
+	// happened on this device (fresh boot, or only local PUTs so far).
+	// RFC3339 UTC over the wire so the cloud parses with the same
+	// constructor used by the audit-stats timestamps above.
+	LastDesiredConfigAppliedAt *time.Time `json:"lastDesiredConfigAppliedAt,omitempty"`
 }
 
 // HBAuditRetentionStats mirrors `audit/configlog.Stats` over the wire.

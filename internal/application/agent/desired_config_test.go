@@ -8,11 +8,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rud1-es/rud1-fw/internal/config"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/cloud"
 )
 
@@ -55,9 +58,13 @@ func (f *fakeSaver) Save() error {
 
 // newApplierForTest builds an applier wired to fakes — no disk I/O.
 // The cfg argument is the live config the applier mutates; tests
-// inspect it after Apply() to assert in-memory state.
+// inspect it after Apply() to assert in-memory state. Iter 49 grew
+// the constructor with an audit-appender slot; this helper passes nil
+// so the iter-48 tests stay byte-for-byte identical (they only assert
+// cfg + saver + pruner outcomes — the audit-log path has its own
+// dedicated tests below).
 func newApplierForTest(cfg *config.Config, pruner retentionPruner, saver configSaver) *desiredConfigApplier {
-	a := newDesiredConfigApplier(cfg, pruner)
+	a := newDesiredConfigApplier(cfg, pruner, nil)
 	if saver != nil {
 		a.saver = saver
 	}
@@ -459,7 +466,7 @@ func TestApply_RealConfigSave_RoundTripsToDisk(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	pruner := &fakePruner{}
-	a := newDesiredConfigApplier(cfg, pruner)
+	a := newDesiredConfigApplier(cfg, pruner, nil)
 
 	patch := &cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(21)}
 	if _, err := a.Apply(patch); err != nil {
@@ -540,3 +547,351 @@ func TestHeartbeat_MockCloud_BackCompatNoDesiredConfig(t *testing.T) {
 			changed, err, saver.calls.Load())
 	}
 }
+
+// ── iter 49: configlog audit-trail + LastAppliedAt convergence chip ────
+
+// fakeAuditAppender captures every Append() so iter-49 tests can pin
+// the exact configlog.Entry shape a cloud apply emits — same Action
+// the local PUT writes, but Actor:"cloud" so the configlog page can
+// disambiguate. Errors can be forced to exercise the warn-and-continue
+// branch (an audit-append failure must NEVER propagate; the persisted
+// retention change still stands).
+type fakeAuditAppender struct {
+	mu      sync.Mutex
+	calls   int
+	entries []configlog.Entry
+	err     error
+}
+
+func (f *fakeAuditAppender) Append(_ context.Context, e configlog.Entry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.entries = append(f.entries, e)
+	return f.err
+}
+
+func (f *fakeAuditAppender) snapshot() []configlog.Entry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]configlog.Entry, len(f.entries))
+	copy(out, f.entries)
+	return out
+}
+
+// newApplierForTestWithAudit is the iter-49 sibling of newApplierForTest
+// that wires an audit-appender + an injectable now() so the tests can
+// pin both the configlog entry AND the LastAppliedAt timestamp without
+// racing the wall clock.
+func newApplierForTestWithAudit(
+	cfg *config.Config,
+	pruner retentionPruner,
+	saver configSaver,
+	appender auditAppender,
+	now func() time.Time,
+) *desiredConfigApplier {
+	a := newDesiredConfigApplier(cfg, pruner, appender)
+	if saver != nil {
+		a.saver = saver
+	}
+	if now != nil {
+		a.now = now
+	}
+	return a
+}
+
+// TestApply_SuccessfulApply_WritesAuditLogWithCloudActor is the iter-49
+// headline: a successful cloud apply must emit a `system.audit.retention.set`
+// configlog entry with Actor:"cloud" and the same Previous/Next map keys
+// the local PUT handler writes. This is the operator-visible signal that
+// disambiguates "rud1-es pushed this" from "an admin clicked Save".
+func TestApply_SuccessfulApply_WritesAuditLogWithCloudActor(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+
+	patch := &cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(21)}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	entries := appender.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit append calls=%d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Action != "system.audit.retention.set" {
+		t.Fatalf("Action=%q, want system.audit.retention.set (mirror local PUT)", e.Action)
+	}
+	if e.Actor != "cloud" {
+		t.Fatalf("Actor=%q, want cloud (iter-49 disambiguation)", e.Actor)
+	}
+	if !e.OK {
+		t.Fatalf("OK=false on success path")
+	}
+	prev, ok := e.Previous.(map[string]any)
+	if !ok || prev["days"] != 14 {
+		t.Fatalf("Previous: got %#v, want {days:14}", e.Previous)
+	}
+	next, ok := e.Next.(map[string]any)
+	if !ok || next["days"] != 21 {
+		t.Fatalf("Next: got %#v, want {days:21}", e.Next)
+	}
+}
+
+// TestApply_NoOp_SkipsAuditLog pins the "don't audit no-ops" rule:
+// a same-value patch must NOT spam the configlog page on every
+// heartbeat once the cloud starts shipping the field. A naive
+// implementation that audited every Apply would generate one entry
+// per heartbeat-tick — operators would lose the actual mutations in
+// the noise.
+func TestApply_NoOp_SkipsAuditLog(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, appender, nil)
+
+	// nil patch
+	if _, err := a.Apply(nil); err != nil {
+		t.Fatalf("nil patch: %v", err)
+	}
+	// empty patch
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{}); err != nil {
+		t.Fatalf("empty patch: %v", err)
+	}
+	// same-value patch
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(14)}); err != nil {
+		t.Fatalf("same-value patch: %v", err)
+	}
+
+	if got := appender.calls; got != 0 {
+		t.Fatalf("no-op apply must not audit-log: got %d calls", got)
+	}
+	if a.LastAppliedAt() != nil {
+		t.Fatalf("no-op apply must not advance LastAppliedAt: got %v", a.LastAppliedAt())
+	}
+}
+
+// TestApply_ValidationReject_SkipsAuditLog: a rejected patch must not
+// emit a configlog entry. The on-disk YAML never changed; an audit
+// entry would lie to operators reading the page. Symmetric with the
+// rollback semantics of save-failure.
+func TestApply_ValidationReject_SkipsAuditLog(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, appender, nil)
+
+	patch := &cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(-5)}
+	if _, err := a.Apply(patch); err == nil {
+		t.Fatalf("rejected patch must error")
+	}
+	if got := appender.calls; got != 0 {
+		t.Fatalf("rejected patch must not audit-log: got %d calls", got)
+	}
+	if a.LastAppliedAt() != nil {
+		t.Fatalf("rejected patch must not advance LastAppliedAt")
+	}
+}
+
+// TestApply_SaveError_SkipsAuditLog: the rollback path. A Save()
+// failure rolls in-memory cfg back; the audit log must NOT carry an
+// entry for the change that never persisted, otherwise the configlog
+// page would show a "successful" cloud apply that the YAML on disk
+// never accepted.
+func TestApply_SaveError_SkipsAuditLog(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	saver := &fakeSaver{err: errors.New("fs full")}
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+
+	patch := &cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(3)}
+	if _, err := a.Apply(patch); err == nil {
+		t.Fatalf("save error must propagate")
+	}
+	if got := appender.calls; got != 0 {
+		t.Fatalf("save-failure rollback must not audit-log: got %d calls", got)
+	}
+	if a.LastAppliedAt() != nil {
+		t.Fatalf("save-failure rollback must not advance LastAppliedAt")
+	}
+}
+
+// TestApply_AppendError_PersistStillWins: an audit-append failure
+// (e.g. fs full mid-write) must not propagate. The persisted config
+// stands, the warn is logged, the apply returns success — same
+// degraded semantics the local PUT handler uses.
+func TestApply_AppendError_PersistStillWins(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{err: errors.New("audit fs full")}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+
+	patch := &cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(7)}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("audit-append failure must not propagate: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false despite successful save")
+	}
+	if cfg.System.AuditRetentionDays != 7 {
+		t.Fatalf("persist must win even when audit errors: cfg=%d", cfg.System.AuditRetentionDays)
+	}
+	if appender.calls != 1 {
+		t.Fatalf("audit Append should have been attempted, got %d calls", appender.calls)
+	}
+	if a.LastAppliedAt() == nil {
+		t.Fatalf("LastAppliedAt must advance even when audit append fails")
+	}
+}
+
+// TestApply_NilAuditLog_StillSaves covers the dev-hardware path: no
+// writable /var/lib/rud1/audit at boot ⇒ auditLog is nil ⇒ apply
+// must still persist the cfg change AND advance LastAppliedAt. The
+// audit-log entry just goes nowhere — exactly mirroring the local PUT
+// handler's "no auditL ⇒ no Append" branch.
+func TestApply_NilAuditLog_StillSaves(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, nil, nil)
+
+	patch := &cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(7)}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if cfg.System.AuditRetentionDays != 7 {
+		t.Fatalf("nil auditLog must not block save: cfg=%d", cfg.System.AuditRetentionDays)
+	}
+	if a.LastAppliedAt() == nil {
+		t.Fatalf("nil auditLog must not block LastAppliedAt advance")
+	}
+}
+
+// TestApply_LastAppliedAt_AdvancesOnSuccess pins the timestamp-
+// monotonicity contract: every successful apply MUST move the
+// LastAppliedAt pointer forward, so the cloud can confirm convergence
+// for each push it sends — not just the first one.
+func TestApply_LastAppliedAt_AdvancesOnSuccess(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+
+	// Pinned clock so the test asserts on exact values, not "after now".
+	t1 := time.Date(2026, 4, 26, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 4, 26, 10, 5, 0, 0, time.UTC)
+	var calls int
+	now := func() time.Time {
+		calls++
+		if calls == 1 {
+			return t1
+		}
+		return t2
+	}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, now)
+
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(7)}); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	got := a.LastAppliedAt()
+	if got == nil || !got.Equal(t1) {
+		t.Fatalf("after first apply LastAppliedAt=%v, want %v", got, t1)
+	}
+
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(21)}); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	got = a.LastAppliedAt()
+	if got == nil || !got.Equal(t2) {
+		t.Fatalf("after second apply LastAppliedAt=%v, want %v", got, t2)
+	}
+}
+
+// TestApply_LastAppliedAt_ReturnsCopy guards against an API surface
+// gotcha: a caller mutating the returned *time.Time must NOT corrupt
+// the applier's internal state. Without the value-copy in
+// LastAppliedAt(), a heartbeat that .UTC()'d the pointer in place
+// could shift the applier's bookkeeping.
+func TestApply_LastAppliedAt_ReturnsCopy(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	pinned := time.Date(2026, 4, 26, 11, 0, 0, 0, time.UTC)
+	a := newApplierForTestWithAudit(
+		cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{},
+		func() time.Time { return pinned },
+	)
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{AuditRetentionDays: intPtr(7)}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	first := a.LastAppliedAt()
+	if first == nil {
+		t.Fatalf("LastAppliedAt should be populated")
+	}
+	*first = first.Add(48 * time.Hour) // attempt to corrupt
+	second := a.LastAppliedAt()
+	if !second.Equal(pinned) {
+		t.Fatalf("LastAppliedAt mutated by caller: got %v, want %v", second, pinned)
+	}
+}
+
+// TestBuildHeartbeatConfig_LastDesiredConfigAppliedAt_RoundTrips wires
+// a fake state source into buildHeartbeatConfig and asserts the
+// timestamp lands on `HBConfigSnapshot.LastDesiredConfigAppliedAt` in
+// UTC. The applier always stores `time.Now()` (locale-tagged); the
+// snapshot must normalise to UTC so the cloud's parser sees a stable
+// `Z` suffix in JSON.
+func TestBuildHeartbeatConfig_LastDesiredConfigAppliedAt_RoundTrips(t *testing.T) {
+	cfg := config.Default()
+	pinned := time.Date(2026, 4, 26, 12, 30, 0, 0, time.FixedZone("CEST", 2*3600))
+	src := stubDesiredState{at: &pinned}
+	got := buildHeartbeatConfig(cfg, nil, src)
+	if got.LastDesiredConfigAppliedAt == nil {
+		t.Fatalf("LastDesiredConfigAppliedAt missing from snapshot")
+	}
+	if got.LastDesiredConfigAppliedAt.Location() != time.UTC {
+		t.Fatalf("LastDesiredConfigAppliedAt not UTC: %v", got.LastDesiredConfigAppliedAt.Location())
+	}
+	if !got.LastDesiredConfigAppliedAt.Equal(pinned) {
+		t.Fatalf("LastDesiredConfigAppliedAt=%v, want equal to %v", got.LastDesiredConfigAppliedAt, pinned)
+	}
+}
+
+// TestBuildHeartbeatConfig_LastDesiredConfigAppliedAt_OmittedWhenNil:
+// fresh device, no cloud apply has ever run, the field must omit so
+// older cloud schemas still parse cleanly AND the cloud doesn't
+// render a misleading "applied at epoch zero" chip.
+func TestBuildHeartbeatConfig_LastDesiredConfigAppliedAt_OmittedWhenNil(t *testing.T) {
+	cfg := config.Default()
+	src := stubDesiredState{at: nil}
+	got := buildHeartbeatConfig(cfg, nil, src)
+	if got.LastDesiredConfigAppliedAt != nil {
+		t.Fatalf("LastDesiredConfigAppliedAt should be nil before any apply, got %v",
+			got.LastDesiredConfigAppliedAt)
+	}
+	// Wire-shape regression: a stray `lastDesiredConfigAppliedAt` key
+	// in the JSON would force iter ≤48 cloud schemas to either ignore
+	// it (fine) or misinterpret an empty/zero string as "applied at
+	// epoch". Easier to keep it omitted.
+	buf, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(buf), "lastDesiredConfigAppliedAt") {
+		t.Fatalf("nil LastDesiredConfigAppliedAt leaked to wire: %s", buf)
+	}
+}
+
+// stubDesiredState is the `desiredConfigStateSource` minimal stub for
+// the buildHeartbeatConfig iter-49 tests. Avoids spinning up a full
+// applier (which would in turn require config + saver + pruner).
+type stubDesiredState struct {
+	at *time.Time
+}
+
+func (s stubDesiredState) LastAppliedAt() *time.Time { return s.at }

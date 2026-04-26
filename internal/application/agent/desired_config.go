@@ -29,11 +29,15 @@
 package agent
 
 import (
+	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/rud1-es/rud1-fw/internal/config"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/audit/configlog"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/cloud"
 )
 
@@ -56,6 +60,16 @@ type configSaver interface {
 	Save() error
 }
 
+// auditAppender is the sliver of `configlog.Logger` the applier needs
+// to log a successful cloud-driven mutation into the same JSONL stream
+// the local PUT handler writes to. Both `configlog.DiskLogger` and
+// `configlog.LoggerNoop` satisfy it. Defined locally (not imported
+// from handlers) so the agent package doesn't grow a circular dep on
+// the HTTP layer it ultimately serves.
+type auditAppender interface {
+	Append(ctx context.Context, e configlog.Entry) error
+}
+
 // desiredConfigApplier validates + applies a `DesiredConfigPatch` to
 // the live config, then re-arms whichever runtime triggers the
 // changed fields are wired to. Constructed once at agent boot and
@@ -66,18 +80,64 @@ type configSaver interface {
 // (dev hardware / read-only fs) — the applier still updates the
 // in-memory + persisted retention value but skips the prune side
 // effect, mirroring the local PUT handler's degraded path.
+//
+// `auditLog` is nil on the same dev-hardware path (no writable
+// /var/lib/rud1/audit). Successful apples are still made; the
+// configlog entry is just suppressed (mirrors the local PUT handler's
+// "no auditL ⇒ no Append" branch).
+//
+// `now` is injectable so tests can pin the timestamp written into the
+// `LastDesiredConfigAppliedAt` accessor without racing the wall clock.
+// Production callers leave it nil and get `time.Now`.
 type desiredConfigApplier struct {
-	cfg    *config.Config
-	saver  configSaver     // defaults to cfg itself; injectable for tests
-	pruner retentionPruner // may be nil
+	cfg      *config.Config
+	saver    configSaver     // defaults to cfg itself; injectable for tests
+	pruner   retentionPruner // may be nil
+	auditLog auditAppender   // may be nil
+
+	now func() time.Time
+
+	// lastAppliedAt is the wall-clock time of the most recent successful
+	// Apply that mutated disk state. Surfaced via LastAppliedAt() and
+	// piggy-backed on the next heartbeat snapshot so the cloud can
+	// confirm convergence without inferring from drift. Guarded by mu
+	// because the heartbeat goroutine reads it from a different code
+	// path (buildHeartbeatConfig) than the applier writes it.
+	mu            sync.Mutex
+	lastAppliedAt *time.Time
 }
 
 // newDesiredConfigApplier wires the applier. Callers from agent.New
 // pass the live cfg + the disk audit logger as pruner (or nil when
-// unavailable). The saver path defaults to cfg.Save() so production
-// callers don't have to think about it; tests inject a fake.
-func newDesiredConfigApplier(cfg *config.Config, pruner retentionPruner) *desiredConfigApplier {
-	return &desiredConfigApplier{cfg: cfg, saver: cfg, pruner: pruner}
+// unavailable) + the same disk audit logger as auditLog (so a
+// cloud-applied retention edit lands in the same JSONL stream as a
+// local PUT, just with `Actor: "cloud"`). The saver path defaults to
+// cfg.Save() so production callers don't have to think about it;
+// tests inject a fake.
+func newDesiredConfigApplier(cfg *config.Config, pruner retentionPruner, auditLog auditAppender) *desiredConfigApplier {
+	return &desiredConfigApplier{
+		cfg:      cfg,
+		saver:    cfg,
+		pruner:   pruner,
+		auditLog: auditLog,
+		now:      time.Now,
+	}
+}
+
+// LastAppliedAt returns a pointer to the wall-clock time of the most
+// recent successful cloud apply, or nil when no cloud apply has ever
+// mutated disk state on this device. Returned by value-copy so the
+// caller can mutate the pointer freely without racing the applier's
+// internal state. `buildHeartbeatConfig` uses this to populate the
+// matching `HBConfigSnapshot.LastDesiredConfigAppliedAt` field.
+func (a *desiredConfigApplier) LastAppliedAt() *time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lastAppliedAt == nil {
+		return nil
+	}
+	t := *a.lastAppliedAt
+	return &t
 }
 
 // Apply ingests `patch` and returns (changed, err). `changed=true` is
@@ -146,10 +206,44 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		// future patches may carry several — keeping the rollback
 		// symmetric with the mutation stage means new fields just need
 		// a matching restore line.
+		//
+		// Critical: NO audit log entry on this path. The on-disk YAML
+		// never changed, so emitting a `system.audit.retention.set`
+		// entry would lie to operators reading the configlog page. We
+		// also do NOT advance lastAppliedAt — the cloud must keep
+		// re-pushing until a save succeeds.
 		if plan.auditRetentionDays != nil {
 			a.cfg.System.AuditRetentionDays = prevAuditRetention
 		}
 		return false, fmt.Errorf("save desired config: %w", err)
+	}
+
+	// Save succeeded — record the apply time so the next heartbeat can
+	// confirm convergence to the cloud. Done BEFORE the prune side
+	// effect because lastAppliedAt is about "did the cloud's edit reach
+	// disk", not "did the prune run cleanly". Mirrors the local PUT
+	// handler's choice to return 200 on prune failure.
+	now := a.now()
+	a.mu.Lock()
+	a.lastAppliedAt = &now
+	a.mu.Unlock()
+
+	// Mirror the local PUT handler's audit-log shape exactly: same
+	// Action, same Previous/Next map keys, only the Actor differs
+	// ("cloud" instead of "operator") so the configlog page can
+	// disambiguate cloud-applied edits from operator-applied ones.
+	// Append failures are warn-logged but never propagated — matches
+	// every other audit-emitting handler in the codebase.
+	if a.auditLog != nil && plan.auditRetentionDays != nil {
+		if err := a.auditLog.Append(context.Background(), configlog.Entry{
+			Action:   "system.audit.retention.set",
+			Actor:    "cloud",
+			Previous: map[string]any{"days": prevAuditRetention},
+			Next:     map[string]any{"days": *plan.auditRetentionDays},
+			OK:       true,
+		}); err != nil {
+			log.Warn().Err(err).Msg("desired-config: audit append failed (non-fatal)")
+		}
 	}
 
 	// ── Stage 3: re-arm runtime triggers ────────────────────────────────
