@@ -101,6 +101,21 @@ const (
 	MaxDesiredNTPProbeTimeoutSeconds = 30
 )
 
+// MinDesiredCellularDataCapMB / MaxDesiredCellularDataCapMB (iter 54)
+// bound the soft data-cap warning threshold the cloud can push for the
+// cellular uplink. 0 is the floor — the operator-facing semantic is
+// "unlimited / no warning" (matching `cfg.Network.CellularDataCapMB=0`
+// behaviour: the local panel suppresses the cap-warning chip). 1_000_000
+// MB (≈ 1 TB) is the ceiling — comfortably above any realistic IoT plan
+// while tight enough that a cloud bug pasting a 64-bit garbage value
+// surfaces as a rejected patch rather than a billion-MB phantom cap.
+// A patch outside this window is rejected entirely (no clamp) so an
+// operator's value is never silently rewritten.
+const (
+	MinDesiredCellularDataCapMB = 0
+	MaxDesiredCellularDataCapMB = 1_000_000
+)
+
 // NTPApplyHook is invoked after a successful Save() when at least one
 // of the NTP-related fields changed. The applier passes the post-apply
 // snapshot (enabled + the canonical server list AFTER normalize) so
@@ -390,6 +405,7 @@ type plannedChange struct {
 	ntpServers         *[]string      // non-nil ⇒ mutate to *ntpServers (post-normalize)
 	lanRoutes          *[]string      // non-nil ⇒ mutate to *lanRoutes (post-normalize)
 	ntpProbeTimeout    *time.Duration // non-nil ⇒ mutate to *ntpProbeTimeout (iter 53)
+	cellularDataCapMB  *uint64        // non-nil ⇒ mutate to *cellularDataCapMB (iter 54)
 }
 
 // fieldNames returns the canonical wire-name list of every field this
@@ -399,7 +415,7 @@ type plannedChange struct {
 // caller can stash it on `lastAppliedFields` and the iter-52 accessor
 // can copy from it without racing the next Apply tick.
 func (p plannedChange) fieldNames() []string {
-	out := make([]string, 0, 5)
+	out := make([]string, 0, 6)
 	if p.auditRetentionDays != nil {
 		out = append(out, "auditRetentionDays")
 	}
@@ -414,6 +430,9 @@ func (p plannedChange) fieldNames() []string {
 	}
 	if p.ntpProbeTimeout != nil {
 		out = append(out, "externalNTPProbeTimeoutSeconds")
+	}
+	if p.cellularDataCapMB != nil {
+		out = append(out, "cellularDataCapMB")
 	}
 	return out
 }
@@ -436,7 +455,8 @@ func (p plannedChange) anyChange() bool {
 		p.ntpProbeEnabled != nil ||
 		p.ntpServers != nil ||
 		p.lanRoutes != nil ||
-		p.ntpProbeTimeout != nil
+		p.ntpProbeTimeout != nil ||
+		p.cellularDataCapMB != nil
 }
 
 // Apply ingests `patch` and returns (changed, err). `changed=true` is
@@ -467,6 +487,7 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	prevLANRoutes := append([]string(nil), a.cfg.LAN.Routes...)
 
 	prevNTPTimeout := a.cfg.System.ExternalNTPProbeTimeout
+	prevCellularDataCapMB := a.cfg.Network.CellularDataCapMB
 
 	var plan plannedChange
 
@@ -540,6 +561,24 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		}
 	}
 
+	if patch.CellularDataCapMB != nil {
+		v := *patch.CellularDataCapMB
+		if v < MinDesiredCellularDataCapMB || v > MaxDesiredCellularDataCapMB {
+			return false, fmt.Errorf(
+				"cellularDataCapMB=%d out of [%d,%d]",
+				v, MinDesiredCellularDataCapMB, MaxDesiredCellularDataCapMB,
+			)
+		}
+		// cfg.Network.CellularDataCapMB is uint64; the wire shape is *int
+		// so a stray negative surfaces as an explicit out-of-range error
+		// above (we never silently widen a negative into a 64-bit
+		// billion-MB cap).
+		newVal := uint64(v)
+		if newVal != prevCellularDataCapMB {
+			plan.cellularDataCapMB = &newVal
+		}
+	}
+
 	if !plan.anyChange() {
 		return false, nil
 	}
@@ -562,6 +601,9 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	}
 	if plan.ntpProbeTimeout != nil {
 		a.cfg.System.ExternalNTPProbeTimeout = *plan.ntpProbeTimeout
+	}
+	if plan.cellularDataCapMB != nil {
+		a.cfg.Network.CellularDataCapMB = *plan.cellularDataCapMB
 	}
 
 	if err := a.saver.Save(); err != nil {
@@ -588,6 +630,9 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		}
 		if plan.ntpProbeTimeout != nil {
 			a.cfg.System.ExternalNTPProbeTimeout = prevNTPTimeout
+		}
+		if plan.cellularDataCapMB != nil {
+			a.cfg.Network.CellularDataCapMB = prevCellularDataCapMB
 		}
 		return false, fmt.Errorf("save desired config: %w", err)
 	}
@@ -673,6 +718,26 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 				OK: true,
 			})
 		}
+		if plan.cellularDataCapMB != nil {
+			// Iter-54: one audit entry per cellular data-cap mutation.
+			// Action key matches the namespace shape used by the local
+			// `POST /api/network/cellular/config` writer ("network.cellular.update")
+			// so the configlog page can display cloud + local edits in
+			// the same stream — only the Actor differs ("cloud" vs
+			// "operator"). Surfaces the previous + next dataCapMB values
+			// (plain integers, MB units) for the operator-readable diff.
+			a.appendAudit(configlog.Entry{
+				Action: "network.cellular.update",
+				Actor:  "cloud",
+				Previous: map[string]any{
+					"dataCapMB": prevCellularDataCapMB,
+				},
+				Next: map[string]any{
+					"dataCapMB": a.cfg.Network.CellularDataCapMB,
+				},
+				OK: true,
+			})
+		}
 	}
 
 	// ── Stage 4: re-arm runtime triggers ────────────────────────────────
@@ -749,6 +814,19 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 			Int("routes", len(a.cfg.LAN.Routes)).
 			Bool("enabled", a.cfg.LAN.Enabled).
 			Msg("desired-config: LAN routes applied from cloud")
+	}
+
+	if plan.cellularDataCapMB != nil {
+		// Iter-54: no apply-hook re-arm needed — the connectivity
+		// supervisor reads `cfg.Network.CellularDataCapMB` on its next
+		// dial cycle, and the local panel re-fetches it on each render
+		// of the cellular config page. The persisted YAML is the only
+		// runtime contract this field has, and Save() above already
+		// flushed it.
+		log.Info().
+			Uint64("oldMB", prevCellularDataCapMB).
+			Uint64("newMB", a.cfg.Network.CellularDataCapMB).
+			Msg("desired-config: cellular data-cap applied from cloud")
 	}
 
 	return true, nil

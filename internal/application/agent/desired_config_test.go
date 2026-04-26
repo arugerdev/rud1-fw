@@ -2283,3 +2283,281 @@ func TestApply_MultiField_IncludesNTPTimeout(t *testing.T) {
 		}
 	}
 }
+
+// ── Iter 54: cellularDataCapMB desired-config field ─────────────────────
+
+// TestHeartbeatResponse_DecodesCellularDataCapMB pins the iter-54 wire
+// shape: the cloud can push `cellularDataCapMB` inside `desiredConfig`.
+// Decoder must surface the integer pointer field without disturbing the
+// iter-50/51/53 fields.
+func TestHeartbeatResponse_DecodesCellularDataCapMB(t *testing.T) {
+	body := `{
+		"ok": true,
+		"desiredConfig": {
+			"externalNTPProbeEnabled": true,
+			"cellularDataCapMB": 2048,
+			"lanRoutes": ["192.168.1.0/24"]
+		}
+	}`
+	var resp cloud.HeartbeatResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DesiredConfig == nil {
+		t.Fatalf("DesiredConfig nil")
+	}
+	if resp.DesiredConfig.CellularDataCapMB == nil ||
+		*resp.DesiredConfig.CellularDataCapMB != 2048 {
+		t.Fatalf("CellularDataCapMB: %+v", resp.DesiredConfig.CellularDataCapMB)
+	}
+	if resp.DesiredConfig.ExternalNTPProbeEnabled == nil ||
+		*resp.DesiredConfig.ExternalNTPProbeEnabled != true {
+		t.Fatalf("enabled disturbed: %+v", resp.DesiredConfig.ExternalNTPProbeEnabled)
+	}
+	if resp.DesiredConfig.LANRoutes == nil ||
+		len(*resp.DesiredConfig.LANRoutes) != 1 {
+		t.Fatalf("LANRoutes disturbed: %+v", resp.DesiredConfig.LANRoutes)
+	}
+}
+
+// TestApply_CellularDataCapMB_PersistsAndAudits is the iter-54 happy
+// path: a cloud push of `cellularDataCapMB` must mutate
+// cfg.Network.CellularDataCapMB (uint64), Save once, and emit one
+// `network.cellular.update` audit entry with previous + next dataCapMB.
+// No apply-hook is required — the supervisor reads the value on the
+// next dial cycle.
+func TestApply_CellularDataCapMB_PersistsAndAudits(t *testing.T) {
+	cfg := config.Default()
+	cfg.Network.CellularDataCapMB = 500
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+
+	v := 4096
+	patch := &cloud.DesiredConfigPatch{CellularDataCapMB: &v}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false, want true")
+	}
+	if cfg.Network.CellularDataCapMB != 4096 {
+		t.Fatalf("cfg.Network.CellularDataCapMB=%d, want 4096",
+			cfg.Network.CellularDataCapMB)
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1", saver.calls.Load())
+	}
+	entries := appender.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries=%d, want 1", len(entries))
+	}
+	if entries[0].Action != "network.cellular.update" {
+		t.Fatalf("Action=%q, want network.cellular.update", entries[0].Action)
+	}
+	if entries[0].Actor != "cloud" {
+		t.Fatalf("Actor=%q, want cloud", entries[0].Actor)
+	}
+	prev, ok := entries[0].Previous.(map[string]any)
+	if !ok {
+		t.Fatalf("Previous not a map: %T", entries[0].Previous)
+	}
+	if prev["dataCapMB"] != uint64(500) {
+		t.Fatalf("Previous.dataCapMB=%v (%T), want uint64(500)",
+			prev["dataCapMB"], prev["dataCapMB"])
+	}
+	next, ok := entries[0].Next.(map[string]any)
+	if !ok {
+		t.Fatalf("Next not a map: %T", entries[0].Next)
+	}
+	if next["dataCapMB"] != uint64(4096) {
+		t.Fatalf("Next.dataCapMB=%v (%T), want uint64(4096)",
+			next["dataCapMB"], next["dataCapMB"])
+	}
+}
+
+// TestApply_CellularDataCapMB_OutOfRangeRejected pins the iter-54
+// validation: a negative value (which would silently widen into a
+// 64-bit billion-MB cap if uint64-converted) AND a value above the
+// 1 TB ceiling must reject the whole patch, leak no state, and never
+// Save.
+func TestApply_CellularDataCapMB_OutOfRangeRejected(t *testing.T) {
+	cfg := config.Default()
+	cfg.Network.CellularDataCapMB = 1024
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	for _, bad := range []int{-1, -100, MaxDesiredCellularDataCapMB + 1, MaxDesiredCellularDataCapMB * 2} {
+		v := bad
+		_, err := a.Apply(&cloud.DesiredConfigPatch{CellularDataCapMB: &v})
+		if err == nil {
+			t.Fatalf("v=%d: expected rejection, got nil err", bad)
+		}
+	}
+	if cfg.Network.CellularDataCapMB != 1024 {
+		t.Fatalf("cfg mutated despite rejection: %d", cfg.Network.CellularDataCapMB)
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("rejected patch must not Save, got %d", saver.calls.Load())
+	}
+}
+
+// TestApply_CellularDataCapMB_ZeroAcceptedAsUnlimited: 0 is the
+// operator-facing "unlimited / no warning" sentinel — must persist
+// cleanly when the prior value was non-zero (i.e. operator clearing
+// the cap from rud1-es).
+func TestApply_CellularDataCapMB_ZeroAcceptedAsUnlimited(t *testing.T) {
+	cfg := config.Default()
+	cfg.Network.CellularDataCapMB = 5000
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+
+	v := 0
+	changed, err := a.Apply(&cloud.DesiredConfigPatch{CellularDataCapMB: &v})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false, want true (5000 → 0 is a real change)")
+	}
+	if cfg.Network.CellularDataCapMB != 0 {
+		t.Fatalf("cfg.Network.CellularDataCapMB=%d, want 0",
+			cfg.Network.CellularDataCapMB)
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1", saver.calls.Load())
+	}
+	entries := appender.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries=%d, want 1", len(entries))
+	}
+	if entries[0].Action != "network.cellular.update" {
+		t.Fatalf("Action=%q, want network.cellular.update", entries[0].Action)
+	}
+}
+
+// TestApply_CellularDataCapMB_NoOpWhenUnchanged: a cloud push echoing
+// the current cap must NOT Save, must NOT advance LastAppliedAt, must
+// NOT emit an audit entry — same flash-saver contract the iter-50/53
+// fields uphold.
+func TestApply_CellularDataCapMB_NoOpWhenUnchanged(t *testing.T) {
+	cfg := config.Default()
+	cfg.Network.CellularDataCapMB = 2500
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+
+	v := 2500
+	changed, err := a.Apply(&cloud.DesiredConfigPatch{CellularDataCapMB: &v})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if changed {
+		t.Fatalf("changed=true, want false on identity push")
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("Save must not run on no-op, got %d", saver.calls.Load())
+	}
+	if a.LastAppliedAt() != nil {
+		t.Fatalf("LastAppliedAt must not advance on no-op")
+	}
+	if len(appender.snapshot()) != 0 {
+		t.Fatalf("no audit entries expected on no-op")
+	}
+}
+
+// TestApply_CellularDataCapMB_RollbackOnSaveError: if the saver errors
+// after the in-memory mutation, cfg.Network.CellularDataCapMB must
+// restore to its prior value — a partial-applied state would leave the
+// supervisor reading a value that never reached disk.
+func TestApply_CellularDataCapMB_RollbackOnSaveError(t *testing.T) {
+	cfg := config.Default()
+	cfg.Network.CellularDataCapMB = 800
+	saver := &fakeSaver{err: fmt.Errorf("disk full")}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+
+	v := 9999
+	_, err := a.Apply(&cloud.DesiredConfigPatch{CellularDataCapMB: &v})
+	if err == nil {
+		t.Fatalf("expected save-error to propagate")
+	}
+	if cfg.Network.CellularDataCapMB != 800 {
+		t.Fatalf("rollback failed: cfg.Network.CellularDataCapMB=%d, want 800",
+			cfg.Network.CellularDataCapMB)
+	}
+	if a.LastAppliedAt() != nil {
+		t.Fatalf("LastAppliedAt must not advance on save error")
+	}
+}
+
+// TestApply_LastAppliedFields_IncludesCellularDataCapMB: a cloud push
+// that changes only the cellular cap must surface "cellularDataCapMB"
+// in `LastAppliedFields()` so the iter-52 chip + the cloud convergence
+// panel both render the new field name.
+func TestApply_LastAppliedFields_IncludesCellularDataCapMB(t *testing.T) {
+	cfg := config.Default()
+	cfg.Network.CellularDataCapMB = 100
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+
+	v := 200
+	if _, err := a.Apply(&cloud.DesiredConfigPatch{CellularDataCapMB: &v}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	got := a.LastAppliedFields()
+	if len(got) != 1 || got[0] != "cellularDataCapMB" {
+		t.Fatalf("LastAppliedFields=%v, want [cellularDataCapMB]", got)
+	}
+}
+
+// TestApply_MultiField_IncludesCellularDataCapMB: a multi-field cloud
+// push containing the new iter-54 field alongside iter-50/51/53 fields
+// must produce a stable wire-name list in cloud-emit order (audit, ntp
+// enabled, ntp servers, lan routes, ntp timeout, cellular cap).
+func TestApply_MultiField_IncludesCellularDataCapMB(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	cfg.System.ExternalNTPProbeEnabled = false
+	cfg.System.ExternalNTPProbeTimeout = 2 * time.Second
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = nil
+	cfg.Network.CellularDataCapMB = 0
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, &fakeSaver{}, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+
+	timeout := 9
+	cap := 8192
+	patch := &cloud.DesiredConfigPatch{
+		AuditRetentionDays:             intPtr(21),
+		ExternalNTPProbeEnabled:        boolPtr(true),
+		ExternalNTPServers:             strSlicePtr("pool.ntp.org"),
+		LANRoutes:                      strSlicePtr("192.168.50.0/24"),
+		ExternalNTPProbeTimeoutSeconds: &timeout,
+		CellularDataCapMB:              &cap,
+	}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	want := []string{
+		"auditRetentionDays",
+		"externalNTPProbeEnabled",
+		"externalNTPServers",
+		"lanRoutes",
+		"externalNTPProbeTimeoutSeconds",
+		"cellularDataCapMB",
+	}
+	got := a.LastAppliedFields()
+	if len(got) != len(want) {
+		t.Fatalf("LastAppliedFields len=%d, want %d (got %v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("[%d]=%q, want %q (full=%v)", i, got[i], want[i], got)
+		}
+	}
+	if cfg.Network.CellularDataCapMB != 8192 {
+		t.Fatalf("cfg.Network.CellularDataCapMB=%d, want 8192",
+			cfg.Network.CellularDataCapMB)
+	}
+}

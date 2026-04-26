@@ -567,6 +567,20 @@ type DesiredConfigPatch struct {
 	// duration string) so a non-Go cloud client doesn't need a
 	// duration parser to write valid patches.
 	ExternalNTPProbeTimeoutSeconds *int `json:"externalNTPProbeTimeoutSeconds,omitempty"`
+
+	// CellularDataCapMB (iter 54) mirrors `cfg.Network.CellularDataCapMB`
+	// — the soft cap (in megabytes) the local panel uses to warn the
+	// operator before the cellular plan runs out. The agent validates
+	// against `[MinDesiredCellularDataCapMB, MaxDesiredCellularDataCapMB]`
+	// (0..1_000_000 MB, where 0 means "unlimited / no warning") before
+	// persisting. No runtime re-arm is needed: the existing connectivity
+	// supervisor reads the value on its next dial cycle. Wire-shape is
+	// `*int` (not `*uint64`) so a JSON push of a stray negative number
+	// surfaces as an explicit out-of-range error instead of silently
+	// wrapping into a 64-bit billion-MB cap. Forward-compat: older
+	// firmware (iter ≤53) ignores this field — the int→uint64 widening
+	// happens inside the agent applier.
+	CellularDataCapMB *int `json:"cellularDataCapMB,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.
