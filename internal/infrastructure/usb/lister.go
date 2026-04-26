@@ -20,7 +20,13 @@ type Device struct {
 	Serial      string
 }
 
-var busIDPattern = regexp.MustCompile(`^\d+-\d+$`)
+// USB busids follow `<bus>-<port>[.<port>]*`: a single port for a device
+// plugged straight into a root hub ("1-2"), or dot-joined ports when it
+// sits behind one or more hubs ("1-1.4", "2-1.2.3"). The Pi 4's onboard
+// VL805 always inserts a `1-1.X` segment for downstream USB-2 ports, so
+// the previous `^\d+-\d+$` silently hid every Arduino, hub-attached
+// dongle, and most USB-2 peripherals.
+var busIDPattern = regexp.MustCompile(`^\d+-\d+(\.\d+)*$`)
 
 // List returns the USB devices currently attached to the host.
 // On simulated hardware two fake devices are returned.
