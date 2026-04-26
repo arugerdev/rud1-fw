@@ -857,6 +857,7 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			PublicEndpoint: natSnap.PublicEndpoint,
 			UPnPOK:         &upnpOK,
 			NATType:        natSnap.NATType,
+			CGNAT:          natSnap.CGNAT,
 			AllowedIps:     deriveSubnet(a.identity.RegistrationCode) + ".0/24",
 			PeerCount:      peerCount,
 			ActivePeers:    activePeers,

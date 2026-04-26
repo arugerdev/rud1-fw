@@ -45,6 +45,13 @@ type Discovery struct {
 	UPnPOK         bool      // true iff UPnP/IGD mapping succeeded
 	NATType        string    // "open" | "restricted" | "symmetric" | "unknown"
 	Source         string    // "upnp" | "stun" | "" — which path won
+	// CGNAT is true when the reflexive address falls inside RFC 6598
+	// (100.64.0.0/10) — the carrier-grade NAT block. P2P WireGuard from a
+	// CGNAT'd Pi to an internet client is effectively impossible without
+	// IPv6 or an explicit relay; the panel uses this flag to show an
+	// actionable warning instead of letting the user fight invisible
+	// firewalls.
+	CGNAT          bool
 	DiscoveredAt   time.Time
 }
 
@@ -63,6 +70,7 @@ func Discover(ctx context.Context, listenPort int) Discovery {
 		// the client's point of view; classification only matters for
 		// symmetric-NAT warnings and UPnP bypasses it entirely.
 		d.NATType = "open"
+		d.CGNAT = IsCGNATEndpoint(ep)
 		return d
 	}
 
@@ -75,7 +83,43 @@ func Discover(ctx context.Context, listenPort int) Discovery {
 	}
 	d.UPnPOK = false
 	d.NATType = natType
+	d.CGNAT = IsCGNATEndpoint(stunEp)
 	return d
+}
+
+// cgnatNet is the RFC 6598 carrier-grade NAT range. Pulled out as a
+// package-level var so the parsing cost is paid once at init.
+var cgnatNet = mustParseCIDR("100.64.0.0/10")
+
+func mustParseCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		// Compile-time constant — a parse failure here is a bug.
+		panic(err)
+	}
+	return n
+}
+
+// IsCGNATEndpoint reports whether the given "ip:port" string lives inside
+// RFC 6598 100.64.0.0/10. A bare IPv4 address (without ":port") is also
+// accepted.
+func IsCGNATEndpoint(endpoint string) bool {
+	if endpoint == "" {
+		return false
+	}
+	host := endpoint
+	if h, _, err := net.SplitHostPort(endpoint); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	return cgnatNet.Contains(v4)
 }
 
 // ── UPnP ─────────────────────────────────────────────────────────────────

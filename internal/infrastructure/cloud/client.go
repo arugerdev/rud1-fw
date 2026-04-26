@@ -383,6 +383,10 @@ type HBVPN struct {
 	// NATType is the STUN-derived classification of our outgoing NAT:
 	// "open" | "restricted" | "symmetric" | "unknown".
 	NATType         string  `json:"natType,omitempty"`
+	// CGNAT is true when the discovered public endpoint is inside RFC 6598
+	// (100.64.0.0/10). The cloud surfaces this on the device card so the
+	// operator gets an actionable warning before clicking Connect.
+	CGNAT           bool    `json:"cgnat,omitempty"`
 	AllowedIps      string  `json:"allowedIps,omitempty"`
 	DNS             string  `json:"dns,omitempty"`
 	PeerCount       int     `json:"peerCount"`

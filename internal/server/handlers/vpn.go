@@ -63,6 +63,11 @@ type vpnStatusResponse struct {
 	UPnPOK         bool   `json:"upnpOk"`
 	NATType        string `json:"natType,omitempty"`
 	NATSource      string `json:"natSource,omitempty"`
+	// CGNAT is true when the discovered public endpoint falls inside the
+	// RFC 6598 carrier-grade NAT range (100.64.0.0/10). The local panel
+	// surfaces an actionable warning when set, since direct WG from
+	// CGNAT'd uplinks is not feasible without IPv6 or a relay.
+	CGNAT          bool   `json:"cgnat"`
 }
 
 // Status handles GET /api/vpn/status.
@@ -88,6 +93,7 @@ func (h *VPNHandler) Status(w http.ResponseWriter, r *http.Request) {
 			UPnPOK:         natSnap.UPnPOK,
 			NATType:        natSnap.NATType,
 			NATSource:      natSnap.Source,
+			CGNAT:          natSnap.CGNAT,
 		})
 		return
 	}
@@ -116,6 +122,7 @@ func (h *VPNHandler) Status(w http.ResponseWriter, r *http.Request) {
 		UPnPOK:         natSnap.UPnPOK,
 		NATType:        natSnap.NATType,
 		NATSource:      natSnap.Source,
+		CGNAT:          natSnap.CGNAT,
 	})
 }
 
