@@ -180,7 +180,18 @@ func queryOne(ctx context.Context, server string, perServer time.Duration, dial 
 	// Estimate the local time at the midpoint of the round trip so the
 	// returned skew is closer to the true server-vs-agent delta. RTT is
 	// `received - sent`; the midpoint is `sent + RTT/2`.
+	//
+	// Windows-flake floor (iter 51): on stock Windows boxes the wall-
+	// clock resolution from successive `time.Now()` calls can collapse
+	// a sub-microsecond loopback round-trip to 0. Downstream code
+	// (handlers, UI freshness checks) treats `RTT==0` as "no probe
+	// happened yet". Floor the measurement at 1 nanosecond — that's
+	// physically meaningless but it preserves the "probe ran, just
+	// fast" signal for callers.
 	rtt := received.Sub(sent)
+	if rtt <= 0 {
+		rtt = time.Nanosecond
+	}
 	localMid := sent.Add(rtt / 2)
 	skew := serverTime.Sub(localMid)
 

@@ -1331,3 +1331,488 @@ func TestNormalizeNTPServers_Direct(t *testing.T) {
 		}
 	})
 }
+
+// ── iter 51: LAN routes desired-config ─────────────────────────────────
+
+// fakeLANHook captures iter-51 LANApplyHook payloads.
+type fakeLANHook struct {
+	mu          sync.Mutex
+	calls       int
+	lastRoutes  []string
+	lastEnabled bool
+}
+
+func (h *fakeLANHook) Hook() LANApplyHook {
+	return func(routes []string, enabled bool) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.calls++
+		h.lastRoutes = append([]string(nil), routes...)
+		h.lastEnabled = enabled
+	}
+}
+
+func (h *fakeLANHook) snapshot() (int, []string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := append([]string(nil), h.lastRoutes...)
+	return h.calls, out, h.lastEnabled
+}
+
+// passthroughLANValidator is the iter-51 test validator: trivially
+// canonicalises by parsing the CIDR. Mirrors `lan.ValidateRoute`'s
+// IP-only + non-/32 + canonical-form invariants without taking a hard
+// dep on the lan package (the applier itself has no such dep).
+func passthroughLANValidator(cidr string) (string, error) {
+	cidr = strings.TrimSpace(cidr)
+	if cidr == "" {
+		return "", errors.New("empty subnet")
+	}
+	// Reject obvious junk so the "validator-rejected" test path has a
+	// predictable failure shape.
+	if !strings.Contains(cidr, "/") {
+		return "", fmt.Errorf("missing /mask: %q", cidr)
+	}
+	return strings.ToLower(cidr), nil
+}
+
+// TestHeartbeatResponse_DecodesLANRoutes pins the iter-51 wire shape:
+// the cloud can ship `lanRoutes` inside the `desiredConfig` block.
+// Decoder must surface the pointer-typed field without disturbing the
+// iter-48/50 fields.
+func TestHeartbeatResponse_DecodesLANRoutes(t *testing.T) {
+	body := `{
+		"ok": true,
+		"desiredConfig": {
+			"auditRetentionDays": 21,
+			"lanRoutes": ["192.168.1.0/24", "10.10.0.0/16"]
+		}
+	}`
+	var resp cloud.HeartbeatResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DesiredConfig == nil {
+		t.Fatalf("DesiredConfig nil")
+	}
+	if resp.DesiredConfig.LANRoutes == nil ||
+		len(*resp.DesiredConfig.LANRoutes) != 2 ||
+		(*resp.DesiredConfig.LANRoutes)[0] != "192.168.1.0/24" {
+		t.Fatalf("LANRoutes: %+v", resp.DesiredConfig.LANRoutes)
+	}
+	if resp.DesiredConfig.AuditRetentionDays == nil || *resp.DesiredConfig.AuditRetentionDays != 21 {
+		t.Fatalf("retention disturbed: %+v", resp.DesiredConfig.AuditRetentionDays)
+	}
+}
+
+// TestApply_LANRoutes_FiresHook_Persists_Audits is the iter-51 happy
+// path: a cloud push must persist via Save, fire the LAN apply hook
+// with the post-apply slice + enabled flag, and emit one
+// `system.lan.routes.set` audit entry with Actor:"cloud".
+func TestApply_LANRoutes_FiresHook_Persists_Audits(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = nil
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	hook := &fakeLANHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	a.SetLANApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{
+		LANRoutes: strSlicePtr("192.168.1.0/24", "10.10.0.0/16"),
+	}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false, want true")
+	}
+	if len(cfg.LAN.Routes) != 2 || cfg.LAN.Routes[0] != "192.168.1.0/24" {
+		t.Fatalf("cfg.LAN.Routes not mutated: %v", cfg.LAN.Routes)
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1", saver.calls.Load())
+	}
+	calls, gotRoutes, gotEnabled := hook.snapshot()
+	if calls != 1 {
+		t.Fatalf("hook calls=%d, want 1", calls)
+	}
+	if !gotEnabled {
+		t.Fatalf("hook saw enabled=%v, want true (cfg.LAN.Enabled=true)", gotEnabled)
+	}
+	if len(gotRoutes) != 2 || gotRoutes[0] != "192.168.1.0/24" {
+		t.Fatalf("hook saw routes=%v, want canonical post-apply set", gotRoutes)
+	}
+	entries := appender.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("audit entries=%d, want 1", len(entries))
+	}
+	if entries[0].Action != "system.lan.routes.set" {
+		t.Fatalf("Action=%q, want system.lan.routes.set", entries[0].Action)
+	}
+	if entries[0].Actor != "cloud" {
+		t.Fatalf("Actor=%q, want cloud", entries[0].Actor)
+	}
+	if a.LastAppliedAt() == nil {
+		t.Fatalf("LastAppliedAt should advance on LAN apply")
+	}
+}
+
+// TestApply_LANRoutes_DisabledFlagPropagatesToHook: when cfg.LAN.Enabled
+// is false, the apply hook STILL fires (the desired list persisted) but
+// the hook receives enabled=false so the closure in agent.go pushes an
+// empty list into the manager — same observable kernel state as the
+// local PUT's `Enabled=false` branch.
+func TestApply_LANRoutes_DisabledFlagPropagatesToHook(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = false
+	cfg.LAN.Routes = nil
+	saver := &fakeSaver{}
+	hook := &fakeLANHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	a.SetLANApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{LANRoutes: strSlicePtr("192.168.1.0/24")}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(cfg.LAN.Routes) != 1 {
+		t.Fatalf("cfg.LAN.Routes must persist regardless of Enabled: %v", cfg.LAN.Routes)
+	}
+	calls, _, gotEnabled := hook.snapshot()
+	if calls != 1 {
+		t.Fatalf("hook calls=%d, want 1 (must fire even when disabled)", calls)
+	}
+	if gotEnabled {
+		t.Fatalf("hook saw enabled=true but cfg.LAN.Enabled=false")
+	}
+}
+
+// TestApply_LANRoutes_NormalizeAndDedupe pins the iter-51 normalisation:
+// trim whitespace, drop empties, dedupe on canonical form (lowercase
+// here per the test validator), preserve order.
+func TestApply_LANRoutes_NormalizeAndDedupe(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = nil
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+
+	patch := &cloud.DesiredConfigPatch{
+		LANRoutes: strSlicePtr(
+			"  192.168.1.0/24  ", "", "192.168.1.0/24", "10.0.0.0/8",
+		),
+	}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed=false")
+	}
+	want := []string{"192.168.1.0/24", "10.0.0.0/8"}
+	got := cfg.LAN.Routes
+	if len(got) != len(want) {
+		t.Fatalf("post-normalize len=%d, want %d (got %v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("[%d]=%q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestApply_LANRoutes_OverCapRejected pins the upper-bound rejection
+// at MaxDesiredLANRoutes+1. A cloud push above the cap (after dedupe)
+// must reject the whole patch — never silently truncate.
+func TestApply_LANRoutes_OverCapRejected(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+
+	too := make([]string, MaxDesiredLANRoutes+1)
+	for i := range too {
+		too[i] = fmt.Sprintf("10.%d.0.0/24", i)
+	}
+	patch := &cloud.DesiredConfigPatch{LANRoutes: &too}
+	_, err := a.Apply(patch)
+	if err == nil {
+		t.Fatalf("over-cap route list must error")
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("rejected patch must not Save, got %d", saver.calls.Load())
+	}
+}
+
+// TestApply_LANRoutes_ValidatorRejection: an invalid CIDR (validator
+// returns error) must reject the whole patch, leak no state, and fire
+// no hook.
+func TestApply_LANRoutes_ValidatorRejection(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = []string{"192.168.1.0/24"}
+	saver := &fakeSaver{}
+	hook := &fakeLANHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	a.SetLANApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{
+		LANRoutes: strSlicePtr("192.168.1.0/24", "not-a-cidr"),
+	}
+	_, err := a.Apply(patch)
+	if err == nil {
+		t.Fatalf("validator rejection must error")
+	}
+	if len(cfg.LAN.Routes) != 1 || cfg.LAN.Routes[0] != "192.168.1.0/24" {
+		t.Fatalf("cfg leaked despite rejection: %v", cfg.LAN.Routes)
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("rejected patch must not Save")
+	}
+	calls, _, _ := hook.snapshot()
+	if calls != 0 {
+		t.Fatalf("rejected patch must not fire hook, got %d", calls)
+	}
+}
+
+// TestApply_LANRoutes_NilValidatorRejected: a patch arriving before
+// the validator is wired (early-boot) must error rather than silently
+// drop. Operators get a clear "patch ignored" trail in cloud logs.
+func TestApply_LANRoutes_NilValidatorRejected(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	// no SetLANRouteValidator call
+
+	patch := &cloud.DesiredConfigPatch{LANRoutes: strSlicePtr("192.168.1.0/24")}
+	_, err := a.Apply(patch)
+	if err == nil {
+		t.Fatalf("nil validator must reject LAN patches")
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("rejected patch must not Save")
+	}
+}
+
+// TestApply_LANRoutes_SameValue_NoOp: the cloud echoing the current
+// route list must NOT touch disk and must NOT fire the hook. Steady-
+// state convergence path.
+func TestApply_LANRoutes_SameValue_NoOp(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = []string{"192.168.1.0/24"}
+	saver := &fakeSaver{}
+	hook := &fakeLANHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	a.SetLANApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{LANRoutes: strSlicePtr("192.168.1.0/24")}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if changed {
+		t.Fatalf("same-value apply must report changed=false")
+	}
+	if saver.calls.Load() != 0 {
+		t.Fatalf("same-value apply must not Save")
+	}
+	calls, _, _ := hook.snapshot()
+	if calls != 0 {
+		t.Fatalf("same-value apply must not fire hook")
+	}
+}
+
+// TestApply_LANRoutes_EmptyClears: an explicit empty list clears
+// cfg.LAN.Routes AND fires the hook so any previously-installed
+// iptables rules are torn down. Mirrors the local PUT's `routes:[]`
+// semantics.
+func TestApply_LANRoutes_EmptyClears(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = []string{"192.168.1.0/24"}
+	saver := &fakeSaver{}
+	hook := &fakeLANHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	a.SetLANApplyHook(hook.Hook())
+
+	empty := []string{}
+	patch := &cloud.DesiredConfigPatch{LANRoutes: &empty}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(cfg.LAN.Routes) != 0 {
+		t.Fatalf("routes not cleared: %v", cfg.LAN.Routes)
+	}
+	calls, gotRoutes, _ := hook.snapshot()
+	if calls != 1 {
+		t.Fatalf("hook calls=%d, want 1 on clear", calls)
+	}
+	if len(gotRoutes) != 0 {
+		t.Fatalf("hook saw non-empty routes on clear: %v", gotRoutes)
+	}
+}
+
+// TestApply_LANRoutes_OrderChange_TripsDiff: route order matters
+// (mirrors the iter-50 NTP-server semantic). A different permutation
+// represents operator intent and must trip the diff check.
+func TestApply_LANRoutes_OrderChange_TripsDiff(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = []string{"192.168.1.0/24", "10.0.0.0/8"}
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+
+	patch := &cloud.DesiredConfigPatch{
+		LANRoutes: strSlicePtr("10.0.0.0/8", "192.168.1.0/24"),
+	}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed {
+		t.Fatalf("order change must trip diff")
+	}
+	if cfg.LAN.Routes[0] != "10.0.0.0/8" {
+		t.Fatalf("post-apply order wrong: %v", cfg.LAN.Routes)
+	}
+}
+
+// TestApply_LANRoutes_SaveError_RollsBack: a Save() failure with a
+// LAN-routes patch must roll cfg.LAN.Routes back to the pre-apply
+// value AND not fire the hook.
+func TestApply_LANRoutes_SaveError_RollsBack(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = []string{"old.example/24"}
+	saver := &fakeSaver{err: errors.New("fs full")}
+	hook := &fakeLANHook{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	a.SetLANApplyHook(hook.Hook())
+
+	patch := &cloud.DesiredConfigPatch{LANRoutes: strSlicePtr("192.168.1.0/24")}
+	if _, err := a.Apply(patch); err == nil {
+		t.Fatalf("save error must propagate")
+	}
+	if len(cfg.LAN.Routes) != 1 || cfg.LAN.Routes[0] != "old.example/24" {
+		t.Fatalf("rollback failed: %v", cfg.LAN.Routes)
+	}
+	calls, _, _ := hook.snapshot()
+	if calls != 0 {
+		t.Fatalf("hook fired despite save failure")
+	}
+}
+
+// TestApply_RetentionAndLAN_TwoAuditEntries: a multi-field patch
+// touching both retention AND LAN routes must Save once + emit one
+// audit entry per field (mirrors iter-50's retention+NTP regression).
+func TestApply_RetentionAndLAN_TwoAuditEntries(t *testing.T) {
+	cfg := config.Default()
+	cfg.System.AuditRetentionDays = 14
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = nil
+	saver := &fakeSaver{}
+	appender := &fakeAuditAppender{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, appender, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	a.SetLANApplyHook((&fakeLANHook{}).Hook())
+
+	patch := &cloud.DesiredConfigPatch{
+		AuditRetentionDays: intPtr(7),
+		LANRoutes:          strSlicePtr("192.168.1.0/24"),
+	}
+	if _, err := a.Apply(patch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if saver.calls.Load() != 1 {
+		t.Fatalf("Save calls=%d, want 1 (atomic multi-field)", saver.calls.Load())
+	}
+	entries := appender.snapshot()
+	if len(entries) != 2 {
+		t.Fatalf("audit entries=%d, want 2 (one per field)", len(entries))
+	}
+	actions := map[string]bool{entries[0].Action: true, entries[1].Action: true}
+	if !actions["system.audit.retention.set"] || !actions["system.lan.routes.set"] {
+		t.Fatalf("expected both Action keys, got %v", actions)
+	}
+}
+
+// TestApply_LANNoHook_StillSaves: a LAN patch landing before the apply
+// hook is wired (early-boot) must still persist + audit-log without
+// panicking. Mirrors the iter-50 nil-NTP-hook contract.
+func TestApply_LANNoHook_StillSaves(t *testing.T) {
+	cfg := config.Default()
+	cfg.LAN.Enabled = true
+	cfg.LAN.Routes = nil
+	saver := &fakeSaver{}
+	a := newApplierForTestWithAudit(cfg, &fakePruner{}, saver, &fakeAuditAppender{}, nil)
+	a.SetLANRouteValidator(passthroughLANValidator)
+	// no SetLANApplyHook call
+
+	patch := &cloud.DesiredConfigPatch{LANRoutes: strSlicePtr("192.168.1.0/24")}
+	changed, err := a.Apply(patch)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !changed || len(cfg.LAN.Routes) != 1 || saver.calls.Load() != 1 {
+		t.Fatalf("nil hook must not block save: changed=%v cfg=%v saves=%d",
+			changed, cfg.LAN.Routes, saver.calls.Load())
+	}
+}
+
+// TestNormalizeLANRoutes_Direct exercises the inlined normalize helper
+// directly so each branch is pinned independent of Apply().
+func TestNormalizeLANRoutes_Direct(t *testing.T) {
+	t.Run("nil_validator_errors", func(t *testing.T) {
+		_, err := normalizeLANRoutes([]string{"192.168.1.0/24"}, nil)
+		if err == nil {
+			t.Fatalf("nil validator must error")
+		}
+	})
+	t.Run("nil_input_returns_empty", func(t *testing.T) {
+		out, err := normalizeLANRoutes(nil, passthroughLANValidator)
+		if err != nil || len(out) != 0 {
+			t.Fatalf("got (%v, %v)", out, err)
+		}
+	})
+	t.Run("trims_drops_empties_dedupes", func(t *testing.T) {
+		out, err := normalizeLANRoutes([]string{
+			" 192.168.1.0/24 ", "", "192.168.1.0/24", "10.0.0.0/8",
+		}, passthroughLANValidator)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if len(out) != 2 || out[0] != "192.168.1.0/24" || out[1] != "10.0.0.0/8" {
+			t.Fatalf("got %v", out)
+		}
+	})
+	t.Run("over_cap_errors", func(t *testing.T) {
+		too := make([]string, MaxDesiredLANRoutes+1)
+		for i := range too {
+			too[i] = fmt.Sprintf("10.%d.0.0/24", i)
+		}
+		_, err := normalizeLANRoutes(too, passthroughLANValidator)
+		if err == nil {
+			t.Fatalf("over-cap must error")
+		}
+	})
+	t.Run("validator_error_propagates", func(t *testing.T) {
+		_, err := normalizeLANRoutes([]string{"junk"}, passthroughLANValidator)
+		if err == nil {
+			t.Fatalf("validator error must propagate")
+		}
+	})
+}

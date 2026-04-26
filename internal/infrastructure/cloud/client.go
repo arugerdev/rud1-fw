@@ -532,6 +532,19 @@ type DesiredConfigPatch struct {
 	// slice clears the list (probe becomes effectively disabled regardless
 	// of the Enabled flag — matches the local PUT semantics).
 	ExternalNTPServers *[]string `json:"externalNTPServers,omitempty"`
+
+	// LANRoutes mirrors `cfg.LAN.Routes` (iter 51). Each entry is a CIDR
+	// the agent must validate via `lan.ValidateRoute(...)` against the
+	// device's own WG /24 (no overlap, IPv4 only, mask < 32). The agent
+	// normalises the list (trim, dedupe on canonical CIDR form, cap at
+	// MaxDesiredLANRoutes) before persisting and re-applies the post-
+	// normalize set through `lan.Manager.Apply(...)` — observationally
+	// identical to the local `PUT /api/lan/routes` with `routes:[…]`.
+	// An explicit empty slice clears the list AND tears down any live
+	// iptables rules for previously-applied routes. The Enabled flag is
+	// not exposed here on purpose: the cloud only owns the route list,
+	// the operator still owns the global on/off via the local panel.
+	LANRoutes *[]string `json:"lanRoutes,omitempty"`
 }
 
 // Heartbeat sends a device heartbeat authenticated with the shared API secret.

@@ -79,6 +79,14 @@ type auditAppender interface {
 // rejects the whole patch above this cap, exactly like the local PUT.
 const MaxDesiredNTPProbeServers = 8
 
+// MaxDesiredLANRoutes caps the route list the cloud can push (iter 51).
+// 32 is comfortably above what a typical operator deployment needs (a
+// handful of /24 subnets per site) but tight enough to flag a runaway
+// loop pasting routes on every heartbeat as misconfiguration rather
+// than valid intent. The applier rejects the whole patch above this
+// cap — never silently truncates.
+const MaxDesiredLANRoutes = 32
+
 // NTPApplyHook is invoked after a successful Save() when at least one
 // of the NTP-related fields changed. The applier passes the post-apply
 // snapshot (enabled + the canonical server list AFTER normalize) so
@@ -92,6 +100,27 @@ const MaxDesiredNTPProbeServers = 8
 // hook needs it so the renderer side can rebuild a full
 // ExternalNTPProbeOptions struct without re-reading cfg.
 type NTPApplyHook func(enabled bool, servers []string, perServer time.Duration)
+
+// LANRouteValidator validates a single CIDR against the live device
+// state (its WG /24 source subnet) and returns the canonical
+// (post-`net.ParseCIDR`-string) form. Wired by agent.go to a closure
+// capturing the `lan.Manager` so the applier itself stays free of the
+// `infrastructure/lan` import. A nil validator means "the agent never
+// wired the LAN subsystem" (early-boot / dev hardware) and the applier
+// rejects any LANRoutes patch with a clear error rather than silently
+// dropping it.
+type LANRouteValidator func(cidr string) (string, error)
+
+// LANApplyHook is invoked after a successful Save() when the LAN
+// route list actually changed. The applier passes the post-normalize
+// canonical slice (caller-owned copy, safe to retain) AND the live
+// `cfg.LAN.Enabled` flag. The hook closure in agent.go is responsible
+// for the enabled-aware reapply: when enabled, push the full set into
+// `lan.Manager.Apply(...)`; when disabled, push an empty set so any
+// previously-installed iptables rules are torn down. This mirrors the
+// `LANHandler.reapplyLocked()` semantic so a cloud push and a local
+// PUT produce byte-identical kernel state.
+type LANApplyHook func(routes []string, enabled bool)
 
 // desiredConfigApplier validates + applies a `DesiredConfigPatch` to
 // the live config, then re-arms whichever runtime triggers the
@@ -124,8 +153,10 @@ type desiredConfigApplier struct {
 	pruner   retentionPruner // may be nil
 	auditLog auditAppender   // may be nil
 
-	hookMu  sync.Mutex
-	ntpHook NTPApplyHook // may be nil
+	hookMu       sync.Mutex
+	ntpHook      NTPApplyHook      // may be nil
+	lanValidator LANRouteValidator // may be nil — patch rejected when nil
+	lanHook      LANApplyHook      // may be nil
 
 	now func() time.Time
 
@@ -169,6 +200,29 @@ func (a *desiredConfigApplier) SetNTPApplyHook(fn NTPApplyHook) {
 	a.hookMu.Unlock()
 }
 
+// SetLANRouteValidator wires the iter-51 per-route CIDR validator.
+// Called once by agent.go with a closure that captures the
+// `lan.Manager` so the applier can validate against the device's WG
+// source subnet without importing `infrastructure/lan` directly.
+// Passing nil clears the validator (used in tests + the early-boot
+// degraded path where the LAN subsystem hasn't been wired yet).
+func (a *desiredConfigApplier) SetLANRouteValidator(v LANRouteValidator) {
+	a.hookMu.Lock()
+	a.lanValidator = v
+	a.hookMu.Unlock()
+}
+
+// SetLANApplyHook registers the iter-51 callback the applier fires
+// after a successful save when the LAN route list actually changed.
+// Wired post-construction in agent.go so the callback can capture the
+// `lan.Manager` reference without the applier growing a hard dep on
+// the handlers package. Passing nil clears the hook.
+func (a *desiredConfigApplier) SetLANApplyHook(fn LANApplyHook) {
+	a.hookMu.Lock()
+	a.lanHook = fn
+	a.hookMu.Unlock()
+}
+
 // LastAppliedAt returns a pointer to the wall-clock time of the most
 // recent successful cloud apply, or nil when no cloud apply has ever
 // mutated disk state on this device. Returned by value-copy so the
@@ -183,6 +237,51 @@ func (a *desiredConfigApplier) LastAppliedAt() *time.Time {
 	}
 	t := *a.lastAppliedAt
 	return &t
+}
+
+// normalizeLANRoutes is the iter-51 sibling of normalizeNTPServers
+// for the LAN.Routes field. Each entry runs through the
+// caller-supplied validator (which captures the manager's source
+// subnet — overlap with the WG /24 is rejected there). Validated
+// entries are then deduped on the canonical CIDR form (case is
+// already normalised by `net.ParseCIDR`'s String() output). Returns
+// an error when the post-dedupe length exceeds MaxDesiredLANRoutes,
+// when a single entry fails CIDR validation, or when the validator
+// itself is nil (the caller must wire one before pushing LAN
+// patches). A nil/empty input returns an empty slice (cleared list)
+// — the caller treats empty as "tear down all live rules", same
+// semantic the local PUT enforces with `routes: []`.
+func normalizeLANRoutes(in []string, v LANRouteValidator) ([]string, error) {
+	if v == nil {
+		return nil, fmt.Errorf("lanRoutes patch received but no LAN validator wired")
+	}
+	if len(in) == 0 {
+		// Distinguish nil from empty for the diff check: an empty-vs-empty
+		// or empty-vs-nil comparison after this is a no-op.
+		return []string{}, nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		canonical, err := v(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid route %q: %w", s, err)
+		}
+		key := canonical
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, canonical)
+	}
+	if len(out) > MaxDesiredLANRoutes {
+		return nil, fmt.Errorf("at most %d LAN routes allowed (got %d)", MaxDesiredLANRoutes, len(out))
+	}
+	return out, nil
 }
 
 // normalizeNTPServers mirrors `handlers.normalizeServers` exactly but
@@ -262,11 +361,13 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	prevAuditEffective := a.cfg.System.AuditRetentionDaysOrDefault()
 	prevNTPEnabled := a.cfg.System.ExternalNTPProbeEnabled
 	prevNTPServers := append([]string(nil), a.cfg.System.ExternalNTPServers...)
+	prevLANRoutes := append([]string(nil), a.cfg.LAN.Routes...)
 
 	type plannedChange struct {
 		auditRetentionDays *int      // non-nil ⇒ mutate to *auditRetentionDays
 		ntpProbeEnabled    *bool     // non-nil ⇒ mutate to *ntpProbeEnabled
 		ntpServers         *[]string // non-nil ⇒ mutate to *ntpServers (post-normalize)
+		lanRoutes          *[]string // non-nil ⇒ mutate to *lanRoutes (post-normalize)
 	}
 	var plan plannedChange
 
@@ -308,9 +409,28 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		}
 	}
 
+	if patch.LANRoutes != nil {
+		// Snapshot the validator under the hookMu so a SetLAN* call in
+		// flight can't race the diff check. The validator is a pure
+		// function once captured, so we drop the lock before invoking.
+		a.hookMu.Lock()
+		validator := a.lanValidator
+		a.hookMu.Unlock()
+		normalized, err := normalizeLANRoutes(*patch.LANRoutes, validator)
+		if err != nil {
+			return false, fmt.Errorf("lanRoutes: %w", err)
+		}
+		// Treat nil and empty interchangeably for the diff check —
+		// either represents "no routes configured" / "tear down all".
+		if !stringSlicesEqual(normalized, prevLANRoutes) {
+			plan.lanRoutes = &normalized
+		}
+	}
+
 	anyChange := plan.auditRetentionDays != nil ||
 		plan.ntpProbeEnabled != nil ||
-		plan.ntpServers != nil
+		plan.ntpServers != nil ||
+		plan.lanRoutes != nil
 
 	if !anyChange {
 		return false, nil
@@ -328,6 +448,9 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 	}
 	if plan.ntpServers != nil {
 		a.cfg.System.ExternalNTPServers = *plan.ntpServers
+	}
+	if plan.lanRoutes != nil {
+		a.cfg.LAN.Routes = *plan.lanRoutes
 	}
 
 	if err := a.saver.Save(); err != nil {
@@ -348,6 +471,9 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 		}
 		if plan.ntpServers != nil {
 			a.cfg.System.ExternalNTPServers = prevNTPServers
+		}
+		if plan.lanRoutes != nil {
+			a.cfg.LAN.Routes = prevLANRoutes
 		}
 		return false, fmt.Errorf("save desired config: %w", err)
 	}
@@ -395,6 +521,24 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 				Next: map[string]any{
 					"enabled": a.cfg.System.ExternalNTPProbeEnabled,
 					"servers": postServers,
+				},
+				OK: true,
+			})
+		}
+		if plan.lanRoutes != nil {
+			// Iter-51: one audit entry per LAN-routes mutation. Action
+			// key mirrors the local `PUT /api/lan/routes` Action so the
+			// configlog page can display cloud + local edits in the same
+			// stream — only the Actor differs ("cloud" vs "operator").
+			postRoutes := append([]string(nil), a.cfg.LAN.Routes...)
+			a.appendAudit(configlog.Entry{
+				Action: "system.lan.routes.set",
+				Actor:  "cloud",
+				Previous: map[string]any{
+					"routes": prevLANRoutes,
+				},
+				Next: map[string]any{
+					"routes": postRoutes,
 				},
 				OK: true,
 			})
@@ -452,6 +596,25 @@ func (a *desiredConfigApplier) Apply(patch *cloud.DesiredConfigPatch) (bool, err
 			Bool("enabled", a.cfg.System.ExternalNTPProbeEnabled).
 			Int("servers", len(a.cfg.System.ExternalNTPServers)).
 			Msg("desired-config: NTP probe applied from cloud")
+	}
+
+	if plan.lanRoutes != nil {
+		a.hookMu.Lock()
+		hook := a.lanHook
+		a.hookMu.Unlock()
+		if hook != nil {
+			// Hand the post-apply snapshot + the live Enabled flag to the
+			// hook. The hook closure in agent.go is responsible for the
+			// enabled-aware reapply: when enabled, push the routes into
+			// `lan.Manager.Apply(...)`; when disabled, push an empty list
+			// so any previously-installed iptables rules are torn down.
+			postRoutes := append([]string(nil), a.cfg.LAN.Routes...)
+			hook(postRoutes, a.cfg.LAN.Enabled)
+		}
+		log.Info().
+			Int("routes", len(a.cfg.LAN.Routes)).
+			Bool("enabled", a.cfg.LAN.Enabled).
+			Msg("desired-config: LAN routes applied from cloud")
 	}
 
 	return true, nil

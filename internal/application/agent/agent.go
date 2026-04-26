@@ -492,6 +492,27 @@ func New(cfg *config.Config) (*Agent, error) {
 		a.timeHealthThrottleMu.Unlock()
 	})
 
+	// Iter 51: wire the LAN-routes validator + apply hook so a
+	// cloud-pushed `lanRoutes` mutation is observationally identical to
+	// a local PUT /api/lan/routes. The validator captures the manager
+	// reference so the source-subnet check is always against the live
+	// WG /24 (post-identity-rotation safe). The hook re-reads the
+	// manager's current state so a same-tick `enabled` toggle from a
+	// concurrent local PUT doesn't leak stale routes into the kernel.
+	a.desiredConfig.SetLANRouteValidator(func(cidr string) (string, error) {
+		return lan.ValidateRoute(cidr, a.lanMgr.Source())
+	})
+	a.desiredConfig.SetLANApplyHook(func(routes []string, enabled bool) {
+		var desired []string
+		if enabled {
+			desired = append(desired, routes...)
+		}
+		_, errs := a.lanMgr.Apply(desired)
+		for _, err := range errs {
+			log.Warn().Err(err).Msg("desired-config: lan apply failed (non-fatal)")
+		}
+	})
+
 	return a, nil
 }
 
