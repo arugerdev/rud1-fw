@@ -23,6 +23,7 @@ package configlog
 import (
 	"bufio"
 	"compress/gzip"
+	"container/heap"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -687,6 +688,11 @@ func (l *DiskLogger) Stats() (Stats, error) {
 	}
 
 	out.FileCount = len(names)
+	// Iter 47: hold the per-day compression ratios in a heap-backed cap
+	// container during the walk so eviction at maxCompressionDays is
+	// O(log N) instead of the iter-46 O(N) lex-min scan. Flattened to
+	// the public Stats.CompressionByDay map at the end of the walk.
+	dayCap := newCompressionDayCap(maxCompressionDays)
 	for _, name := range names {
 		path := filepath.Join(baseDir, name)
 		fi, err := os.Stat(path)
@@ -734,24 +740,20 @@ func (l *DiskLogger) Stats() (Stats, error) {
 		// state.
 		//
 		// Iter 46: switch from "stop adding once full" to "evict oldest
-		// when at cap" via addCompressionDayCapped. The behaviour is
-		// identical for the current newest-first iteration order — we
-		// still keep the most recent N days — but the contract is now
-		// pinned to the day key itself (smallest YYYY-MM-DD evicted)
-		// rather than to the iteration order, so a future re-sort or
-		// filename-format change cannot quietly invert which days the
-		// fleet dashboard sees.
+		// when at cap" via the day-keyed cap helper. Iter 47: back the
+		// cap with a min-heap so eviction is O(log N) per insert rather
+		// than O(N) lex-min scan. Behaviour pinned: smallest YYYY-MM-DD
+		// evicted; an incoming day older than every existing key is
+		// dropped to preserve the "newest N kept" guarantee under any
+		// iteration order.
 		if fileEntryBytes > 0 && fi.Size() > 0 && fileEntryBytes > fi.Size() {
 			day := dayKeyFromName(name)
 			if day != "" {
-				out.CompressionByDay = addCompressionDayCapped(
-					out.CompressionByDay, day,
-					float64(fileEntryBytes)/float64(fi.Size()),
-					maxCompressionDays,
-				)
+				dayCap.add(day, float64(fileEntryBytes)/float64(fi.Size()))
 			}
 		}
 	}
+	out.CompressionByDay = dayCap.snapshot()
 
 	// Filenames are newest-first (reverse-sorted YYYY-MM-DD), so the
 	// last entry of the first file is the global newest and the first
@@ -767,53 +769,117 @@ func (l *DiskLogger) Stats() (Stats, error) {
 	return out, nil
 }
 
-// addCompressionDayCapped inserts (day -> ratio) into m, evicting the
-// lexicographically-smallest existing key first when m is already at
-// the cap. Day keys are YYYY-MM-DD strings, so lexical order is also
-// chronological order — the evicted key is the oldest day in the map.
+// compressionDayCap is a bounded {day -> ratio} aggregator that keeps
+// the newest `cap` distinct YYYY-MM-DD keys. When an `add` would push
+// the size past `cap`, the lexicographically-smallest key (which is
+// also the chronologically oldest, since day keys are fixed-width
+// YYYY-MM-DD) is evicted. An incoming key older than every existing
+// key is dropped instead — the same "refuse to evict ourselves" guard
+// the iter-46 helper had, which is what makes the contract sort-order
+// independent.
 //
-// The map is allocated lazily so callers can pass nil for the
-// first-insert case. If `day` is already present, the value is updated
-// in place without touching the eviction path (the size is unchanged).
+// Iter 47: the eviction is backed by a min-heap of day strings so the
+// per-insert cost when at cap is O(log N) instead of the iter-46 O(N)
+// lex-min scan. At today's N=90 the wall-clock difference is in the
+// noise, but raising `maxCompressionDays` into the thousands (or
+// invoking `Stats()` more frequently — heartbeat cadence is currently
+// every ~30s but a future hot path could run it per-request) becomes
+// a real cost as the scan is N per insert past cap.
 //
-// Iter 46: factored out of Stats() so the cap contract is independent
-// of the directory-listing sort order. The previous implementation
-// ("stop adding once len == cap") relied on listFiles() returning
-// names newest-first; a future re-sort or filename-format change would
-// have silently inverted which days the fleet dashboard kept.
-func addCompressionDayCapped(m map[string]float64, day string, ratio float64, cap int) map[string]float64 {
-	if cap <= 0 {
-		return m
+// The container is internal to the configlog package; callers consume
+// the snapshot via `snapshot()` which materialises the map so the
+// public Stats.CompressionByDay shape is unchanged.
+type compressionDayCap struct {
+	capacity int
+	m        map[string]float64
+	h        compressionDayHeap
+}
+
+// newCompressionDayCap returns a fresh cap container. capacity <= 0
+// makes every `add` a no-op so callers never need to special-case
+// "uncapped".
+func newCompressionDayCap(capacity int) *compressionDayCap {
+	return &compressionDayCap{capacity: capacity}
+}
+
+// add inserts (day -> ratio). If `day` already exists, the value is
+// updated in place and the heap is untouched (size is unchanged so no
+// eviction is needed). When the insert would exceed capacity, the
+// lex-smallest key is evicted via Pop — but only if the incoming key
+// is strictly larger; otherwise the incoming key is dropped because
+// evicting itself would weaken the "newest capacity kept" guarantee.
+func (c *compressionDayCap) add(day string, ratio float64) {
+	if c == nil || c.capacity <= 0 {
+		return
 	}
-	if m == nil {
-		m = make(map[string]float64)
+	if c.m == nil {
+		c.m = make(map[string]float64, c.capacity)
+		// Pre-size the heap backing slice so the typical fill-to-cap
+		// path avoids slice-growth reallocations entirely.
+		c.h = make(compressionDayHeap, 0, c.capacity)
 	}
-	if _, exists := m[day]; exists {
-		m[day] = ratio
-		return m
+	if _, exists := c.m[day]; exists {
+		c.m[day] = ratio
+		return
 	}
-	if len(m) >= cap {
-		// Find the lexicographically-smallest key (oldest YYYY-MM-DD)
-		// and evict it. We only do this on the insert path, so the
-		// O(N) scan runs at most once per day-file past the cap —
-		// negligible for N=90 and a heartbeat-cadence Stats() call.
-		var oldest string
-		for k := range m {
-			if oldest == "" || k < oldest {
-				oldest = k
-			}
-		}
-		// Refuse to evict ourselves: if the incoming day is older than
-		// every existing key, drop the new entry instead. This keeps
-		// the "newest N kept" guarantee true for arbitrary iteration
-		// orders — including the oldest-first regression case.
+	if len(c.m) >= c.capacity {
+		// Peek the heap min — guaranteed non-empty because len(m)>=cap>0.
+		oldest := c.h[0]
 		if day < oldest {
-			return m
+			// Incoming key is older than every existing entry; drop
+			// it instead of evicting a newer day. This is the
+			// regression-resistance guard the iter-46 contract pinned.
+			return
 		}
-		delete(m, oldest)
+		// O(log N) removal of the heap min.
+		_ = heap.Pop(&c.h)
+		delete(c.m, oldest)
 	}
-	m[day] = ratio
-	return m
+	c.m[day] = ratio
+	heap.Push(&c.h, day)
+}
+
+// snapshot returns the contained map, transferring ownership to the
+// caller. Subsequent `add` calls allocate a fresh map so the snapshot
+// is safe to mutate / read concurrently with later writes (callers
+// today call snapshot exactly once at the end of Stats(), so this is
+// purely defensive). Returns nil when no entries were ever added so
+// the cloud heartbeat's `omitempty` JSON tag drops the field cleanly.
+func (c *compressionDayCap) snapshot() map[string]float64 {
+	if c == nil || len(c.m) == 0 {
+		return nil
+	}
+	out := c.m
+	c.m = nil
+	c.h = nil
+	return out
+}
+
+// compressionDayHeap is a min-heap of day-key strings backing the cap
+// container's eviction path. Day keys are fixed-width YYYY-MM-DD so
+// lexical < is also chronological <; the heap min is therefore the
+// oldest day in the cap.
+//
+// Implements container/heap.Interface. Kept private to the package so
+// callers can't accidentally reach past the compressionDayCap façade.
+type compressionDayHeap []string
+
+func (h compressionDayHeap) Len() int           { return len(h) }
+func (h compressionDayHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h compressionDayHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+// Push / Pop are required by container/heap.Interface; callers should
+// invoke heap.Push(&h, x) / heap.Pop(&h) rather than these directly.
+func (h *compressionDayHeap) Push(x any) {
+	*h = append(*h, x.(string))
+}
+
+func (h *compressionDayHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 // boundaryAt returns the timestamp of the last (newest) or first

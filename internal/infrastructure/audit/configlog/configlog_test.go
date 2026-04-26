@@ -1402,26 +1402,27 @@ func TestStatsCompressionByDayBelowCapNoTrim(t *testing.T) {
 	}
 }
 
-// TestAddCompressionDayCappedSortInvariantOldestFirst (iter 46): pin
-// the cap contract to the day key itself, not to the iteration order.
-// The iter-45 implementation relied on listFiles() returning newest-
-// first and "stopped adding once full", which silently inverts to
-// "keep oldest 90" if a future re-sort or filename-format change flips
-// the order. Iterate 95 days oldest-first and assert that the newest
-// 90 are still kept and the 5 oldest are dropped — the regression
-// that catches a sort-order flip.
-func TestAddCompressionDayCappedSortInvariantOldestFirst(t *testing.T) {
+// TestCompressionDayCapSortInvariantOldestFirst (iter 46, refactored
+// iter 47 to drive the heap-backed compressionDayCap): pin the cap
+// contract to the day key itself, not to the iteration order. The
+// iter-45 implementation relied on listFiles() returning newest-first
+// and "stopped adding once full", which silently inverts to "keep
+// oldest 90" if a future re-sort or filename-format change flips the
+// order. Iterate 95 days oldest-first and assert that the newest 90
+// are still kept and the 5 oldest are dropped.
+func TestCompressionDayCapSortInvariantOldestFirst(t *testing.T) {
 	const total = 95
 	const cap = 90 // mirrors maxCompressionDays
 	newest := time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC)
 
 	// Build day keys oldest-first (the inverse of listFiles()'s real
 	// order). i=0 is the oldest (newest-94d), i=total-1 is newest.
-	var m map[string]float64
+	c := newCompressionDayCap(cap)
 	for i := 0; i < total; i++ {
 		day := newest.AddDate(0, 0, -(total-1-i)).Format("2006-01-02")
-		m = addCompressionDayCapped(m, day, 1.0+float64(i)/100.0, cap)
+		c.add(day, 1.0+float64(i)/100.0)
 	}
+	m := c.snapshot()
 
 	if len(m) != cap {
 		t.Fatalf("len=%d, want %d (cap must hold regardless of iteration order)", len(m), cap)
@@ -1442,14 +1443,14 @@ func TestAddCompressionDayCappedSortInvariantOldestFirst(t *testing.T) {
 	}
 }
 
-// TestAddCompressionDayCappedTieBreakRandomOrder (iter 46): with
-// exactly cap+1 days inserted in a deterministic-but-shuffled order,
-// the resulting map must hold exactly `cap` entries and the single
-// dropped key must be the lexicographically-smallest YYYY-MM-DD
-// (which, given fixed-width day keys, is the chronologically oldest).
-// Pinning this catches accidental "drop newest" or "drop random"
-// regressions in the eviction path.
-func TestAddCompressionDayCappedTieBreakRandomOrder(t *testing.T) {
+// TestCompressionDayCapTieBreakRandomOrder (iter 46, refactored
+// iter 47): with exactly cap+1 days inserted in a deterministic-but-
+// shuffled order, the resulting map must hold exactly `cap` entries
+// and the single dropped key must be the lexicographically-smallest
+// YYYY-MM-DD (which, given fixed-width day keys, is the chronologically
+// oldest). Pinning this catches accidental "drop newest" or
+// "drop random" regressions in the heap eviction path.
+func TestCompressionDayCapTieBreakRandomOrder(t *testing.T) {
 	const cap = 5 // small cap keeps the test legible
 	const total = cap + 1
 
@@ -1467,10 +1468,11 @@ func TestAddCompressionDayCappedTieBreakRandomOrder(t *testing.T) {
 		t.Fatalf("test setup: order len=%d, want %d", len(order), total)
 	}
 
-	var m map[string]float64
+	c := newCompressionDayCap(cap)
 	for _, i := range order {
-		m = addCompressionDayCapped(m, days[i], 1.0+float64(i)/10.0, cap)
+		c.add(days[i], 1.0+float64(i)/10.0)
 	}
+	m := c.snapshot()
 
 	if len(m) != cap {
 		t.Fatalf("len=%d, want %d", len(m), cap)
@@ -1484,5 +1486,128 @@ func TestAddCompressionDayCappedTieBreakRandomOrder(t *testing.T) {
 		if _, ok := m[days[i]]; !ok {
 			t.Fatalf("expected %q to be retained; got map=%v", days[i], m)
 		}
+	}
+}
+
+// TestCompressionDayCapHeapEvictionOrder (iter 47): drives the heap
+// eviction path through the full lifecycle — fill to cap, then push
+// many newer days in adversarial order, then verify the heap pops
+// keys in strict ascending lex order at each eviction step. This
+// pins the heap-backed eviction contract independently of the
+// snapshot() flatten: at any point during inserts past cap, the
+// in-memory map must contain exactly `cap` entries and the smallest
+// key in the map must be ≥ every key that has been evicted. A
+// regression that pops the wrong heap node (e.g. a sift-down bug)
+// would leave a stale older key behind and fail this invariant.
+func TestCompressionDayCapHeapEvictionOrder(t *testing.T) {
+	const cap = 4
+	// 12 consecutive days, inserted in a permutation that interleaves
+	// fills and evictions: first 4 insertions seed the cap (no eviction),
+	// the next 8 each evict exactly one key.
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	days := make([]string, 12)
+	for i := range days {
+		days[i] = base.AddDate(0, 0, i).Format("2006-01-02")
+	}
+	// Shuffled-but-deterministic order. After all inserts, the cap
+	// holds the 4 lex-largest keys (== 4 newest days), so days[0..7]
+	// must all be evicted and days[8..11] must all be present.
+	order := []int{5, 2, 9, 0, 7, 3, 11, 1, 8, 4, 10, 6}
+	if len(order) != len(days) {
+		t.Fatalf("test setup: order len mismatch")
+	}
+
+	c := newCompressionDayCap(cap)
+	for step, i := range order {
+		c.add(days[i], float64(i))
+		// Internal-state invariants checked at every step. We touch
+		// c.m / c.h directly (same package) — that's the point: a
+		// snapshot would zero them and we want to assert mid-run.
+		if got := len(c.m); got > cap {
+			t.Fatalf("step %d: map len=%d > cap=%d", step, got, cap)
+		}
+		if len(c.h) != len(c.m) {
+			t.Fatalf("step %d: heap len=%d != map len=%d (invariant violated)", step, len(c.h), len(c.m))
+		}
+		// Heap[0] must equal the lex-smallest key in the map.
+		if len(c.m) > 0 {
+			var mapMin string
+			for k := range c.m {
+				if mapMin == "" || k < mapMin {
+					mapMin = k
+				}
+			}
+			if c.h[0] != mapMin {
+				t.Fatalf("step %d: heap min=%q != map min=%q (heap invariant broken)", step, c.h[0], mapMin)
+			}
+		}
+	}
+
+	m := c.snapshot()
+	if len(m) != cap {
+		t.Fatalf("final len=%d, want %d", len(m), cap)
+	}
+	// Newest cap keys are days[8..11].
+	for i := len(days) - cap; i < len(days); i++ {
+		if _, ok := m[days[i]]; !ok {
+			t.Fatalf("expected newest day %q kept; got map=%v", days[i], m)
+		}
+	}
+	// Older keys must all be evicted.
+	for i := 0; i < len(days)-cap; i++ {
+		if _, ok := m[days[i]]; ok {
+			t.Fatalf("expected older day %q evicted; got map=%v", days[i], m)
+		}
+	}
+}
+
+// TestCompressionDayCapNonPositiveCapIsNoOp (iter 47): a cap of zero
+// or negative is a no-op contract — adds are silently dropped and
+// snapshot() returns nil. Pinning this so a misconfiguration in
+// maxCompressionDays can't sneak through unbounded growth.
+func TestCompressionDayCapNonPositiveCapIsNoOp(t *testing.T) {
+	for _, cap := range []int{0, -1, -1000} {
+		c := newCompressionDayCap(cap)
+		c.add("2026-04-20", 2.5)
+		c.add("2026-04-21", 3.0)
+		if got := c.snapshot(); got != nil {
+			t.Fatalf("cap=%d: snapshot=%v, want nil (no-op contract)", cap, got)
+		}
+	}
+}
+
+// TestCompressionDayCapUpdateExistingKey (iter 47): adding the same
+// day twice must update the value in place without disturbing the
+// heap. The heap length must stay ≤ map length (a duplicate Push
+// would leak a stale entry that surfaces as a phantom eviction
+// later). Snapshot must reflect the most-recent ratio.
+func TestCompressionDayCapUpdateExistingKey(t *testing.T) {
+	c := newCompressionDayCap(4)
+	c.add("2026-04-20", 2.0)
+	c.add("2026-04-21", 3.0)
+	c.add("2026-04-20", 9.5) // overwrite
+
+	if len(c.h) != len(c.m) {
+		t.Fatalf("heap len=%d != map len=%d (duplicate Push leaked into heap)", len(c.h), len(c.m))
+	}
+	m := c.snapshot()
+	if len(m) != 2 {
+		t.Fatalf("map len=%d, want 2", len(m))
+	}
+	if got := m["2026-04-20"]; got != 9.5 {
+		t.Fatalf("ratio for 2026-04-20=%v, want 9.5 (in-place update lost)", got)
+	}
+}
+
+// TestCompressionDayCapSnapshotEmpty (iter 47): a freshly-constructed
+// cap with no adds — and a cap that received only no-op adds (cap<=0)
+// — must return nil from snapshot() so the cloud heartbeat's
+// `omitempty` JSON tag drops the auditCompressionByDay field cleanly.
+// Returning a non-nil empty map would emit `"auditCompressionByDay":{}`
+// on the wire, breaking the "iter ≤41 cloud sees no field" round-trip.
+func TestCompressionDayCapSnapshotEmpty(t *testing.T) {
+	c := newCompressionDayCap(10)
+	if got := c.snapshot(); got != nil {
+		t.Fatalf("fresh cap snapshot=%v, want nil", got)
 	}
 }
