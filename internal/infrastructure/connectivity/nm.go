@@ -196,6 +196,17 @@ func (b *NMBackend) Connect(ctx context.Context, req cx.ConnectRequest) error {
 	// nmcli blocks until association attempt resolves; give it a generous
 	// timeout to handle slow DHCP leases.
 	if _, err := b.run(ctx, 45*time.Second, args...); err != nil {
+		// Warn-level so the raw nmcli stderr is visible by default (the
+		// inner run() logs at debug). Connect failures are rare, user-driven
+		// actions — not spammy — so it's safe to log them prominently.
+		log.Warn().Str("ssid", req.SSID).Err(err).Msg("wifi connect failed")
+		if isNotVisibleFailure(err) {
+			// SSID is not in nmcli's current scan cache. Most often: a stale
+			// scan, the AP is on a band/channel the radio isn't currently on,
+			// or the SSID has subtle whitespace/unicode that didn't survive
+			// some upstream string handling.
+			return fmt.Errorf("wifi network %q not visible — try rescanning", req.SSID)
+		}
 		if isSecretsFailure(err) {
 			return fmt.Errorf("wifi auth failed: wrong password or unsupported security")
 		}
@@ -599,12 +610,22 @@ func pctToDBm(pct int) int {
 	return -95 + (pct * 55 / 100)
 }
 
+// isSecretsFailure matches nmcli stderr lines that mean "the password (or
+// key-mgmt) we supplied was rejected by the AP". Distinct from
+// isNotVisibleFailure — that one means we never even tried to authenticate.
 func isSecretsFailure(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "Secrets were required") ||
 		strings.Contains(s, "property-missing") ||
-		strings.Contains(s, "invalid passphrase") ||
-		strings.Contains(strings.ToLower(s), "no network with ssid")
+		strings.Contains(s, "invalid passphrase")
+}
+
+// isNotVisibleFailure matches the nmcli error returned when the requested
+// SSID is absent from the current scan cache. This is NOT an auth failure
+// and must be surfaced separately so the operator knows to rescan or check
+// for whitespace/unicode in the SSID rather than retyping the password.
+func isNotVisibleFailure(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "no network with ssid")
 }
 
 func defaultStr(v, def string) string {

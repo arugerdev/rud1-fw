@@ -3,7 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
@@ -87,7 +86,10 @@ func (h *ConnectivityHandler) WiFiConnect(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	req.SSID = strings.TrimSpace(req.SSID)
+	// Do NOT TrimSpace the SSID. 802.11 SSIDs are 0..32 arbitrary bytes and
+	// may legitimately begin or end with whitespace — iPhone Personal
+	// Hotspots, for instance, broadcast the device name verbatim ("Alvaritoru ")
+	// and trimming silently mangles it so nmcli can't find the AP.
 	if req.SSID == "" {
 		writeError(w, http.StatusBadRequest, "ssid is required")
 		return
