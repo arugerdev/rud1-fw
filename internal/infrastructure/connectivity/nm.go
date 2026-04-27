@@ -189,20 +189,60 @@ func (b *NMBackend) Connect(ctx context.Context, req cx.ConnectRequest) error {
 	// nothing to clean and we still want to attempt the connect.
 	_, _ = b.run(ctx, 3*time.Second, "connection", "delete", req.SSID)
 
-	args := []string{"device", "wifi", "connect", req.SSID, "ifname", b.wifiIface}
-	if req.Password != "" {
-		args = append(args, "password", req.Password)
+	// Build the profile EXPLICITLY rather than via `nmcli device wifi
+	// connect`. The high-level command infers `wifi-sec.key-mgmt` from
+	// the live scan beacon, so it fails when the SSID isn't currently
+	// visible (stale scan / weak signal / momentary AP outage) with:
+	//
+	//   Error: 802-11-wireless-security.key-mgmt: property is missing.
+	//
+	// Building the profile by hand makes the call deterministic — the
+	// password the operator typed is the only thing that decides
+	// success or failure. Mirrors the AP-mode setup below which has
+	// always built profiles this way for the same reason.
+	addArgs := []string{
+		"connection", "add",
+		"type", "wifi",
+		"ifname", b.wifiIface,
+		"con-name", req.SSID,
+		"ssid", req.SSID,
+		"connection.autoconnect", "yes",
 	}
 	if req.Hidden {
-		args = append(args, "hidden", "yes")
+		addArgs = append(addArgs, "802-11-wireless.hidden", "yes")
 	}
-	// nmcli blocks until association attempt resolves; give it a generous
-	// timeout to handle slow DHCP leases.
-	if _, err := b.run(ctx, 45*time.Second, args...); err != nil {
-		// Warn-level so the raw nmcli stderr is visible by default (the
-		// inner run() logs at debug). Connect failures are rare, user-driven
-		// actions — not spammy — so it's safe to log them prominently.
+	if req.Password != "" {
+		// WPA2-PSK is the de-facto home-router default and what every
+		// SSID-with-password setup we ship today targets. WPA2/WPA3
+		// mixed-mode APs accept `wpa-psk` because they negotiate down
+		// to WPA2-PSK for clients that don't offer SAE. Pure WPA3-SAE
+		// networks would need `sae` here — out of scope for now;
+		// document as a known limitation if a customer hits it.
+		addArgs = append(addArgs,
+			"wifi-sec.key-mgmt", "wpa-psk",
+			"wifi-sec.psk", req.Password,
+		)
+	}
+
+	if _, err := b.run(ctx, 8*time.Second, addArgs...); err != nil {
+		// `connection add` failures are usually argument-parsing on
+		// our side (e.g. SSID with characters nmcli's shell-style arg
+		// parser hates). Log loudly so the operator sees the cause.
+		log.Warn().Str("ssid", req.SSID).Err(err).Msg("wifi profile add failed")
+		return fmt.Errorf("wifi profile add: %w", err)
+	}
+
+	// `connection up` does the actual association + DHCP. Generous
+	// timeout because some routers take a beat to associate and DHCP
+	// can be slow on the first lease of a new client.
+	if _, err := b.run(ctx, 45*time.Second, "connection", "up", req.SSID); err != nil {
 		log.Warn().Str("ssid", req.SSID).Err(err).Msg("wifi connect failed")
+		// On failure, drop the half-broken profile so the next attempt
+		// starts clean. Best-effort — `connection delete` will fail
+		// silently if the row was already removed by NM during its
+		// own teardown after the failed up.
+		_, _ = b.run(ctx, 3*time.Second, "connection", "delete", req.SSID)
+
 		if isNotVisibleFailure(err) {
 			// SSID is not in nmcli's current scan cache. Most often: a stale
 			// scan, the AP is on a band/channel the radio isn't currently on,
