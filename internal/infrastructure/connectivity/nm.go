@@ -33,6 +33,7 @@ type NMBackend struct {
 	apPass    string
 	apIface   string // usually same as wifiIface; NM can run AP and client on different radios if available
 	apCIDR    string // e.g. "192.168.50.1/24"
+	apCountry string // ISO-3166 alpha-2 (e.g. "ES") for the kernel reg domain
 	nmcli     string // resolved path, cached
 }
 
@@ -43,6 +44,7 @@ type NMConfig struct {
 	APPassword    string
 	APInterface   string
 	APCIDR        string
+	APCountry     string
 }
 
 // NewNMBackend builds a backend. `nmcli` must be on PATH; if it isn't, the
@@ -55,6 +57,7 @@ func NewNMBackend(c NMConfig) *NMBackend {
 		apPass:    c.APPassword,
 		apIface:   defaultStr(c.APInterface, c.WiFiInterface),
 		apCIDR:    defaultStr(c.APCIDR, "192.168.50.1/24"),
+		apCountry: defaultStr(c.APCountry, "ES"),
 	}
 	if p, err := exec.LookPath("nmcli"); err == nil {
 		b.nmcli = p
@@ -298,29 +301,50 @@ func (b *NMBackend) Status(ctx context.Context) (*cx.WiFiStatus, error) {
 
 // ── AP ──────────────────────────────────────────────────────────────────────
 
-const apConnectionName = "rud1-setup-ap"
+const (
+	apConnectionName = "rud1-setup-ap"
+	// apChannel pins the AP to 2.4 GHz channel 6 — universally supported
+	// by every WiFi-capable phone in the last 15 years (no DFS, no UE-only
+	// 12/13, no driver edge cases). The Pi 3 onboard radio is 2.4 GHz only
+	// anyway; locking to a known-good channel keeps clients from chasing
+	// NM's auto-pick.
+	apChannel = "6"
+)
 
-// APEnable raises the setup hotspot. Idempotent: bringing it up while
-// already active just re-applies the password.
+// APEnable raises the setup hotspot. Idempotent in the strong sense: when
+// the profile is already active the call is a no-op, so the supervisor's
+// per-tick re-evaluation never tears down a working association.
 //
-// PiOS Lite 64-bit gotchas this function defends against:
+// Compatibility knobs locked in:
 //
-//   - rfkill soft-block: PiOS ships WiFi soft-blocked until a regulatory
-//     domain is set. We unblock the radio before bringing the AP up so
-//     `connection up` doesn't fail with the cryptic "Secrets were required"
-//     style error that the kernel emits when the radio is still blocked.
-//   - Missing wireless regulatory domain: NM's hotspot mode silently fails
-//     to broadcast on a `00` (world) regdom. We log a clear warning so an
-//     installer SSH'd in can run `iw reg set <country>` (or set it via
-//     raspi-config / wireless-regdom).
-//   - nmcli noisy errors: if `connection up` fails we surface the raw stderr
-//     at warn level so the failure mode is visible without enabling debug.
+//   - 2.4 GHz band, fixed channel 6, hidden=no
+//   - WPA2-PSK only (proto=rsn, pairwise=ccmp, group=ccmp) — refuses to
+//     fall back to WPA1/TKIP, which kills modern Android clients.
+//   - PMF disabled — Protected Management Frames are optional/required by
+//     default in NM ≥ 1.40 and break legacy phones (Android 9 and older,
+//     some Samsung firmwares) that have no 802.11w support.
+//   - ipv4.method=shared — NM's built-in dnsmasq serves DHCP + DNS on the
+//     AP subnet so any phone gets an IP and can resolve the panel.
+//
+// PiOS Lite gotchas defended against:
+//
+//   - rfkill soft-block (cleared up front).
+//   - Missing reg domain: country 00 means the radio refuses to broadcast.
+//     ensureRegulatoryDomain applies APCountry (default "ES") if unset.
+//   - nmcli noisy errors: stderr is surfaced at warn level on failure.
 func (b *NMBackend) APEnable(ctx context.Context) error {
 	if !b.Available() {
 		return ErrUnavailable
 	}
 	if b.apPass == "" {
 		return errors.New("ap password is empty; refusing to start an open hotspot")
+	}
+
+	// Idempotency fast-path: a profile that's already activated is left
+	// alone. This is what stops the supervisor from cycling the AP every
+	// 15-second tick and dropping every connected phone in the process.
+	if b.isAPActive(ctx) {
+		return nil
 	}
 
 	// Best-effort radio unblock. `rfkill` is in raspberrypi-sys-mods on PiOS
@@ -331,9 +355,10 @@ func (b *NMBackend) APEnable(ctx context.Context) error {
 	// Make sure NM's own radio toggle is on too. Same idempotent-best-effort
 	// philosophy: if this fails because radio is already on, who cares.
 	_, _ = b.run(ctx, 2*time.Second, "radio", "wifi", "on")
-	// Warn (don't fail) when the kernel has no regulatory domain set —
-	// hotspot mode in 802.11bg requires one to pick legal channels.
-	b.warnIfRegdomUnset(ctx)
+	// Apply a regulatory domain if the kernel still has the empty default.
+	// Without this nmcli reports "connection up" but no channel is actually
+	// broadcast and phones never see the SSID.
+	b.ensureRegulatoryDomain(ctx)
 
 	// Delete stale profile so we re-create with current SSID/password.
 	// Note: this only deletes our OWN profile (apConnectionName) — never
@@ -349,10 +374,16 @@ func (b *NMBackend) APEnable(ctx context.Context) error {
 		"autoconnect", "no",
 		"ssid", b.apSSID,
 		"mode", "ap",
-		"802-11-wireless.band", "bg", // 2.4 GHz for phone compatibility
+		"802-11-wireless.band", "bg",
+		"802-11-wireless.channel", apChannel,
+		"802-11-wireless.hidden", "no",
 		"ipv4.method", "shared",
 		"ipv4.addresses", b.apCIDR,
 		"wifi-sec.key-mgmt", "wpa-psk",
+		"wifi-sec.proto", "rsn",
+		"wifi-sec.pairwise", "ccmp",
+		"wifi-sec.group", "ccmp",
+		"wifi-sec.pmf", "1",
 		"wifi-sec.psk", b.apPass,
 	}
 	if _, err := b.run(ctx, 10*time.Second, args...); err != nil {
@@ -369,6 +400,28 @@ func (b *NMBackend) APEnable(ctx context.Context) error {
 		return fmt.Errorf("ap up: %w", err)
 	}
 	return nil
+}
+
+// isAPActive returns true when our setup-AP profile is currently in the
+// "activated" state per NetworkManager. A transient nmcli failure is
+// treated as "not active" so the caller takes the recreate path — that's
+// the safe direction (an extra recreate beats a phantom "AP looks fine"
+// when it really isn't).
+func (b *NMBackend) isAPActive(ctx context.Context) bool {
+	out, err := b.run(ctx, 3*time.Second,
+		"-t", "-f", "NAME,STATE",
+		"connection", "show", "--active",
+	)
+	if err != nil {
+		return false
+	}
+	for _, line := range splitNonEmpty(out) {
+		f := splitNmcli(line, 2)
+		if len(f) >= 2 && f[0] == apConnectionName && f[1] == "activated" {
+			return true
+		}
+	}
+	return false
 }
 
 // bestEffortUnblockWiFi calls `rfkill unblock wifi` so the radio is usable.
@@ -397,45 +450,65 @@ func (b *NMBackend) bestEffortUnblockWiFi(ctx context.Context) {
 	}
 }
 
-// warnIfRegdomUnset checks `iw reg get` and logs a loud warning if the
-// kernel reports `country 00`. A device with no regdom set will not
-// broadcast on any channel, so the AP will appear "up" in nmcli but be
-// invisible to phones.
-func (b *NMBackend) warnIfRegdomUnset(ctx context.Context) {
+// ensureRegulatoryDomain reads `iw reg get` and, if the kernel still
+// reports the empty default (country 00), applies b.apCountry. A unset
+// regdom is the most common reason the AP "starts" but no phone sees it
+// — the radio is up but the kernel refuses to pick a channel under
+// world-roaming rules.
+//
+// This used to be a warn-only probe; now we actually fix it. Failures are
+// logged at warn so the operator can spot a missing `iw` or a kernel that
+// rejects the country code, but they don't block the AP bring-up — the
+// subsequent `connection up` will surface the real symptom.
+func (b *NMBackend) ensureRegulatoryDomain(ctx context.Context) {
 	iw, err := exec.LookPath("iw")
 	if err != nil {
 		// `iw` not installed — common on minimal images. We can't check
-		// but we also can't fix; the AP may still work if NM's defaults
-		// are good enough. Don't spam the log.
+		// or fix; the AP may still work if NM's defaults are good enough.
 		return
 	}
+
+	country := b.apCountry
+	if country == "" {
+		country = "ES"
+	}
+
 	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx2, iw, "reg", "get")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
+	out, err := exec.CommandContext(ctx2, iw, "reg", "get").Output()
+	if err != nil {
 		return
 	}
-	out := stdout.String()
-	for _, line := range strings.Split(out, "\n") {
+
+	// `iw reg get` prints one or more "country XX: ..." blocks. We treat
+	// the first one as authoritative — if it's "00" or empty we apply.
+	needSet := true
+	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
-		// `iw reg get` prints lines like: "country 00: DFS-UNSET"
-		// or "country ES: DFS-ETSI". We care about the first one.
 		if !strings.HasPrefix(line, "country ") {
 			continue
 		}
-		// Parse out the 2-letter code between "country " and ":".
 		rest := strings.TrimPrefix(line, "country ")
 		code, _, _ := strings.Cut(rest, ":")
 		code = strings.TrimSpace(code)
-		if code == "00" || code == "" {
-			log.Warn().
-				Str("regdom", code).
-				Msg("wireless regulatory domain is unset — setup AP may not broadcast. " +
-					"Run `sudo iw reg set ES` (or your country code) and `sudo raspi-config nonint do_wifi_country ES`.")
+		if code != "" && code != "00" {
+			needSet = false
 		}
+		break
+	}
+	if !needSet {
 		return
+	}
+
+	log.Warn().
+		Str("country", country).
+		Msg("wireless regulatory domain unset (country 00) — applying default so the AP can broadcast")
+	ctx3, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx3, iw, "reg", "set", country).Run(); err != nil {
+		log.Warn().Err(err).Str("country", country).
+			Msg("iw reg set failed — AP may still not broadcast. " +
+				"Set wireless_country in config.yaml or run `sudo raspi-config nonint do_wifi_country <CC>`.")
 	}
 }
 
@@ -451,8 +524,8 @@ func (b *NMBackend) APDisable(ctx context.Context) error {
 
 // APSetCredentials updates the SSID and password the AP will use on its
 // next bring-up. If the AP is currently active it is reapplied in-place so
-// connected clients are dropped and the new credentials take effect
-// immediately. An empty ssid keeps the current one.
+// connected clients see the new credentials immediately. An empty ssid
+// keeps the current one.
 func (b *NMBackend) APSetCredentials(ctx context.Context, ssid, password string) error {
 	if !b.Available() {
 		return ErrUnavailable
@@ -462,16 +535,12 @@ func (b *NMBackend) APSetCredentials(ctx context.Context, ssid, password string)
 	}
 	b.apPass = password
 
-	// Was the AP active? If so, recycle so clients see the new SSID/PSK
-	// without an out-of-band restart of the agent.
-	wasActive := false
-	if st, err := b.APStatus(ctx); err == nil && st != nil {
-		wasActive = st.Active
-	}
-	if wasActive {
-		// APEnable wipes the stale rud1-setup-ap profile and re-creates it
-		// with the freshly assigned credentials, so this single call is
-		// enough — no explicit APDisable beforehand.
+	// If the AP is up, force a recreate. APEnable's idempotency check
+	// would otherwise short-circuit the rebuild and the new PSK/SSID would
+	// only land on the next supervisor bounce. Tearing the profile down
+	// first makes APEnable take the recreate branch deterministically.
+	if b.isAPActive(ctx) {
+		_, _ = b.run(ctx, 3*time.Second, "connection", "delete", apConnectionName)
 		return b.APEnable(ctx)
 	}
 	return nil

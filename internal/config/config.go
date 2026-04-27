@@ -131,6 +131,12 @@ type NetworkConfig struct {
 	CellularDataCapMB uint64 `yaml:"cellular_data_cap_mb"`
 	// PreferredUplink: auto | wifi | cellular
 	PreferredUplink string `yaml:"preferred_uplink"`
+	// WirelessCountry is the ISO-3166 alpha-2 country code applied to the
+	// kernel's wireless regulatory domain when the agent finds it unset
+	// (`country 00`). Without a regdom the radio refuses to pick a channel
+	// and the setup AP looks "up" but is invisible to phones. Default "ES";
+	// override per-region as needed.
+	WirelessCountry string `yaml:"wireless_country"`
 }
 
 // ServerConfig configures the local HTTP API consumed by rud1-app.
@@ -279,6 +285,7 @@ func Default() *Config {
 			// supervisor reverts to its boot-grace-then-threshold logic.
 			OfflineGraceSeconds: 15,
 			PreferredUplink:     "auto",
+			WirelessCountry:     "ES",
 		},
 		Setup: SetupConfig{
 			Complete: false,

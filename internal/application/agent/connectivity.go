@@ -38,6 +38,7 @@ func buildConnectivityService(cfg *config.Config, registrationCode string) (cx.S
 		APPassword:    apPass,
 		APInterface:   cfg.Network.APInterface,
 		APCIDR:        cfg.Network.APCIDR,
+		APCountry:     cfg.Network.WirelessCountry,
 	})
 	mm := connimpl.NewMMBackend()
 

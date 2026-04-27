@@ -46,6 +46,7 @@ RUD1_CLOUD_URL="${RUD1_CLOUD_URL:-https://rud1.es}"
 RUD1_SKIP_APT="${RUD1_SKIP_APT:-0}"
 RUD1_ENABLE_USBIP="${RUD1_ENABLE_USBIP:-1}"
 RUD1_DISABLE_NGINX="${RUD1_DISABLE_NGINX:-0}"
+RUD1_WIFI_COUNTRY="${RUD1_WIFI_COUNTRY:-ES}"
 
 log()   { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -155,6 +156,21 @@ fi
 if systemctl list-unit-files avahi-daemon.service >/dev/null 2>&1; then
   log "Enabling avahi-daemon (so the device is reachable at <hostname>.local)"
   systemctl enable --now avahi-daemon
+fi
+
+# ── Wireless regulatory domain ───────────────────────────────────────────────
+# Without a country code the kernel refuses to broadcast on any channel,
+# so the setup AP looks "up" but is invisible to phones. We apply RUD1_WIFI_COUNTRY
+# (default ES) at install time and persist it through raspi-config so the
+# kernel restores it after every reboot. The agent also re-applies it on
+# AP raise as a defence in depth.
+if command -v iw >/dev/null; then
+  log "Applying wireless regulatory domain: $RUD1_WIFI_COUNTRY"
+  iw reg set "$RUD1_WIFI_COUNTRY" 2>/dev/null || \
+    warn "iw reg set $RUD1_WIFI_COUNTRY failed — agent will retry on first AP raise"
+fi
+if command -v raspi-config >/dev/null; then
+  raspi-config nonint do_wifi_country "$RUD1_WIFI_COUNTRY" 2>/dev/null || true
 fi
 
 # ── Kernel modules (USB/IP + VPN) ────────────────────────────────────────────

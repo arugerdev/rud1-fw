@@ -68,3 +68,9 @@ network:
   cellular_apn: ""
   # cellular_data_cap_mb: soft alert threshold. 0 disables the warning.
   cellular_data_cap_mb: 0
+  # wireless_country: ISO-3166 alpha-2 code applied to the kernel's
+  # regulatory domain when it's still the empty default ("country 00").
+  # Without a regdom the radio refuses to pick a channel and the setup
+  # AP is invisible to phones. install.sh seeds this at provisioning time;
+  # the agent re-applies it on every AP raise as a defence in depth.
+  wireless_country: ES
