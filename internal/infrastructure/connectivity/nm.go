@@ -421,10 +421,19 @@ func (b *NMBackend) APEnable(ctx context.Context) error {
 		"ipv4.addresses", b.apCIDR,
 		"wifi-sec.key-mgmt", "wpa-psk",
 		"wifi-sec.proto", "rsn",
-		"wifi-sec.pairwise", "ccmp",
-		"wifi-sec.group", "ccmp",
-		"wifi-sec.pmf", "1",
 		"wifi-sec.psk", b.apPass,
+		// PMF=0 (disabled). Older settings used PMF=1 ("capable") with
+		// explicit pairwise/group=ccmp, which is technically more
+		// secure but triggers a known iOS↔hostapd negotiation bug:
+		// iPhone 14 / iOS 17+ reports "Incorrect password" against APs
+		// that advertise PMF capability without requiring it. This AP
+		// is a one-time first-boot setup channel — the operator runs
+		// the wizard, joins the home WiFi, and the AP goes away — so
+		// maximising compatibility outweighs the marginal security
+		// gain of mandatory frame protection on a 5-minute hotspot.
+		// We also drop the explicit pairwise/group and let hostapd's
+		// defaults negotiate, again to widen iOS compatibility.
+		"wifi-sec.pmf", "disable",
 	}
 	if _, err := b.run(ctx, 10*time.Second, args...); err != nil {
 		return fmt.Errorf("ap add: %w", err)
