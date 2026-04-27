@@ -116,18 +116,38 @@ EOF
   systemctl enable --now ModemManager 2>/dev/null || true
 fi
 
-# ── Hostname (optional) ──────────────────────────────────────────────────────
-if [[ -n "$RUD1_HOSTNAME" ]]; then
+# ── Hostname ─────────────────────────────────────────────────────────────────
+# Default: provision the device as `rud1` (so `http://rud1.local` resolves
+# the moment Avahi comes up). After the agent boots and generates its
+# RegistrationCode we refine it to `rud1-XXXX` further down so two units in
+# the same LAN don't fight over `rud1.local`. Operators that pass an
+# explicit RUD1_HOSTNAME keep full control.
+apply_hostname() {
+  local target="$1"
+  local current
   current="$(hostnamectl --static 2>/dev/null || cat /etc/hostname)"
-  if [[ "$current" != "$RUD1_HOSTNAME" ]]; then
-    log "Setting hostname: $current → $RUD1_HOSTNAME"
-    hostnamectl set-hostname "$RUD1_HOSTNAME"
-    # Update /etc/hosts 127.0.1.1 entry
-    if grep -q "^127.0.1.1" /etc/hosts; then
-      sed -i "s/^127.0.1.1.*/127.0.1.1\t${RUD1_HOSTNAME}/" /etc/hosts
-    else
-      echo -e "127.0.1.1\t${RUD1_HOSTNAME}" >> /etc/hosts
-    fi
+  if [[ "$current" == "$target" ]]; then
+    return
+  fi
+  log "Setting hostname: $current → $target"
+  hostnamectl set-hostname "$target"
+  if grep -q "^127.0.1.1" /etc/hosts; then
+    sed -i "s/^127.0.1.1.*/127.0.1.1\t${target}/" /etc/hosts
+  else
+    echo -e "127.0.1.1\t${target}" >> /etc/hosts
+  fi
+}
+
+if [[ -n "$RUD1_HOSTNAME" ]]; then
+  apply_hostname "$RUD1_HOSTNAME"
+else
+  current_host="$(hostnamectl --static 2>/dev/null || cat /etc/hostname)"
+  # Only seed `rud1` when the box still has the stock Pi name (or empty).
+  # An existing `rud1-*` (or any operator-chosen value) is left alone here;
+  # the post-boot refinement below will tighten `rud1` → `rud1-XXXX` once
+  # the registration code is known.
+  if [[ -z "$current_host" || "$current_host" == "raspberrypi" ]]; then
+    apply_hostname "rud1"
   fi
 fi
 
@@ -280,6 +300,7 @@ server:
     - http://localhost:5173
     - http://localhost
     - http://rud1.local
+    - http://rud1-*.local
 cloud:
   enabled: true
   base_url: ${RUD1_CLOUD_URL}
@@ -394,6 +415,23 @@ for _ in 1 2 3 4 5; do
   [[ -n "$REG_CODE" ]] && break
   sleep 2
 done
+
+# ── Hostname refinement (rud1 → rud1-XXXX) ──────────────────────────────────
+# Once we know the registrationCode, append its last 4 hex chars so two
+# fresh units in the same LAN don't both claim `rud1.local`. We only touch
+# the hostname when it's still the bare default we (or the Pi image) set —
+# never when the operator has chosen something custom.
+if [[ -z "$RUD1_HOSTNAME" && -n "$REG_CODE" ]]; then
+  current_host="$(hostnamectl --static 2>/dev/null || cat /etc/hostname)"
+  if [[ "$current_host" == "rud1" || "$current_host" == "raspberrypi" || -z "$current_host" ]]; then
+    suffix="${REG_CODE//-/}"
+    suffix="${suffix: -4}"
+    apply_hostname "rud1-${suffix}"
+    # Avahi picks up the new hostname on the next refresh; nudge it so the
+    # device is reachable at the new <hostname>.local immediately.
+    systemctl restart avahi-daemon 2>/dev/null || true
+  fi
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 HOSTNAME="$(hostname)"

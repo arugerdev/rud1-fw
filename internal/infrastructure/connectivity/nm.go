@@ -449,6 +449,34 @@ func (b *NMBackend) APDisable(ctx context.Context) error {
 	return nil
 }
 
+// APSetCredentials updates the SSID and password the AP will use on its
+// next bring-up. If the AP is currently active it is reapplied in-place so
+// connected clients are dropped and the new credentials take effect
+// immediately. An empty ssid keeps the current one.
+func (b *NMBackend) APSetCredentials(ctx context.Context, ssid, password string) error {
+	if !b.Available() {
+		return ErrUnavailable
+	}
+	if ssid != "" {
+		b.apSSID = ssid
+	}
+	b.apPass = password
+
+	// Was the AP active? If so, recycle so clients see the new SSID/PSK
+	// without an out-of-band restart of the agent.
+	wasActive := false
+	if st, err := b.APStatus(ctx); err == nil && st != nil {
+		wasActive = st.Active
+	}
+	if wasActive {
+		// APEnable wipes the stale rud1-setup-ap profile and re-creates it
+		// with the freshly assigned credentials, so this single call is
+		// enough — no explicit APDisable beforehand.
+		return b.APEnable(ctx)
+	}
+	return nil
+}
+
 // APStatus reports whether the hotspot profile is currently active.
 func (b *NMBackend) APStatus(ctx context.Context) (*cx.APStatus, error) {
 	s := &cx.APStatus{

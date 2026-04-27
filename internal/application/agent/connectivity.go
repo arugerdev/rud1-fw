@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,13 +16,15 @@ import (
 )
 
 // buildConnectivityService picks the right backend for the platform and
-// wires the AP SSID/password, pulling them from config when provided or
-// deriving deterministic defaults from the device's machine-id otherwise.
+// wires the AP SSID/password from config when provided. Otherwise it falls
+// back to a fixed factory default password ("configurame") and an SSID
+// suffixed with the last 4 chars of the device's RegistrationCode, so two
+// units in the same room don't share an SSID.
 //
 // Returns the Service plus a pre-configured Supervisor (nil when simulated
 // or when NetworkManager is not available).
-func buildConnectivityService(cfg *config.Config, machineID string) (cx.Service, *connimpl.Supervisor) {
-	apSSID, apPass := resolveAPCredentials(cfg, machineID)
+func buildConnectivityService(cfg *config.Config, registrationCode string) (cx.Service, *connimpl.Supervisor) {
+	apSSID, apPass := resolveAPCredentials(cfg, registrationCode)
 	persistAPPasswordHint(apSSID, apPass)
 
 	if platform.SimulateHardware() {
@@ -71,26 +71,43 @@ func buildConnectivityService(cfg *config.Config, machineID string) (cx.Service,
 	return real, sup
 }
 
-// resolveAPCredentials returns (ssid, password). Either value from config
-// takes precedence; missing values are derived deterministically from the
-// machine-id so the credentials are stable across reboots but unique per
-// device.
-func resolveAPCredentials(cfg *config.Config, machineID string) (string, string) {
-	sum := sha256.Sum256([]byte(machineID))
-	hexSum := hex.EncodeToString(sum[:])
+// DefaultAPPassword is the factory-default WPA2 passphrase the device
+// broadcasts in setup mode. Kept simple and uniform across the fleet so it
+// can be printed on the box / documented in the manual; the user is
+// expected to change it via PUT /api/network/ap/credentials once the
+// device is paired. WPA2-PSK requires 8+ chars.
+const DefaultAPPassword = "configurame"
 
+// resolveAPCredentials returns (ssid, password). Values from config take
+// precedence; missing values fall back to:
+//   - SSID:     "Rud1-Setup-XXXX" with the last 4 chars of the device's
+//               registrationCode (so two factory-fresh units side by side
+//               don't share the same SSID).
+//   - Password: DefaultAPPassword ("configurame") — same on every device,
+//               printed on the sticker. Operators rotate it from the panel.
+func resolveAPCredentials(cfg *config.Config, registrationCode string) (string, string) {
 	ssid := strings.TrimSpace(cfg.Network.APSSID)
 	if ssid == "" {
-		suffix := strings.ToUpper(hexSum[:4])
-		ssid = "Rud1-Setup-" + suffix
+		ssid = "Rud1-Setup-" + apSuffixFromCode(registrationCode)
 	}
 
 	pass := strings.TrimSpace(cfg.Network.APPassword)
 	if pass == "" {
-		// 12 hex chars = 48 bits of entropy; WPA2-PSK requires 8+ chars.
-		pass = hexSum[4:16]
+		pass = DefaultAPPassword
 	}
 	return ssid, pass
+}
+
+// apSuffixFromCode returns the last 4 alphanumeric chars of a
+// registrationCode (which has shape "RUD1-XXXXXXXX-XXXXXXXX"), uppercased.
+// Falls back to "0000" when the code is empty or shorter than 4 chars
+// (e.g. a stripped-down test config) so the SSID is always well-formed.
+func apSuffixFromCode(code string) string {
+	stripped := strings.ReplaceAll(code, "-", "")
+	if len(stripped) < 4 {
+		return "0000"
+	}
+	return strings.ToUpper(stripped[len(stripped)-4:])
 }
 
 // persistAPPasswordHint writes SSID + password to /var/lib/rud1-agent/setup-ap.txt

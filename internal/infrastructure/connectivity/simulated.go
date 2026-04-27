@@ -245,3 +245,13 @@ func (s *simulatedService) APStatus(_ context.Context) (*cx.APStatus, error) {
 }
 func (s *simulatedService) APEnable(_ context.Context) error  { s.state.APEnable(); return nil }
 func (s *simulatedService) APDisable(_ context.Context) error { s.state.APDisable(); return nil }
+
+func (s *simulatedService) APSetCredentials(_ context.Context, ssid, password string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ssid != "" {
+		s.apSSID = ssid
+	}
+	s.apPass = password
+	return nil
+}

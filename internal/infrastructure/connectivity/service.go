@@ -220,6 +220,23 @@ func (s *Service) APDisable(ctx context.Context) error {
 	return s.nm.APDisable(ctx)
 }
 
+// APSetCredentials updates the SSID/password used by the setup hotspot.
+// Caller is responsible for persisting the change to config.yaml; this
+// method only mutates the in-memory state and recycles the AP if active.
+func (s *Service) APSetCredentials(ctx context.Context, ssid, password string) error {
+	s.mu.Lock()
+	if ssid != "" {
+		s.apSSID = ssid
+	}
+	s.apPass = password
+	s.mu.Unlock()
+
+	if s.nm == nil {
+		return nil
+	}
+	return s.nm.APSetCredentials(ctx, ssid, password)
+}
+
 // ── Internet probe ──────────────────────────────────────────────────────────
 
 func defaultInternetProbe() bool {

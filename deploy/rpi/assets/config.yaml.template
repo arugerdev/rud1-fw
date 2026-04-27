@@ -13,6 +13,10 @@ server:
     - http://localhost
     - http://localhost:5173
     - http://rud1.local
+    # The default install.sh refines the hostname to `rud1-XXXX` (last 4
+    # chars of the registrationCode) so two units in the same LAN don't
+    # collide on rud1.local. The wildcard below covers that case.
+    - http://rud1-*.local
     # Add additional hostnames here if you renamed the Pi, e.g.:
     # - http://factory-gw-01.local
   # auth_token: ""   # Optional: require Bearer auth on the LOCAL API (recommended if
@@ -43,9 +47,12 @@ network:
   # RPi 3 radio + the optional Sierra Wireless MC7700 cellular HAT.
   wifi_interface: wlan0
   ap_interface: wlan0
-  # ap_ssid + ap_password can be left blank to auto-derive per device from
-  # its machine-id. The generated values are written to
-  # /var/lib/rud1-agent/setup-ap.txt (mode 0600) on every boot.
+  # ap_ssid blank → "Rud1-Setup-XXXX" (last 4 chars of the registration
+  # code, so two units side by side don't share an SSID).
+  # ap_password blank → "configurame" (uniform factory default; rotate it
+  # from the panel via PUT /api/network/ap/credentials).
+  # The effective values are mirrored to /var/lib/rud1-agent/setup-ap.txt
+  # (mode 0600) on every boot for SSH-bound recovery.
   ap_ssid: ""
   ap_password: ""
   ap_cidr: 192.168.50.1/24

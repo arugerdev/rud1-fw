@@ -172,6 +172,7 @@ func New(
 
 		r.Get("/api/network/ap", connH.APStatus)
 		r.Post("/api/network/ap", connH.APSet)
+		r.Put("/api/network/ap/credentials", connH.APSetCredentials)
 
 		r.Get("/api/vpn/status", vpnH.Status)
 		r.Post("/api/vpn/reconnect", vpnH.Reconnect)

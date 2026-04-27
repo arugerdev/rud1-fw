@@ -3,21 +3,33 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
 
+	"github.com/rud1-es/rud1-fw/internal/config"
 	cx "github.com/rud1-es/rud1-fw/internal/domain/connectivity"
 )
 
 // ConnectivityHandler serves WiFi / cellular / AP management endpoints.
 type ConnectivityHandler struct {
 	svc cx.Service
+	cfg *config.Config
+	// apMu serialises AP-credentials mutations so a flaky panel that
+	// double-submits doesn't interleave config writes (Save() is itself
+	// atomic but we want the in-memory snapshot to match disk).
+	apMu sync.Mutex
 }
 
 // NewConnectivityHandler constructs a handler around a Service.
-func NewConnectivityHandler(svc cx.Service) *ConnectivityHandler {
-	return &ConnectivityHandler{svc: svc}
+//
+// cfg is required for endpoints that persist mutations to config.yaml
+// (e.g. PUT /api/network/ap/credentials). May be nil in tests that don't
+// exercise the persistence path.
+func NewConnectivityHandler(svc cx.Service, cfg *config.Config) *ConnectivityHandler {
+	return &ConnectivityHandler{svc: svc, cfg: cfg}
 }
 
 // Snapshot — GET /api/network/connectivity
@@ -214,4 +226,81 @@ func (h *ConnectivityHandler) APSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": body.Enabled})
+}
+
+// APSetCredentials — PUT /api/network/ap/credentials  {ssid?, password}
+//
+// Mutates the SSID/password the setup hotspot will use. Persisted to
+// config.yaml so the change survives a reboot, and applied in-place when
+// the AP is currently active so the operator sees the new credentials
+// without needing to restart the agent.
+//
+// The factory default password ("configurame") is uniform across the
+// fleet — this endpoint is the supported way for an operator to rotate
+// it once the device is in production.
+func (h *ConnectivityHandler) APSetCredentials(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SSID     string `json:"ssid"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	ssid := strings.TrimSpace(body.SSID)
+	pass := body.Password // do NOT trim — trailing/leading spaces are valid PSK chars
+	if len(pass) < 8 || len(pass) > 63 {
+		writeError(w, http.StatusBadRequest, "password length must be between 8 and 63 characters (WPA2-PSK)")
+		return
+	}
+	if n := len(ssid); n > 32 {
+		// IEEE 802.11 SSID length cap (32 octets).
+		writeError(w, http.StatusBadRequest, "ssid length must be at most 32 characters")
+		return
+	}
+	if h.cfg == nil {
+		// Tests that wire a handler without a config still get a usable
+		// path through the service for runtime mutation; we just can't
+		// persist. Keeping this branch lets `go test` exercise the
+		// handler without faking a YAML-on-disk.
+		if err := h.svc.APSetCredentials(r.Context(), ssid, pass); err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+
+	h.apMu.Lock()
+	defer h.apMu.Unlock()
+
+	prevSSID := h.cfg.Network.APSSID
+	prevPass := h.cfg.Network.APPassword
+	if ssid != "" {
+		h.cfg.Network.APSSID = ssid
+	}
+	h.cfg.Network.APPassword = pass
+
+	if err := h.cfg.Save(); err != nil {
+		// Roll back the in-memory mutation so the next read reflects disk.
+		h.cfg.Network.APSSID = prevSSID
+		h.cfg.Network.APPassword = prevPass
+		log.Warn().Err(err).Msg("ap: persist credentials failed")
+		writeError(w, http.StatusInternalServerError, "failed to persist ap credentials")
+		return
+	}
+
+	// Apply in-memory + recycle the AP if active. We've already persisted,
+	// so a service-level error here is a soft failure (the change WILL
+	// take effect on the next agent restart).
+	if err := h.svc.APSetCredentials(r.Context(), ssid, pass); err != nil {
+		log.Warn().Err(err).Msg("ap: hot-apply credentials failed (will take effect on next restart)")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"applied": false,
+			"warning": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "applied": true})
 }

@@ -337,9 +337,9 @@ func New(cfg *config.Config) (*Agent, error) {
 	// Connectivity (WiFi / cellular / setup-AP) — picks the right backend
 	// for the platform, plus an optional supervisor that auto-raises the
 	// setup AP when the device has been offline too long.
-	connSvc, connSup := buildConnectivityService(cfg, a.identity.SerialNumber)
+	connSvc, connSup := buildConnectivityService(cfg, a.identity.RegistrationCode)
 	a.connSup = connSup
-	connH := handlers.NewConnectivityHandler(connSvc)
+	connH := handlers.NewConnectivityHandler(connSvc, cfg)
 
 	// System stats collector — shared between the HTTP handler (/api/system/stats)
 	// and the heartbeat loop (HBSystem block). Stateless apart from the optional

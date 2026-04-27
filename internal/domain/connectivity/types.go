@@ -211,4 +211,9 @@ type Service interface {
 	APStatus(ctx context.Context) (*APStatus, error)
 	APEnable(ctx context.Context) error
 	APDisable(ctx context.Context) error
+	// APSetCredentials swaps the SSID and/or PSK the setup hotspot uses.
+	// An empty ssid means "keep the current one"; password is mandatory
+	// (≥ 8 chars, WPA2 floor). When the AP is currently active it is
+	// reapplied with the new credentials in-place.
+	APSetCredentials(ctx context.Context, ssid, password string) error
 }
