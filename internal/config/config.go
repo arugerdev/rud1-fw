@@ -173,6 +173,29 @@ type VPNConfig struct {
 	// cloud returns a `vpnPeer` block in the heartbeat response so it can
 	// materialise a complete wg0.conf.
 	PrivateKeyPath string `yaml:"private_key_path"`
+	// Relay configures the OUTBOUND wg-relay tunnel the Pi maintains to a
+	// rud1-vps relay when the cloud decides direct P2P is impossible (CGNAT,
+	// symmetric NAT, no public endpoint). Activation is fully cloud-driven
+	// — the agent never brings wg-relay up on its own; it materialises the
+	// tunnel iff the heartbeat response carries a `relayPeer` block, and
+	// tears it down when the block is absent. The fields here are filesystem
+	// paths only; the actual peer/endpoint comes from the cloud.
+	Relay RelayClientConfig `yaml:"relay"`
+}
+
+// RelayClientConfig — paths and conventions for the agent-managed
+// wg-relay tunnel. There is no `enabled` flag: the cloud's heartbeat
+// response is the single source of truth (`relayPeer` non-nil = up,
+// nil = down). Operators wanting to forbid relay use entirely should
+// flip the device's `relayMode` to DIRECT_ONLY in the cloud.
+type RelayClientConfig struct {
+	// Interface is the WireGuard interface name. Defaults to "wg-relay"
+	// — distinct from wg0 (the local server) so both can run side by
+	// side without colliding on routes / netfilter rules.
+	Interface string `yaml:"interface"`
+	// ConfigPath is the canonical wg-relay.conf the agent rewrites on
+	// every change. wg-quick reads it on `up` / `down`.
+	ConfigPath string `yaml:"config_path"`
 }
 
 // LANConfig configures the Pi's LAN-exposure behaviour over WireGuard.
@@ -270,6 +293,10 @@ func Default() *Config {
 			ConfigPath:     filepath.Join(platform.ConfigDir(), "wg0.conf"),
 			PubkeyPath:     filepath.Join(platform.ConfigDir(), "wg-pubkey.txt"),
 			PrivateKeyPath: "/etc/wireguard/privatekey",
+			Relay: RelayClientConfig{
+				Interface:  "wg-relay",
+				ConfigPath: "/etc/wireguard/wg-relay.conf",
+			},
 		},
 		USB: USBConfig{
 			BindPort: 3240,

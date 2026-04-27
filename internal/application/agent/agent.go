@@ -214,6 +214,8 @@ func New(cfg *config.Config) (*Agent, error) {
 		cfg.VPN.Interface,
 		cfg.VPN.PubkeyPath,
 		a.snapshotNAT,
+		cfg.VPN.Relay.ConfigPath,
+		cfg.VPN.Relay.Interface,
 	)
 	vpnPeerH := handlers.NewVPNPeerHandler(cfg.VPN.Interface)
 	vpnPeersSumH := handlers.NewVPNPeersSummaryHandler(cfg.VPN.Interface)
@@ -864,6 +866,32 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			LastHandshake:  lastHandshakePtr,
 			PeerTelemetry:  peerTelemetry,
 		}
+
+		// Relay tunnel telemetry — populated only when the wg-relay
+		// interface is actually up. Steady-state direct-mode devices
+		// emit nothing here, keeping legacy heartbeat shape unchanged.
+		relayIface := a.cfg.VPN.Relay.Interface
+		if relayIface == "" {
+			relayIface = "wg-relay"
+		}
+		relayConfigPath := a.cfg.VPN.Relay.ConfigPath
+		if relayConfigPath == "" {
+			relayConfigPath = "/etc/wireguard/wg-relay.conf"
+		}
+		if rs, err := wireguard.ReadRelayStatus(relayIface, relayConfigPath); err == nil && rs != nil {
+			row := &cloud.HBVPNRelay{
+				InterfaceName: relayIface,
+				TunnelUp:      rs.Up,
+				Address:       rs.Address,
+				Endpoint:      rs.Endpoint,
+				BytesRx:       rs.BytesRx,
+				BytesTx:       rs.BytesTx,
+			}
+			if !rs.LatestHshake.IsZero() {
+				row.LastHandshake = rs.LatestHshake.UTC().Format(time.RFC3339)
+			}
+			hbVPN.Relay = row
+		}
 	}
 
 	// ── USB + USB/IP ──────────────────────────────────────────────────────
@@ -1137,6 +1165,15 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		} else if changed {
 			log.Info().Msg("heartbeat: desired config applied from cloud")
 		}
+	}
+
+	// Relay tunnel reconciliation. The cloud's `relayPeer` field is
+	// the single source of truth for whether `wg-relay` should be up:
+	//   - non-nil → ApplyRelay (idempotent; no-op when fingerprint matches).
+	//   - nil/absent → TeardownRelay (idempotent; no-op when iface absent).
+	// Failures here never abort the heartbeat — the next tick retries.
+	if err := a.reconcileRelay(resp.RelayPeer); err != nil {
+		log.Warn().Err(err).Msg("heartbeat: relay reconcile failed")
 	}
 }
 
@@ -1504,6 +1541,77 @@ func (a *Agent) applyClientPeers(desired []cloud.ClientPeer) {
 			Int("live", len(liveByKey)).
 			Msg("vpn: client peer set converged")
 	}
+}
+
+// reconcileRelay applies (or tears down) the wg-relay outbound tunnel
+// based on the cloud's `relayPeer` field in the heartbeat response.
+//
+//   - peer != nil → wg-relay should be up against this VPS. We materialise
+//     the config and call wireguard.ApplyRelay, which short-circuits when
+//     the on-disk fingerprint matches the new spec (so the steady-state
+//     case avoids any kernel state changes).
+//   - peer == nil → wg-relay should be down. We call wireguard.TeardownRelay,
+//     which is idempotent on a missing interface.
+//
+// Idempotent: safe to call from every heartbeat tick. Failures are
+// returned to the caller for logging; the heartbeat path swallows them
+// so a transient `wg-quick` hiccup never aborts the rest of the tick.
+func (a *Agent) reconcileRelay(peer *cloud.RelayPeer) error {
+	iface := a.cfg.VPN.Relay.Interface
+	if iface == "" {
+		iface = "wg-relay"
+	}
+	configPath := a.cfg.VPN.Relay.ConfigPath
+	if configPath == "" {
+		configPath = "/etc/wireguard/wg-relay.conf"
+	}
+
+	if peer == nil {
+		// Cloud says no relay. Tear it down (no-op when already absent).
+		return wireguard.TeardownRelay(configPath, iface)
+	}
+
+	if peer.ServerPublicKey == "" || peer.Endpoint == "" || peer.Address == "" {
+		return fmt.Errorf("relay peer block missing required fields")
+	}
+
+	// Read the same private key wg0 uses — single keypair per device,
+	// reused for both server (wg0) and client (wg-relay) interfaces.
+	privkeyPath := a.cfg.VPN.PrivateKeyPath
+	if privkeyPath == "" {
+		privkeyPath = filepath.Join(platform.DataDir(), "wg-server.key")
+	}
+	priv, err := wireguard.ReadPrivateKey(privkeyPath)
+	if err != nil {
+		return fmt.Errorf("read privkey for wg-relay: %w", err)
+	}
+
+	keepalive := peer.PersistentKeepalive
+	if keepalive <= 0 {
+		keepalive = 25 // mandatory for outbound NAT keepalive
+	}
+
+	spec := wireguard.RelaySpec{
+		Interface:           iface,
+		PrivateKey:          priv,
+		AddressCIDR:         peer.Address,
+		PeerPublicKey:       peer.ServerPublicKey,
+		Endpoint:            peer.Endpoint,
+		AllowedIPs:          peer.AllowedIPs,
+		PersistentKeepalive: keepalive,
+	}
+	restarted, err := wireguard.ApplyRelay(configPath, spec)
+	if err != nil {
+		return err
+	}
+	if restarted {
+		log.Info().
+			Str("iface", iface).
+			Str("endpoint", peer.Endpoint).
+			Str("address", peer.Address).
+			Msg("wg-relay: tunnel applied from cloud assignment")
+	}
+	return nil
 }
 
 // maybeReapplyServer handles the unusual case where the cloud tells us the

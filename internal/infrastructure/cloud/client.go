@@ -415,6 +415,44 @@ type HBVPN struct {
 	// `UserVPNPeer` without having to reach into the Pi on demand.
 	// Omitted when the VPN interface isn't up or listing failed.
 	PeerTelemetry []HBVPNPeerTelemetry `json:"peerTelemetry,omitempty"`
+	// Relay describes the state of the OUTBOUND wg-relay tunnel — non-nil
+	// only when the cloud has previously assigned this device a relay peer
+	// and the agent has materialised wg-relay locally. Tunnel up + recent
+	// handshake means relay-mode users can reach the Pi via the VPS; a
+	// stale handshake while relay mode is supposed to be active surfaces
+	// "VPS unreachable from Pi" on the cloud side.
+	Relay *HBVPNRelay `json:"relay,omitempty"`
+}
+
+// HBVPNRelay carries the agent's view of its wg-relay outbound tunnel.
+// Reported only when the cloud's last heartbeat response delivered a
+// relayPeer block — when the cloud demotes the device back to direct
+// (relayPeer:null), the agent tears wg-relay down and stops emitting
+// this block. The cloud uses LastHandshake to detect "Pi can't reach
+// VPS" without polling the relay independently.
+type HBVPNRelay struct {
+	InterfaceName string  `json:"interfaceName"`
+	// TunnelUp signals that wg-quick has the iface up AND the kernel
+	// reports a peer (the VPS). False covers both "interface absent"
+	// and "peer never installed" — distinguishable from log lines but
+	// indistinct on the wire because rud1-es only cares about the
+	// binary "is the relay path viable right now" answer.
+	TunnelUp      bool    `json:"tunnelUp"`
+	// Address is the Pi's relay /32, e.g. "10.99.42.1/32" — echoed
+	// back so the cloud can spot drift between what it assigned and
+	// what the agent actually applied.
+	Address       string  `json:"address,omitempty"`
+	// LastHandshake is the most recent successful handshake on the
+	// outbound tunnel, RFC3339 UTC. Empty when the tunnel just came
+	// up and hasn't completed its first handshake yet.
+	LastHandshake string  `json:"lastHandshake,omitempty"`
+	// Endpoint is the VPS endpoint the kernel actually dialled —
+	// useful for diagnosing DNS-resolution drift across heartbeats
+	// (e.g. operator changed the DNS A record but the agent cached
+	// the old IP via the kernel).
+	Endpoint      string  `json:"endpoint,omitempty"`
+	BytesRx       uint64  `json:"bytesRx"`
+	BytesTx       uint64  `json:"bytesTx"`
 }
 
 // HBVPNPeerTelemetry is one `wg show dump` row serialised for the cloud.
@@ -463,6 +501,27 @@ type VpnPeer struct {
 	AllowedIPs          string  `json:"allowedIps"` // e.g. "10.200.0.0/16"
 	DNS                 *string `json:"dns"`
 	PersistentKeepalive int     `json:"persistentKeepalive"`
+}
+
+// RelayPeer is the cloud→agent assignment for the OUTBOUND wg-relay
+// tunnel. Non-nil tells the agent to bring up `wg-relay` against the
+// VPS at `Endpoint`, with the Pi's assigned `Address` and a wide
+// AllowedIPs catching the relay subnet so users can reach the Pi
+// through it. Strict omitempty on the wire — older firmware predating
+// relay support ignores unknown fields, so emitting nothing keeps
+// them quiet.
+//
+// The agent treats this block as the SOURCE OF TRUTH for the relay
+// tunnel: it will tear `wg-relay` down on every heartbeat that omits
+// the field. Operators flipping a device from FORCE_RELAY back to
+// AUTO/DIRECT_ONLY thus reach steady state on the next heartbeat tick
+// without needing a config push or device reboot.
+type RelayPeer struct {
+	ServerPublicKey     string `json:"serverPublicKey"`
+	Endpoint            string `json:"endpoint"`            // e.g. "vps.rud1.es:51820"
+	Address             string `json:"address"`             // e.g. "10.99.42.1/32"
+	AllowedIPs          string `json:"allowedIps"`          // e.g. "10.99.0.0/16"
+	PersistentKeepalive int    `json:"persistentKeepalive"` // typically 25
 }
 
 // ClientPeer is one [Peer] block installed on the Pi's WG server for a
@@ -523,6 +582,14 @@ type HeartbeatResponse struct {
 	// distinguishable; unknown fields are silently ignored (forward-
 	// compat — DisallowUnknownFields is intentionally NOT set).
 	DesiredConfig *DesiredConfigPatch `json:"desiredConfig,omitempty"`
+	// RelayPeer (claimed only): the cloud's assignment for the
+	// agent-managed wg-relay outbound tunnel. Non-nil = bring it up
+	// (or refresh the existing tunnel) against the rud1-vps relay at
+	// `Endpoint`. Nil/absent = tear it down idempotently. The cloud
+	// emits this whenever the device is in (or should be in) relay
+	// mode AND a relay row is reachable; otherwise the field is
+	// omitted so older firmware sees no change in the response shape.
+	RelayPeer *RelayPeer `json:"relayPeer,omitempty"`
 }
 
 // DesiredConfigPatch carries the operator-tunable fields the cloud

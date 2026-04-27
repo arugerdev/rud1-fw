@@ -21,22 +21,30 @@ type NatSnapshot func() nat.Discovery
 
 // VPNHandler serves VPN-related API endpoints.
 type VPNHandler struct {
-	configPath    string
-	iface         string
-	ownPubkeyPath string
-	natSnapshot   NatSnapshot // may be nil in legacy wiring
+	configPath      string
+	iface           string
+	ownPubkeyPath   string
+	natSnapshot     NatSnapshot // may be nil in legacy wiring
+	relayConfigPath string      // wg-relay.conf path; empty disables relay status
+	relayIface      string      // wg-relay interface name
 }
 
 // NewVPNHandler creates a VPNHandler for the given WireGuard config file and
 // interface name. ownPubkeyPath points at the world-readable mirror of the
 // device's own WG public key. `natSnap` is optional — when nil the handler
-// omits the NAT-related response fields.
-func NewVPNHandler(configPath, iface, ownPubkeyPath string, natSnap NatSnapshot) *VPNHandler {
+// omits the NAT-related response fields. `relayConfigPath` and `relayIface`
+// are optional — when both are non-empty the handler also reads the
+// wg-relay tunnel state (if up) and surfaces it under `relay` in the
+// status response. The local panel uses this to render the "you're going
+// through the VPS" badge so the operator sees the transport at a glance.
+func NewVPNHandler(configPath, iface, ownPubkeyPath string, natSnap NatSnapshot, relayConfigPath, relayIface string) *VPNHandler {
 	return &VPNHandler{
-		configPath:    configPath,
-		iface:         iface,
-		ownPubkeyPath: ownPubkeyPath,
-		natSnapshot:   natSnap,
+		configPath:      configPath,
+		iface:           iface,
+		ownPubkeyPath:   ownPubkeyPath,
+		natSnapshot:     natSnap,
+		relayConfigPath: relayConfigPath,
+		relayIface:      relayIface,
 	}
 }
 
@@ -68,6 +76,24 @@ type vpnStatusResponse struct {
 	// surfaces an actionable warning when set, since direct WG from
 	// CGNAT'd uplinks is not feasible without IPv6 or a relay.
 	CGNAT          bool   `json:"cgnat"`
+	// Relay block — present only when the agent has a wg-relay tunnel up
+	// (i.e. the cloud put this device in relay mode AND the kernel state
+	// reflects that). Steady-state direct-mode devices omit it entirely
+	// so legacy panel renderers don't see new fields they can't parse.
+	Relay          *relayStatusBlock `json:"relay,omitempty"`
+}
+
+// relayStatusBlock mirrors the heartbeat's HBVPNRelay so the local panel
+// can render the relay tile from the same shape the cloud sees. Surfaced
+// under `vpnStatus.relay` in the JSON response.
+type relayStatusBlock struct {
+	Interface     string `json:"interface"`
+	TunnelUp      bool   `json:"tunnelUp"`
+	Address       string `json:"address,omitempty"`
+	Endpoint      string `json:"endpoint,omitempty"`
+	LastHandshake int64  `json:"lastHandshake,omitempty"` // unix seconds; 0 = never
+	BytesRx       uint64 `json:"bytesRx"`
+	BytesTx       uint64 `json:"bytesTx"`
 }
 
 // Status handles GET /api/vpn/status.
@@ -123,7 +149,36 @@ func (h *VPNHandler) Status(w http.ResponseWriter, r *http.Request) {
 		NATType:        natSnap.NATType,
 		NATSource:      natSnap.Source,
 		CGNAT:          natSnap.CGNAT,
+		Relay:          h.snapshotRelay(),
 	})
+}
+
+// snapshotRelay returns a non-nil block iff the wg-relay interface is
+// up. The handler is configured with the relay paths at construction;
+// when those are empty (legacy wiring or relay disabled at the config
+// level) we always return nil. Errors reading the kernel state are
+// also treated as "no relay" — the local panel falls back to direct
+// telemetry rather than rendering a degraded chip.
+func (h *VPNHandler) snapshotRelay() *relayStatusBlock {
+	if h.relayConfigPath == "" || h.relayIface == "" {
+		return nil
+	}
+	rs, err := wireguard.ReadRelayStatus(h.relayIface, h.relayConfigPath)
+	if err != nil || rs == nil {
+		return nil
+	}
+	out := &relayStatusBlock{
+		Interface: h.relayIface,
+		TunnelUp:  rs.Up,
+		Address:   rs.Address,
+		Endpoint:  rs.Endpoint,
+		BytesRx:   rs.BytesRx,
+		BytesTx:   rs.BytesTx,
+	}
+	if !rs.LatestHshake.IsZero() {
+		out.LastHandshake = rs.LatestHshake.Unix()
+	}
+	return out
 }
 
 func firstNonEmpty(candidates ...string) string {
