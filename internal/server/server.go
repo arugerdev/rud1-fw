@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -67,7 +69,15 @@ func New(
 
 	// Global middleware — order matters.
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   cfg.Server.AllowedOrigins,
+		// We use a function rather than a static list because the
+		// local panel (rud1-app, served on port 80 by the embedded
+		// web server) and the firmware API (this server, port 7070)
+		// live on the SAME host but DIFFERENT ports — and that counts
+		// as a cross-origin request from the browser's perspective.
+		// Same-host-any-port is the canonical pattern for a panel +
+		// API combo on a single appliance, so we allow it explicitly
+		// in addition to the configured origin list.
+		AllowOriginFunc:  allowOriginFunc(cfg.Server.AllowedOrigins),
 		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		AllowCredentials: true,
@@ -285,5 +295,57 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil
 	case err := <-errCh:
 		return err
+	}
+}
+
+// allowOriginFunc builds the CORS origin predicate.
+//
+// Returns true when:
+//
+//   1. The request's Origin matches any string in the configured
+//      AllowedOrigins list (exact match, scheme + host + port). This
+//      is the dev-machine path: vite on :5173, Next on :3000, etc.
+//
+//   2. The Origin's hostname equals the hostname the request was
+//      received on, regardless of port. This is the canonical
+//      "panel and API on the same appliance, different ports"
+//      pattern — rud1-app is served on port 80 of the Pi, this API
+//      is on port 7070, and a browser pointed at http://<pi-ip>/
+//      will tag XHRs to http://<pi-ip>:7070/api/* as cross-origin.
+//      The pair shares trust by design, so we allow it.
+//
+// This is safe even with `AllowCredentials: true` because the
+// browser only sends credentials when the API server explicitly
+// echoes the Origin back — and we only echo origins we have
+// validated above.
+func allowOriginFunc(allowedOrigins []string) func(r *http.Request, origin string) bool {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowed[strings.ToLower(strings.TrimSpace(o))] = struct{}{}
+	}
+	return func(r *http.Request, origin string) bool {
+		if origin == "" {
+			// Same-origin requests (no Origin header). Browsers omit
+			// the header for navigation; the cors lib handles this
+			// upstream, but we keep the function side-effect-free.
+			return false
+		}
+		o := strings.ToLower(origin)
+		if _, ok := allowed[o]; ok {
+			return true
+		}
+		// Same-host-any-port: parse the Origin and compare its hostname
+		// to the hostname of the request we just received. r.Host can
+		// include the port (e.g. "192.168.1.240:7070"), so we strip it.
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		reqHost := r.Host
+		if h, _, splitErr := net.SplitHostPort(reqHost); splitErr == nil {
+			reqHost = h
+		}
+		oHost := u.Hostname()
+		return oHost != "" && oHost == reqHost
 	}
 }
