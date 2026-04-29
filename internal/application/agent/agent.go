@@ -35,6 +35,7 @@ import (
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/storage"
 	sysinfo "github.com/rud1-es/rud1-fw/internal/infrastructure/system"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/system/ntpprobe"
+	"github.com/rud1-es/rud1-fw/internal/infrastructure/serbridge"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat"
 	"github.com/rud1-es/rud1-fw/internal/infrastructure/sysstat/uptime"
 	usblister "github.com/rud1-es/rud1-fw/internal/infrastructure/usb"
@@ -57,6 +58,13 @@ type Agent struct {
 	cloud    *cloud.Client         // nil when cloud.Enabled == false
 	srv      *server.Server
 	usbipH   *handlers.USBIPHandler // shared with heartbeat loop so ExportedDevices() matches sysfs
+	// serBridge is the alternate transport for CDC-class devices.
+	// Nil when cfg.USB.SerialBridge.Enabled == false — the agent boots
+	// without the bridge listener and the /api/serial-bridge/* routes
+	// are simply not registered. Heartbeat skips the bridge fields in
+	// that mode, which the cloud reads as "feature unavailable" and
+	// hides the bridge UI in the Connect tab.
+	serBridge serbridge.Manager
 	revLog   *revlog.Logger         // nil when /var/lib/rud1/revocations isn't writable
 	auditLog *configlog.DiskLogger  // nil when /var/lib/rud1/audit isn't writable
 	lanMgr   *lan.Manager           // owns the LAN-routing iptables rules
@@ -224,6 +232,32 @@ func New(cfg *config.Config) (*Agent, error) {
 	usbH := handlers.NewUSBHandler()
 	usbipH := handlers.NewUSBIPHandler(cfg)
 	a.usbipH = usbipH
+
+	// --- Serial bridge (alternate transport for CDC devices) ---
+	// Only constructed when explicitly enabled so a default-config Pi
+	// doesn't open extra listener ports. Failure to allocate is non-
+	// fatal: we log it, leave a.serBridge nil, and the agent boots
+	// without the bridge endpoints — the panel feature-detects via
+	// the heartbeat's `serialBridgeEnabled` field.
+	var serBridgeH *handlers.SerialBridgeHandler
+	if cfg.USB.SerialBridge.Enabled {
+		mgr, err := serbridge.NewLinuxManager(
+			cfg.USB.SerialBridge.BasePort,
+			cfg.USB.SerialBridge.MaxSessions,
+		)
+		if err != nil {
+			log.Warn().Err(err).Msg("serial bridge disabled: manager init failed")
+		} else if err := mgr.Start(); err != nil {
+			log.Warn().Err(err).Msg("serial bridge disabled: manager start failed")
+		} else {
+			a.serBridge = mgr
+			serBridgeH = handlers.NewSerialBridgeHandler(mgr, &cfg.USB)
+			log.Info().
+				Int("basePort", cfg.USB.SerialBridge.BasePort).
+				Int("maxSessions", cfg.USB.SerialBridge.MaxSessions).
+				Msg("serial bridge enabled")
+		}
+	}
 
 	// Disk-backed revocation log: daily-rotated JSONL under
 	// /var/lib/rud1/revocations in prod, OS temp dir on simulated hardware
@@ -481,7 +515,7 @@ func New(cfg *config.Config) (*Agent, error) {
 	a.desiredConfig = newDesiredConfigApplier(cfg, desiredPruner, desiredAuditLog)
 	sysDesiredCfgH := handlers.NewSystemDesiredConfigHandler(a.desiredConfig)
 
-	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH, sysAuditFwdH, sysDesiredCfgH)
+	a.srv = server.New(cfg, systemH, networkH, vpnH, vpnPeerH, vpnPeersSumH, vpnPeerDetailH, vpnThroughputH, usbH, usbipH, serBridgeH, connH, identityH, lanH, lanProbeH, lanTraceH, sysStatsH, sysHealthH, sysPctHistH, sysPctExpH, sysUptimeEvH, sysUptimeEvExpH, sysUptimeSumH, setupH, sysTzH, sysTimeHealthH, sysNTPProbeCfgH, sysAuditH, sysAuditRetH, sysAuditFwdH, sysDesiredCfgH)
 	// Iter 50: wire the NTP-probe re-arm hook so a cloud-pushed
 	// `externalNTPProbeEnabled`/`externalNTPServers` mutation is observ-
 	// ationally identical to a local PUT. The hook fires after a
@@ -910,10 +944,13 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 		}
 		for _, d := range usbDevs {
 			dev := cloud.HBUSBDevice{
-				BusID:     d.BusID,
-				VendorID:  d.VendorID,
-				ProductID: d.ProductID,
-				Shared:    exportedSet[d.BusID],
+				BusID:          d.BusID,
+				VendorID:       d.VendorID,
+				ProductID:      d.ProductID,
+				Shared:         exportedSet[d.BusID],
+				DeviceClass:    d.DeviceClass,
+				InterfaceClass: d.InterfaceClass,
+				IsCDC:          d.IsCDC(),
 			}
 			if d.VendorName != "" {
 				s := d.VendorName
@@ -948,6 +985,19 @@ func (a *Agent) sendHeartbeat(ctx context.Context) {
 			UsbipEnabled:   a.cfg.USB.USBIPEnabled,
 			ExportedBusIDs: exportedIDs,
 			InUseBusIDs:    inUse,
+		}
+		// Serial bridge: surface the listener config and the live
+		// open-session list so the cloud can route the desktop client
+		// to the right transport. We only emit when the manager is
+		// actually up — config-disabled installs send no bridge fields
+		// (cloud reads that as "feature unavailable" and hides the
+		// bridge UI); manager-up-but-no-sessions still reports
+		// `serialBridgeEnabled: true` because the panel wants to show
+		// "0 of 8 bridge sessions" load chips even on an idle Pi.
+		if a.serBridge != nil {
+			hbUSB.SerialBridgeEnabled = true
+			hbUSB.SerialBridgeBasePort = a.cfg.USB.SerialBridge.BasePort
+			hbUSB.SerialBridgeOpenBusIDs = a.serBridge.OpenBusIDs()
 		}
 	}
 

@@ -26,6 +26,7 @@ type Server struct {
 	router     *chi.Mux
 	httpServer *http.Server
 	usbipH     *handlers.USBIPHandler
+	serBridgeH *handlers.SerialBridgeHandler // nil when serial bridge disabled
 }
 
 // New assembles the Server with all routes and middleware.
@@ -43,6 +44,7 @@ func New(
 	vpnThroughputH *handlers.VPNThroughputHandler,
 	usbH *handlers.USBHandler,
 	usbipH *handlers.USBIPHandler,
+	serBridgeH *handlers.SerialBridgeHandler,
 	connH *handlers.ConnectivityHandler,
 	identityH *handlers.IdentityHandler,
 	lanH *handlers.LANHandler,
@@ -248,6 +250,30 @@ func New(
 		r.Post("/api/usbip/attach", usbipH.Attach)
 		r.Delete("/api/usbip/attach", usbipH.Detach)
 
+		// Serial bridge — alternate transport for CDC-class devices
+		// (Arduinos, ESP32 dev boards, USB-serial dongles). The kernel
+		// `usbip_host` module crashes in stub_rx_loop when a CDC interface
+		// re-enumerates (DTR-toggle reset on Arduino), so we route those
+		// devices through a userspace TCP↔/dev/ttyACMx proxy with a
+		// minimal RFC 2217 negotiator instead. Routes mirror the USB/IP
+		// shape so the Connect tab can switch transports symmetrically.
+		// Registered only when the handler was constructed (i.e. config
+		// has serial_bridge.enabled = true) — otherwise the routes 404
+		// rather than 503, which matches the panel's feature-detect
+		// pattern for the cross-transport status pill.
+		if serBridgeH != nil {
+			r.Get("/api/serial-bridge/status", serBridgeH.Status)
+			r.Get("/api/serial-bridge/sessions", serBridgeH.Sessions)
+			r.Get("/api/serial-bridge/sessions/{busId}", serBridgeH.SessionForBusID)
+			r.Post("/api/serial-bridge/open", serBridgeH.Open)
+			r.Delete("/api/serial-bridge/open", serBridgeH.Close)
+			// Manual DTR pulse for clients that can't synthesize it via
+			// RFC 2217. Kept inside the same handler group so the same
+			// authorized_nets gate applies — operators with stricter
+			// compliance can still scope which subnets may issue resets.
+			r.Post("/api/serial-bridge/reset", serBridgeH.Reset)
+		}
+
 		// /api/setup/reset is destructive (clears the wizard state) so
 		// it ALWAYS requires auth, regardless of cfg.Setup.Complete.
 		// Lives here, inside the BearerAuth group, instead of behind
@@ -263,7 +289,13 @@ func New(
 		WriteTimeout: cfg.Server.WriteTimeout,
 	}
 
-	return &Server{cfg: cfg, router: r, httpServer: httpServer, usbipH: usbipH}
+	return &Server{
+		cfg:        cfg,
+		router:     r,
+		httpServer: httpServer,
+		usbipH:     usbipH,
+		serBridgeH: serBridgeH,
+	}
 }
 
 // Run starts the HTTP server and blocks until ctx is cancelled, then shuts down.

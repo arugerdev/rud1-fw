@@ -33,7 +33,8 @@ usb:
   usbip_enabled: false          # Set to true to enable USB/IP server (Linux only)
   authorized_nets:              # CIDRs allowed to attach USB devices (empty = no restriction)
     - 10.200.0.0/16             # Allow VPN subnet (adjust to your WireGuard range)
-
+  serial_bridge:
+    enabled: true
 network:
   # WiFi client + setup-AP (NetworkManager) + optional LTE modem (ModemManager).
   # Leave ap_ssid / ap_password blank to auto-derive them from the device's

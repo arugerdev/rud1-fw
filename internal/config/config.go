@@ -251,6 +251,47 @@ type USBConfig struct {
 	// when non-empty, attach requests are rejected unless the device matches.
 	// Deny entries always win and are evaluated first.
 	Policy USBPolicyConfig `yaml:"policy"`
+
+	// SerialBridge configures the TCP↔serial bridge used for CDC-class
+	// devices (Arduinos, ESP32 dev boards, USB-serial dongles). Auto-mode
+	// in the export handler routes CDC devices through this transport
+	// instead of USB/IP because the kernel `usbip_host` module races on
+	// the re-enumeration that follows DTR-toggle resets. Disabled by
+	// default (`enabled: false`) — on devices that don't host serial
+	// programmers there's no reason to open the listener port.
+	SerialBridge SerialBridgeConfig `yaml:"serial_bridge"`
+}
+
+// SerialBridgeConfig configures the TCP↔serial proxy.
+//
+// The bridge listens on `BasePort + <slot>` per device (slot is allocated
+// by the manager at open time) so the desktop client knows where to
+// connect once the cloud forwards the bus id → port mapping. We pin the
+// base instead of using ephemeral ports because the WG firewall/policy
+// enforcement on the desktop side allowlists ports at config time, and
+// rolling allocations would force the operator to re-issue the WG
+// config on every session.
+type SerialBridgeConfig struct {
+	// Enabled is the master switch. Independent of USB.USBIPEnabled —
+	// some operators only need serial bridge (Arduino-only fleet) and
+	// don't want a usbipd listening on 3240. Both can be on; auto-mode
+	// picks the right transport per device.
+	Enabled bool `yaml:"enabled"`
+	// BasePort is the lowest TCP port allocated to a session. Sessions
+	// claim BasePort, BasePort+1, BasePort+2... up to MaxSessions. Default
+	// 7700 — well above the firmware HTTP API on 7070 and below the
+	// usbipd default on 3240, so a default-config Pi has all three
+	// services on stable, documentable ports.
+	BasePort int `yaml:"base_port"`
+	// MaxSessions caps simultaneous open serial bridges. The Pi 4
+	// comfortably handles dozens; the default of 8 is a guardrail
+	// against runaway clients more than a hardware limit.
+	MaxSessions int `yaml:"max_sessions"`
+	// AuthorizedNets is a CIDR allowlist of TCP source IPs allowed to
+	// connect to the bridge listener. Empty list = inherit USB.AuthorizedNets
+	// (most installs want the same VPN-subnet allowlist for both transports).
+	// Set explicitly to override.
+	AuthorizedNets []string `yaml:"authorized_nets,omitempty"`
 }
 
 // USBPolicyConfig is the attach-time allow/deny policy for USB/IP sharing.
@@ -300,6 +341,11 @@ func Default() *Config {
 		},
 		USB: USBConfig{
 			BindPort: 3240,
+			SerialBridge: SerialBridgeConfig{
+				Enabled:     false,
+				BasePort:    7700,
+				MaxSessions: 8,
+			},
 		},
 		Network: NetworkConfig{
 			WiFiInterface: "wlan0",

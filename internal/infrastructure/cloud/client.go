@@ -470,14 +470,25 @@ type HBVPNPeerTelemetry struct {
 }
 
 // HBUSBDevice is one USB device in a heartbeat.
+//
+// DeviceClass / InterfaceClass are USB class codes (lowercase hex strings,
+// e.g. "02" for CDC, "0a" for CDC-Data, "08" for Mass Storage). They
+// drive the cloud's transport selection: devices reporting CDC at either
+// level get the serial-bridge transport in the Connect tab, everything
+// else stays on USB/IP. Empty strings mean the firmware is older than
+// the class-aware lister and the cloud should default to USB/IP for
+// compatibility.
 type HBUSBDevice struct {
-	BusID       string  `json:"busId"`
-	VendorID    string  `json:"vendorId"`
-	ProductID   string  `json:"productId"`
-	VendorName  *string `json:"vendorName,omitempty"`
-	ProductName *string `json:"productName,omitempty"`
-	Serial      *string `json:"serial,omitempty"`
-	Shared      bool    `json:"shared"`
+	BusID          string  `json:"busId"`
+	VendorID       string  `json:"vendorId"`
+	ProductID      string  `json:"productId"`
+	VendorName     *string `json:"vendorName,omitempty"`
+	ProductName    *string `json:"productName,omitempty"`
+	Serial         *string `json:"serial,omitempty"`
+	Shared         bool    `json:"shared"`
+	DeviceClass    string  `json:"deviceClass,omitempty"`
+	InterfaceClass string  `json:"interfaceClass,omitempty"`
+	IsCDC          bool    `json:"isCdc,omitempty"`
 }
 
 // HBUSB wraps the USB device list and USB/IP server state.
@@ -489,6 +500,21 @@ type HBUSB struct {
 	// remote client attachment (usbip_status == 3). Useful for the
 	// Connect tab's "Attached" badge and for the VPN_DOWN cleanup logic.
 	InUseBusIDs []string `json:"inUseBusIds,omitempty"`
+	// SerialBridgeEnabled mirrors USB.SerialBridge.Enabled from config.
+	// Surfacing it in the heartbeat lets the cloud decide whether to
+	// even render the bridge-mode option in the Connect tab — a Pi
+	// configured for usb-only deployments shouldn't lure the operator
+	// into clicking a bridge button that's going to fail.
+	SerialBridgeEnabled bool `json:"serialBridgeEnabled,omitempty"`
+	// SerialBridgePort is the bridge listener base port. The cloud
+	// forwards it to the desktop client which uses it (plus the
+	// per-session offset) to dial the right TCP socket.
+	SerialBridgeBasePort int `json:"serialBridgeBasePort,omitempty"`
+	// SerialBridgeOpenBusIDs lists bus IDs with a currently-open
+	// bridge session. Same role as ExportedBusIDs / InUseBusIDs but
+	// for the alternate transport. Used by the panel to paint a
+	// "Bridge active" badge.
+	SerialBridgeOpenBusIDs []string `json:"serialBridgeOpenBusIds,omitempty"`
 }
 
 // VpnPeer is the [Peer] block the cloud pushes to the agent when it has
